@@ -1,0 +1,41 @@
+# Binaries and build outputs
+/headlamp
+/bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go test and coverage artifacts
+*.test
+*.out
+coverage.*
+
+# Local runtime state, databases, and keys
+data/
+tsnet-state/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+master.key
+*.pem
+*.key
+
+# Local configs and secrets
+headlamp.yaml
+headlamp.local.yaml
+.env
+.env.*
+
+# Frontend dependencies and build artifacts
+web/node_modules/
+web/dist/
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

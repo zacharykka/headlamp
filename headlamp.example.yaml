@@ -1,0 +1,196 @@
+# Headlamp configuration example.
+# Copy to headlamp.yaml and override secrets via environment variables.
+# Supported secret placeholders use ${ENV_VAR} syntax.
+
+server:
+  tsnet:
+    enabled: true
+    hostname: headlamp
+    # Headscale control plane URL. Leave empty to connect to official Tailscale SaaS.
+    control_url: "https://headscale.example.com"
+    # Pre-auth key used for first-time node registration (or set HEADLAMP_AUTH_KEY).
+    auth_key: "${HEADLAMP_AUTH_KEY}"
+    # Persistent directory for tsnet state and auto-generated master.key.
+    state_dir: "./data"
+    ephemeral: false
+    # Default 80 when tls.mode is "none", or 443 when TLS is enabled.
+    listen_port: 80
+
+  tls:
+    # Supported modes: none | static | acme_dns01
+    mode: none
+    # Required when mode is "static":
+    cert_file: ""
+    key_file: ""
+    # Required when mode is "acme_dns01":
+    domain: ""
+    acme_email: ""
+    dns_provider: ""
+
+  # Optional local HTTP listener for development, /healthz, or non-tailnet callers.
+  local_listen: "127.0.0.1:8080"
+
+  # Local development mock identity (only use on trusted localhost).
+  dev_mode: false
+  dev_user: "dev@local"
+  dev_roles:
+    - admin
+    - user
+
+  # Optional static fallback API tokens for non-tailnet callers (e.g. CI runners).
+  api_tokens:
+    # - name: ci-runner
+    #   token: "${HEADLAMP_CI_TOKEN}"
+    #   subject: "tag:ci-runner"
+    #   display_name: "CI Runner"
+    #   groups: ["automation"]
+    #   roles: ["user"]
+    #   tags: ["tag:ci-runner"]
+
+policy:
+  # Supported modes: hybrid | local_only | grants_only
+  mode: hybrid
+  bootstrap_admins:
+    - "alice@example.com"
+  groups:
+    - name: engineering
+      description: "Engineering team"
+      members:
+        - "alice@example.com"
+        - "bob@example.com"
+  rules:
+    - name: engineering-default
+      subject: "group:engineering"
+      role: user
+      allow_models:
+        - "anthropic/*"
+        - "openai/*"
+        - "gemini/*"
+        - "ollama/*"
+        - "team/*"
+      deny_models: []
+      allow_mcp_tools:
+        - "docs/*"
+      deny_mcp_tools: []
+      priority: 100
+
+storage:
+  # Supported drivers: sqlite | postgres
+  driver: sqlite
+  dsn: "./data/headlamp.db"
+
+providers:
+  - name: anthropic
+    type: anthropic
+    base_url: "https://api.anthropic.com"
+    api_key: "${ANTHROPIC_API_KEY}"
+    passthrough: false
+    models:
+      - "claude-sonnet-4-20250514"
+      - "claude-opus-4-20250514"
+      - "claude-3-5-haiku-20241022"
+
+  - name: openai
+    type: openai
+    base_url: "https://api.openai.com"
+    api_key: "${OPENAI_API_KEY}"
+    passthrough: false
+    models:
+      - "gpt-4.1"
+      - "gpt-4.1-mini"
+      - "o4-mini"
+
+  - name: gemini
+    type: gemini
+    base_url: "https://generativelanguage.googleapis.com"
+    api_key: "${GEMINI_API_KEY}"
+    passthrough: false
+    models:
+      - "gemini-2.5-pro"
+      - "gemini-2.5-flash"
+
+  - name: ollama
+    type: ollama
+    base_url: "http://127.0.0.1:11434"
+    api_key: ""
+    passthrough: false
+    models:
+      - "qwen2.5-coder:32b"
+
+routes:
+  - alias: "team/coding"
+    provider: anthropic
+    model: "claude-sonnet-4-20250514"
+    fallbacks:
+      - provider: openai
+        model: "gpt-4.1"
+
+  - alias: "team/fast"
+    provider: gemini
+    model: "gemini-2.5-flash"
+    fallbacks:
+      - provider: openai
+        model: "gpt-4.1-mini"
+
+audit:
+  # Privacy-minimal default: metadata in usage_logs only, full payloads disabled.
+  store_payloads: false
+  # Days to retain audit_payloads when enabled (0 disables automatic purge).
+  retention_days: 7
+
+# ---------------------------------------------------------------------------
+# Headscale v0.29.7 Policy & Grants Reference Snippet (HuJSON)
+# ---------------------------------------------------------------------------
+# Save as your Headscale policy file (policy.path in headscale config.yaml):
+#
+# {
+#   "groups": {
+#     "group:admins": ["alice@"],
+#     "group:engineering": ["alice@", "bob@"]
+#   },
+#   "tagOwners": {
+#     "tag:headlamp": ["group:admins"],
+#     "tag:ci-runner": ["group:admins"]
+#   },
+#   "grants": [
+#     {
+#       "src": ["group:admins"],
+#       "dst": ["tag:headlamp"],
+#       "ip": ["80", "443"],
+#       "app": {
+#         "headlamp.dev/cap/gateway": [
+#           {
+#             "role": "admin",
+#             "models": ["*"],
+#             "mcp_tools": ["*"]
+#           }
+#         ]
+#       }
+#     },
+#     {
+#       "src": ["group:engineering"],
+#       "dst": ["tag:headlamp"],
+#       "ip": ["80", "443"],
+#       "app": {
+#         "headlamp.dev/cap/gateway": [
+#           {
+#             "role": "user",
+#             "models": ["anthropic/*", "openai/gpt-4.1*", "team/*"],
+#             "mcp_tools": ["docs/*", "github/read_*"]
+#           }
+#         ]
+#       }
+#     }
+#   ]
+# }
+#
+# In Headscale v0.29.7 config.yaml:
+#   policy:
+#     mode: file
+#     path: /etc/headscale/policy.hujson
+#   dns:
+#     magic_dns: true
+#     base_domain: tailnet.internal
+#
+# Register Headlamp with a reusable tagged pre-auth key:
+#   headscale preauthkeys create --user admin --reusable --tags tag:headlamp --expiration 24h
