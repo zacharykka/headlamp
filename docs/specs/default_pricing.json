@@ -1,0 +1,532 @@
+{
+  "schema_version": 1,
+  "currency": "USD",
+  "unit": "per_1m_tokens",
+  "updated_at": "2026-11-26",
+  "notes": "Standard online tier pricing in USD per 1M tokens. Reasoning/thinking tokens are billed at the output rate. Anthropic cache_write is the default 5-minute ephemeral TTL (1.25x input); cache_write_1h is the optional 1-hour TTL (2.0x input). OpenAI and Gemini implicit caching have 0 cache_write fee.",
+  "models": {
+    "openai/gpt-5.4": {
+      "input": 2.50,
+      "output": 15.00,
+      "cache_read": 0.25,
+      "cache_write": 0.0
+    },
+    "openai/gpt-5.2": {
+      "input": 1.75,
+      "output": 14.00,
+      "cache_read": 0.175,
+      "cache_write": 0.0
+    },
+    "openai/gpt-5.1": {
+      "input": 1.25,
+      "output": 10.00,
+      "cache_read": 0.125,
+      "cache_write": 0.0
+    },
+    "openai/gpt-5": {
+      "input": 1.25,
+      "output": 10.00,
+      "cache_read": 0.125,
+      "cache_write": 0.0
+    },
+    "openai/gpt-5-mini": {
+      "input": 0.25,
+      "output": 2.00,
+      "cache_read": 0.025,
+      "cache_write": 0.0
+    },
+    "openai/gpt-5-nano": {
+      "input": 0.05,
+      "output": 0.40,
+      "cache_read": 0.005,
+      "cache_write": 0.0
+    },
+    "openai/gpt-4.1": {
+      "input": 2.00,
+      "output": 8.00,
+      "cache_read": 0.50,
+      "cache_write": 0.0
+    },
+    "openai/gpt-4.1-mini": {
+      "input": 0.40,
+      "output": 1.60,
+      "cache_read": 0.10,
+      "cache_write": 0.0
+    },
+    "openai/gpt-4.1-nano": {
+      "input": 0.10,
+      "output": 0.40,
+      "cache_read": 0.025,
+      "cache_write": 0.0
+    },
+    "openai/gpt-4o": {
+      "input": 2.50,
+      "output": 10.00,
+      "cache_read": 1.25,
+      "cache_write": 0.0
+    },
+    "openai/gpt-4o-mini": {
+      "input": 0.15,
+      "output": 0.60,
+      "cache_read": 0.075,
+      "cache_write": 0.0
+    },
+    "openai/o3": {
+      "input": 2.00,
+      "output": 8.00,
+      "cache_read": 0.50,
+      "cache_write": 0.0
+    },
+    "openai/o4-mini": {
+      "input": 1.10,
+      "output": 4.40,
+      "cache_read": 0.275,
+      "cache_write": 0.0
+    },
+    "openai/o3-mini": {
+      "input": 1.10,
+      "output": 4.40,
+      "cache_read": 0.55,
+      "cache_write": 0.0
+    },
+    "openai/text-embedding-3-small": {
+      "input": 0.02,
+      "output": 0.0,
+      "cache_read": 0.0,
+      "cache_write": 0.0
+    },
+    "openai/text-embedding-3-large": {
+      "input": 0.13,
+      "output": 0.0,
+      "cache_read": 0.0,
+      "cache_write": 0.0
+    },
+    "anthropic/claude-opus-5-5": {
+      "input": 4.00,
+      "output": 20.00,
+      "cache_read": 0.20,
+      "cache_write": 5.00,
+      "cache_write_1h": 8.00
+    },
+    "anthropic/claude-sonnet-5-5": {
+      "input": 2.00,
+      "output": 10.00,
+      "cache_read": 0.10,
+      "cache_write": 2.50,
+      "cache_write_1h": 4.00
+    },
+    "anthropic/claude-haiku-5-5": {
+      "input": 0.10,
+      "output": 0.50,
+      "cache_read": 0.01,
+      "cache_write": 0.125,
+      "cache_write_1h": 0.20
+    },
+    "anthropic/claude-opus-4-6": {
+      "input": 5.00,
+      "output": 25.00,
+      "cache_read": 0.50,
+      "cache_write": 6.25,
+      "cache_write_1h": 10.00
+    },
+    "anthropic/claude-sonnet-4-6": {
+      "input": 3.00,
+      "output": 15.00,
+      "cache_read": 0.30,
+      "cache_write": 3.75,
+      "cache_write_1h": 6.00
+    },
+    "anthropic/claude-opus-4-5": {
+      "input": 5.00,
+      "output": 25.00,
+      "cache_read": 0.50,
+      "cache_write": 6.25,
+      "cache_write_1h": 10.00
+    },
+    "anthropic/claude-sonnet-4-5": {
+      "input": 3.00,
+      "output": 15.00,
+      "cache_read": 0.30,
+      "cache_write": 3.75,
+      "cache_write_1h": 6.00
+    },
+    "anthropic/claude-haiku-4-5": {
+      "input": 1.00,
+      "output": 5.00,
+      "cache_read": 0.10,
+      "cache_write": 1.25,
+      "cache_write_1h": 2.00
+    },
+    "anthropic/claude-opus-4-1": {
+      "input": 15.00,
+      "output": 75.00,
+      "cache_read": 1.50,
+      "cache_write": 18.75,
+      "cache_write_1h": 30.00
+    },
+    "anthropic/claude-opus-4-0": {
+      "input": 15.00,
+      "output": 75.00,
+      "cache_read": 1.50,
+      "cache_write": 18.75,
+      "cache_write_1h": 30.00
+    },
+    "anthropic/claude-sonnet-4-0": {
+      "input": 3.00,
+      "output": 15.00,
+      "cache_read": 0.30,
+      "cache_write": 3.75,
+      "cache_write_1h": 6.00
+    },
+    "anthropic/claude-3-7-sonnet": {
+      "input": 3.00,
+      "output": 15.00,
+      "cache_read": 0.30,
+      "cache_write": 3.75,
+      "cache_write_1h": 6.00
+    },
+    "anthropic/claude-3-5-sonnet": {
+      "input": 3.00,
+      "output": 15.00,
+      "cache_read": 0.30,
+      "cache_write": 3.75,
+      "cache_write_1h": 6.00
+    },
+    "anthropic/claude-3-5-haiku": {
+      "input": 0.80,
+      "output": 4.00,
+      "cache_read": 0.08,
+      "cache_write": 1.00,
+      "cache_write_1h": 1.60
+    },
+    "gemini/gemini-3.1-pro-preview": {
+      "input": 2.00,
+      "output": 12.00,
+      "cache_read": 0.20,
+      "cache_write": 0.0
+    },
+    "gemini/gemini-3-pro-preview": {
+      "input": 2.00,
+      "output": 12.00,
+      "cache_read": 0.20,
+      "cache_write": 0.0
+    },
+    "gemini/gemini-3-flash-preview": {
+      "input": 0.50,
+      "output": 3.00,
+      "cache_read": 0.05,
+      "cache_write": 0.0
+    },
+    "gemini/gemini-2.5-pro": {
+      "input": 1.25,
+      "output": 10.00,
+      "cache_read": 0.125,
+      "cache_write": 0.0
+    },
+    "gemini/gemini-2.5-flash": {
+      "input": 0.30,
+      "output": 2.50,
+      "cache_read": 0.03,
+      "cache_write": 0.0
+    },
+    "gemini/gemini-2.5-flash-lite": {
+      "input": 0.10,
+      "output": 0.40,
+      "cache_read": 0.01,
+      "cache_write": 0.0
+    },
+    "gemini/gemini-2.0-flash": {
+      "input": 0.10,
+      "output": 0.40,
+      "cache_read": 0.025,
+      "cache_write": 0.0
+    },
+    "gemini/gemini-2.0-flash-lite": {
+      "input": 0.075,
+      "output": 0.30,
+      "cache_read": 0.0,
+      "cache_write": 0.0
+    }
+  },
+  "patterns": [
+    {
+      "pattern": "ollama/*",
+      "input": 0.0,
+      "output": 0.0,
+      "cache_read": 0.0,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "local/*",
+      "input": 0.0,
+      "output": 0.0,
+      "cache_read": 0.0,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "openai/gpt-5.4*",
+      "input": 2.50,
+      "output": 15.00,
+      "cache_read": 0.25,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "openai/gpt-5.2*",
+      "input": 1.75,
+      "output": 14.00,
+      "cache_read": 0.175,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "openai/gpt-5.1*",
+      "input": 1.25,
+      "output": 10.00,
+      "cache_read": 0.125,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "openai/gpt-5-mini*",
+      "input": 0.25,
+      "output": 2.00,
+      "cache_read": 0.025,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "openai/gpt-5-nano*",
+      "input": 0.05,
+      "output": 0.40,
+      "cache_read": 0.005,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "openai/gpt-5*",
+      "input": 1.25,
+      "output": 10.00,
+      "cache_read": 0.125,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "openai/gpt-4.1-mini*",
+      "input": 0.40,
+      "output": 1.60,
+      "cache_read": 0.10,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "openai/gpt-4.1-nano*",
+      "input": 0.10,
+      "output": 0.40,
+      "cache_read": 0.025,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "openai/gpt-4.1*",
+      "input": 2.00,
+      "output": 8.00,
+      "cache_read": 0.50,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "openai/gpt-4o-mini*",
+      "input": 0.15,
+      "output": 0.60,
+      "cache_read": 0.075,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "openai/gpt-4o*",
+      "input": 2.50,
+      "output": 10.00,
+      "cache_read": 1.25,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "openai/o4-mini*",
+      "input": 1.10,
+      "output": 4.40,
+      "cache_read": 0.275,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "openai/o3-mini*",
+      "input": 1.10,
+      "output": 4.40,
+      "cache_read": 0.55,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "openai/o3*",
+      "input": 2.00,
+      "output": 8.00,
+      "cache_read": 0.50,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "anthropic/claude-opus-5-5*",
+      "input": 4.00,
+      "output": 20.00,
+      "cache_read": 0.20,
+      "cache_write": 5.00,
+      "cache_write_1h": 8.00
+    },
+    {
+      "pattern": "anthropic/claude-sonnet-5-5*",
+      "input": 2.00,
+      "output": 10.00,
+      "cache_read": 0.10,
+      "cache_write": 2.50,
+      "cache_write_1h": 4.00
+    },
+    {
+      "pattern": "anthropic/claude-haiku-5-5*",
+      "input": 0.10,
+      "output": 0.50,
+      "cache_read": 0.01,
+      "cache_write": 0.125,
+      "cache_write_1h": 0.20
+    },
+    {
+      "pattern": "anthropic/claude-opus-4-6*",
+      "input": 5.00,
+      "output": 25.00,
+      "cache_read": 0.50,
+      "cache_write": 6.25,
+      "cache_write_1h": 10.00
+    },
+    {
+      "pattern": "anthropic/claude-sonnet-4-6*",
+      "input": 3.00,
+      "output": 15.00,
+      "cache_read": 0.30,
+      "cache_write": 3.75,
+      "cache_write_1h": 6.00
+    },
+    {
+      "pattern": "anthropic/claude-opus-4-5*",
+      "input": 5.00,
+      "output": 25.00,
+      "cache_read": 0.50,
+      "cache_write": 6.25,
+      "cache_write_1h": 10.00
+    },
+    {
+      "pattern": "anthropic/claude-sonnet-4-5*",
+      "input": 3.00,
+      "output": 15.00,
+      "cache_read": 0.30,
+      "cache_write": 3.75,
+      "cache_write_1h": 6.00
+    },
+    {
+      "pattern": "anthropic/claude-haiku-4-5*",
+      "input": 1.00,
+      "output": 5.00,
+      "cache_read": 0.10,
+      "cache_write": 1.25,
+      "cache_write_1h": 2.00
+    },
+    {
+      "pattern": "anthropic/claude-opus-4*",
+      "input": 15.00,
+      "output": 75.00,
+      "cache_read": 1.50,
+      "cache_write": 18.75,
+      "cache_write_1h": 30.00
+    },
+    {
+      "pattern": "anthropic/claude-sonnet-4*",
+      "input": 3.00,
+      "output": 15.00,
+      "cache_read": 0.30,
+      "cache_write": 3.75,
+      "cache_write_1h": 6.00
+    },
+    {
+      "pattern": "anthropic/claude-3-7-sonnet*",
+      "input": 3.00,
+      "output": 15.00,
+      "cache_read": 0.30,
+      "cache_write": 3.75,
+      "cache_write_1h": 6.00
+    },
+    {
+      "pattern": "anthropic/claude-3-5-sonnet*",
+      "input": 3.00,
+      "output": 15.00,
+      "cache_read": 0.30,
+      "cache_write": 3.75,
+      "cache_write_1h": 6.00
+    },
+    {
+      "pattern": "anthropic/claude-3-5-haiku*",
+      "input": 0.80,
+      "output": 4.00,
+      "cache_read": 0.08,
+      "cache_write": 1.00,
+      "cache_write_1h": 1.60
+    },
+    {
+      "pattern": "gemini/gemini-3.1-pro*",
+      "input": 2.00,
+      "output": 12.00,
+      "cache_read": 0.20,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "gemini/gemini-3-pro*",
+      "input": 2.00,
+      "output": 12.00,
+      "cache_read": 0.20,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "gemini/gemini-3-flash*",
+      "input": 0.50,
+      "output": 3.00,
+      "cache_read": 0.05,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "gemini/gemini-2.5-pro*",
+      "input": 1.25,
+      "output": 10.00,
+      "cache_read": 0.125,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "gemini/gemini-2.5-flash-lite*",
+      "input": 0.10,
+      "output": 0.40,
+      "cache_read": 0.01,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "gemini/gemini-2.5-flash*",
+      "input": 0.30,
+      "output": 2.50,
+      "cache_read": 0.03,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "gemini/gemini-2.0-flash-lite*",
+      "input": 0.075,
+      "output": 0.30,
+      "cache_read": 0.0,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "gemini/gemini-2.0-flash*",
+      "input": 0.10,
+      "output": 0.40,
+      "cache_read": 0.025,
+      "cache_write": 0.0
+    },
+    {
+      "pattern": "*",
+      "input": 0.0,
+      "output": 0.0,
+      "cache_read": 0.0,
+      "cache_write": 0.0
+    }
+  ]
+}

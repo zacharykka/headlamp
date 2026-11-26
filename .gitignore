@@ -39,3 +39,8 @@ web/dist/
 .vscode/
 *.swp
 *.swo
+
+# Agent Prompts
+AGNETS.md
+DESIGN.md
+CLAUDE.md

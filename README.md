@@ -66,6 +66,7 @@ In `hybrid` or `grants_only` policy mode, Headlamp reads `headlamp.dev/cap/gatew
     {
       "src": ["group:engineering"],
       "dst": ["tag:headlamp"],
+      "ip": ["tcp:80", "tcp:443"],
       "app": {
         "headlamp.dev/cap/gateway": [
           {
@@ -80,7 +81,7 @@ In `hybrid` or `grants_only` policy mode, Headlamp reads `headlamp.dev/cap/gatew
 }
 ```
 
-See [`headlamp.example.yaml`](headlamp.example.yaml) for a fuller Headscale v0.29.7 policy snippet.
+See [`docs/headscale-setup.md`](docs/headscale-setup.md) and [`headlamp.example.yaml`](headlamp.example.yaml) for a full Headscale v0.29.7 setup and policy guide.
 
 ## Development
 

@@ -156,7 +156,7 @@ audit:
 #     {
 #       "src": ["group:admins"],
 #       "dst": ["tag:headlamp"],
-#       "ip": ["80", "443"],
+#       "ip": ["tcp:80", "tcp:443"],
 #       "app": {
 #         "headlamp.dev/cap/gateway": [
 #           {
@@ -170,7 +170,7 @@ audit:
 #     {
 #       "src": ["group:engineering"],
 #       "dst": ["tag:headlamp"],
-#       "ip": ["80", "443"],
+#       "ip": ["tcp:80", "tcp:443"],
 #       "app": {
 #         "headlamp.dev/cap/gateway": [
 #           {
@@ -192,5 +192,5 @@ audit:
 #     magic_dns: true
 #     base_domain: tailnet.internal
 #
-# Register Headlamp with a reusable tagged pre-auth key:
-#   headscale preauthkeys create --user admin --reusable --tags tag:headlamp --expiration 24h
+# Register Headlamp with a reusable tagged pre-auth key (Headscale v0.29+ tagged keys are user-less):
+#   headscale preauthkeys create --reusable --tags tag:headlamp --expiration 24h
