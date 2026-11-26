@@ -237,15 +237,17 @@ Headscale v0.29+ implements Tailscale's modern `grants` syntax (including `ip`, 
       }
     },
 
-    // 3. Aperture compatibility alias (same policy syntax as Tailscale Aperture!)
-    // Note: Aperture grants often place role/models/connectors in separate objects within the array,
-    // and "models" may be a single string glob rather than an array.
+    // 3. Multi-object array & string "models" syntax under headlamp.dev/cap/gateway
+    // CRITICAL: Headscale v0.29.7 rejects capability names under "tailscale.com/cap/*"
+    // with "capability name must not be in the tailscale.com domain".
+    // Use "headlamp.dev/cap/gateway" on Headscale; Headlamp also accepts
+    // "tailscale.com/cap/aperture" when connected to official Tailscale SaaS.
     {
       "src": ["group:interns"],
       "dst": ["tag:headlamp"],
       "ip": ["tcp:80", "tcp:443"],
       "app": {
-        "tailscale.com/cap/aperture": [
+        "headlamp.dev/cap/gateway": [
           { "role": "user" },
           { "models": "ollama/**" },
           { "connectors": ["docs/**"] }
@@ -326,6 +328,7 @@ kill -HUP $(pidof headscale) # or `headscale policy set -f ...` in database mode
 6. **MagicDNS Trailing Dot & `extra_records` Limits**:
    * `who.Node.Name` always has a trailing dot (e.g. `"alice-mac.tailnet.internal."`). Strip it before storing/displaying.
    * Headscale `dns.extra_records` only supports `A` and `AAAA` records (Tailscale clients silently drop `CNAME`), and mixed-case names are lowercased in v0.29.
-7. **Non-OIDC Headscale `LoginName` Formats**: Headscale local users created without OIDC email may appear as `alice` or `alice@` (trailing `@` with no domain) in `UserProfile.LoginName`. Do not reject `LoginName` with a strict email regex; trim a trailing `@` only consistently if normalizing, or match exact configured `bootstrap_admins` / policy subjects.
-8. **State Persistence & `AuthKey` Reuse**: Always set `tsnet.Server.Dir`. Once `tailscaled.state` is written, `tsnet` ignores `AuthKey` on restart. If you wipe `Dir`, remove the stale node from Headscale or expect a `-1` suffix on the MagicDNS hostname (`headlamp-1`).
-9. **Headscale v0.29.7 Policy Validation & Limits**: Policy `tests` blocks are validated automatically on reload/set; malformed rules reject the entire reload. Pending interactive registration payloads are capped at 64 KiB, and metrics are strictly isolated to `metrics_listen_addr` (no longer exposed over Noise).
+7. **Non-OIDC Headscale `LoginName` vs Policy Syntax**: For local Headscale v0.29.7 users without an OIDC email, Headscale policy `src`/`groups` entries use a trailing `@` (e.g. `"alice@"`), whereas `WhoIs.UserProfile.LoginName` reports `"alice"` without the trailing `@` (and Headlamp trims any trailing `@` if present). Configure Headlamp `bootstrap_admins` and local policy `subject` without the trailing `@` (or confirm via `GET /whoami`).
+8. **Headscale v0.29.7 Forbids `tailscale.com/cap/*` Capabilities**: Applying a policy containing `"tailscale.com/cap/aperture"` fails in Headscale v0.29.7 with `capability name must not be in the tailscale.com domain`. Always use `"headlamp.dev/cap/gateway"` on Headscale (multi-object arrays and string-or-slice `models` work identically under it); keep `"tailscale.com/cap/aperture"` parsing strictly for official Tailscale SaaS compatibility.
+9. **State Persistence & `AuthKey` Reuse**: Always set `tsnet.Server.Dir`. Once `tailscaled.state` is written, `tsnet` ignores `AuthKey` on restart. If you wipe `Dir`, remove the stale node from Headscale or expect a `-1` suffix on the MagicDNS hostname (`headlamp-1`).
+10. **Headscale v0.29.7 Policy Validation & Limits**: Policy `tests` blocks are validated automatically on reload/set; malformed rules reject the entire reload. Pending interactive registration payloads are capped at 64 KiB, and metrics are strictly isolated to `metrics_listen_addr` (no longer exposed over Noise).

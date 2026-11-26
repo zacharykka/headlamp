@@ -77,13 +77,17 @@ Save as `/etc/headscale/policy.hujson`:
       }
     },
 
-    // Optional: Tailscale Aperture compatibility syntax also works
+    // Multi-object array & single-string "models" syntax also work under headlamp.dev/cap/gateway.
+    // Note: Headscale v0.29.7 rejects "tailscale.com/cap/*" capability names
+    // ("capability name must not be in the tailscale.com domain"), so always use
+    // "headlamp.dev/cap/gateway" on Headscale. ("tailscale.com/cap/aperture" is
+    // supported by Headlamp for official Tailscale SaaS tailnets only.)
     {
       "src": ["group:interns"],
       "dst": ["tag:headlamp"],
       "ip": ["tcp:80", "tcp:443"],
       "app": {
-        "tailscale.com/cap/aperture": [
+        "headlamp.dev/cap/gateway": [
           { "role": "user" },
           { "models": "ollama/**" },
           { "connectors": ["docs/**"] }
@@ -251,6 +255,7 @@ claude
 ## 6. Headscale v0.29.7 Troubleshooting Checklist
 
 - **Connection refused / timeout to `http://headlamp`**: Verify your grant includes `"ip": ["tcp:80", "tcp:443"]` (not just `"app"`).
+- **`capability name must not be in the tailscale.com domain`**: Headscale v0.29.7 forbids `tailscale.com/cap/*` capability names in policies. Use `"headlamp.dev/cap/gateway"` on Headscale (Headlamp's `"tailscale.com/cap/aperture"` compatibility is for official Tailscale SaaS only).
 - **Tagged devices show `tagged-devices` in Headscale**: Expected in Headscale v0.28/v0.29+. Headlamp inspects `Node.IsTagged()` first and resolves the caller subject to `tag:<name>` (e.g. `tag:ci-runner`) rather than `tagged-devices`.
-- **Non-OIDC local users**: Local Headscale users without OIDC email appear as `alice` or `alice@`; list the exact value reported by `headscale users list` in `bootstrap_admins` or `policy.hujson`.
+- **Non-OIDC local users**: In Headscale v0.29.7, policy `src` / `groups` entries use a trailing `@` (for example `"alice@"`), while `WhoIs.UserProfile.LoginName`—and therefore Headlamp's `bootstrap_admins` and local policy `subject`—uses `"alice"` without the trailing `@`. Run `curl http://headlamp/whoami` from a tailnet device to confirm the exact resolved `principal.subject`.
 - **HTTPS on Headscale**: Tailscale SaaS automatic `*.ts.net` certs (`ListenTLS`) are not available on Headscale. Use `tls.mode: none` inside WireGuard (default) or `tls.mode: static` with your own certificate and key.

@@ -141,7 +141,14 @@ audit:
 # ---------------------------------------------------------------------------
 # Headscale v0.29.7 Policy & Grants Reference Snippet (HuJSON)
 # ---------------------------------------------------------------------------
-# Save as your Headscale policy file (policy.path in headscale config.yaml):
+# Save as your Headscale policy file (policy.path in headscale config.yaml).
+# Notes for Headscale v0.29.7:
+#   - Always use "headlamp.dev/cap/gateway" on Headscale (Headscale v0.29.7
+#     rejects "tailscale.com/cap/*" capability names; "tailscale.com/cap/aperture"
+#     compatibility applies to official Tailscale SaaS only).
+#   - For non-OIDC Headscale users, policy src/groups use a trailing "@"
+#     (e.g. "alice@"), while WhoIs / Headlamp bootstrap_admins / local policy
+#     subjects use "alice" without "@" (confirm with GET /whoami).
 #
 # {
 #   "groups": {

@@ -58,7 +58,7 @@ export GEMINI_API_KEY="headlamp"
 
 ## Headscale v0.29.7 `grants` Example
 
-In `hybrid` or `grants_only` policy mode, Headlamp reads `headlamp.dev/cap/gateway` (and compatible alias `tailscale.com/cap/aperture`) from Headscale `WhoIs` capabilities:
+In `hybrid` or `grants_only` policy mode, Headlamp reads `headlamp.dev/cap/gateway` from Headscale `WhoIs` capabilities (and also supports `tailscale.com/cap/aperture` when connected to official Tailscale SaaS — note that Headscale v0.29.7 rejects `tailscale.com/cap/*` capability names):
 
 ```jsonc
 {
