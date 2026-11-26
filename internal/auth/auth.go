@@ -18,6 +18,9 @@ const (
 
 	RoleUser  = "user"
 	RoleAdmin = "admin"
+
+	// CapHeadlampGateway is the Headscale/Tailscale peer capability key used for grants.
+	CapHeadlampGateway = "headlamp.dev/cap/gateway"
 )
 
 var (
@@ -28,13 +31,14 @@ var (
 )
 
 // Principal represents the authenticated caller of a Headlamp request.
+// Authorization capabilities live in RawCaps (native Headscale/Tailscale grants for tsnet
+// callers, or synthesized headlamp.dev/cap/gateway grants for dev_mock and static API tokens).
 type Principal struct {
 	Subject     string            `json:"subject"`
 	DisplayName string            `json:"display_name"`
 	NodeName    string            `json:"node_name"`
 	NodeIP      string            `json:"node_ip"`
 	Tags        []string          `json:"tags"`
-	Groups      []string          `json:"groups"`
 	Roles       []string          `json:"roles"`
 	RawCaps     map[string][]byte `json:"-"`
 	AuthSource  string            `json:"auth_source"`
@@ -53,14 +57,6 @@ func (p *Principal) IsAdmin() bool {
 	return p.HasRole(RoleAdmin)
 }
 
-// HasGroup reports whether the principal belongs to the given group.
-func (p *Principal) HasGroup(group string) bool {
-	if p == nil {
-		return false
-	}
-	return slices.Contains(p.Groups, group)
-}
-
 // HasTag reports whether the principal carries the given Tailnet node tag.
 func (p *Principal) HasTag(tag string) bool {
 	if p == nil {
@@ -76,7 +72,6 @@ func (p *Principal) Clone() *Principal {
 	}
 	cp := *p
 	cp.Tags = slices.Clone(p.Tags)
-	cp.Groups = slices.Clone(p.Groups)
 	cp.Roles = slices.Clone(p.Roles)
 	if p.RawCaps != nil {
 		cp.RawCaps = make(map[string][]byte, len(p.RawCaps))
@@ -141,18 +136,19 @@ func (c *ChainAuthenticator) Authenticate(r *http.Request) (*Principal, error) {
 }
 
 // DevAuthenticator synthesizes a local Principal for development and testing.
-// Optional request headers X-Headlamp-Dev-User, X-Headlamp-Dev-Roles, and
-// X-Headlamp-Dev-Tags override the defaults per request.
+// Request headers X-Headlamp-Dev-User, X-Headlamp-Dev-Roles, and X-Headlamp-Dev-Tags
+// are ignored unless allowHeaderOverride is true AND the request arrives from a loopback peer.
 type DevAuthenticator struct {
-	defaultSubject     string
-	defaultDisplayName string
-	defaultRoles       []string
-	defaultGroups      []string
-	defaultTags        []string
+	defaultSubject      string
+	defaultDisplayName  string
+	defaultRoles        []string
+	defaultTags         []string
+	allowHeaderOverride bool
 }
 
-// NewDevAuthenticator creates a dev_mock Authenticator.
-func NewDevAuthenticator(subject string, roles []string) *DevAuthenticator {
+// NewDevAuthenticator creates a dev_mock Authenticator that synthesizes
+// headlamp.dev/cap/gateway grants for pure grants-only policy evaluation.
+func NewDevAuthenticator(subject string, roles []string, allowHeaderOverride bool) *DevAuthenticator {
 	if strings.TrimSpace(subject) == "" {
 		subject = "dev@local"
 	}
@@ -160,26 +156,29 @@ func NewDevAuthenticator(subject string, roles []string) *DevAuthenticator {
 		roles = []string{RoleAdmin, RoleUser}
 	}
 	return &DevAuthenticator{
-		defaultSubject:     subject,
-		defaultDisplayName: subject,
-		defaultRoles:       slices.Clone(roles),
+		defaultSubject:      subject,
+		defaultDisplayName:  subject,
+		defaultRoles:        slices.Clone(roles),
+		allowHeaderOverride: allowHeaderOverride,
 	}
 }
 
-// Authenticate always returns a mock Principal tagged with AuthSourceDevMock.
+// Authenticate returns a mock Principal tagged with AuthSourceDevMock and synthesized grants.
 func (d *DevAuthenticator) Authenticate(r *http.Request) (*Principal, error) {
 	subject := d.defaultSubject
 	displayName := d.defaultDisplayName
 	roles := slices.Clone(d.defaultRoles)
 	tags := slices.Clone(d.defaultTags)
 
-	if r != nil {
+	if d.allowHeaderOverride && isLoopbackRequest(r) {
 		if v := strings.TrimSpace(r.Header.Get("X-Headlamp-Dev-User")); v != "" {
 			subject = v
 			displayName = v
 		}
 		if v := strings.TrimSpace(r.Header.Get("X-Headlamp-Dev-Roles")); v != "" {
-			roles = splitHeaderCSV(v)
+			if parsed := splitHeaderCSV(v); len(parsed) > 0 {
+				roles = parsed
+			}
 		}
 		if v := strings.TrimSpace(r.Header.Get("X-Headlamp-Dev-Tags")); v != "" {
 			tags = splitHeaderCSV(v)
@@ -192,25 +191,30 @@ func (d *DevAuthenticator) Authenticate(r *http.Request) (*Principal, error) {
 		NodeName:    "localhost",
 		NodeIP:      remoteHost(r),
 		Tags:        tags,
-		Groups:      slices.Clone(d.defaultGroups),
 		Roles:       roles,
+		RawCaps:     synthesizeGatewayCaps(roles, []string{"*"}, nil, []string{"*"}, nil),
 		AuthSource:  AuthSourceDevMock,
 	}, nil
 }
 
-// StaticToken binds a pre-shared API token to a Principal identity.
+// StaticToken binds a pre-shared API token to a Principal identity and inline grant scopes.
+// AllowModels defaults to ["*"] when omitted.
 type StaticToken struct {
-	Name        string
-	Token       string
-	Subject     string
-	DisplayName string
-	Groups      []string
-	Roles       []string
-	Tags        []string
+	Name          string
+	Token         string
+	Subject       string
+	DisplayName   string
+	Roles         []string
+	Tags          []string
+	AllowModels   []string
+	DenyModels    []string
+	AllowMCPTools []string
+	DenyMCPTools  []string
 }
 
 // TokenAuthenticator authenticates requests using fallback static API tokens.
-// Tokens are read from Authorization: Bearer, x-api-key, or x-goog-api-key headers.
+// Tokens are read from Authorization: Bearer, x-api-key, x-goog-api-key, or
+// (for /gemini/* routes only) the ?key= query parameter.
 type TokenAuthenticator struct {
 	tokens        []StaticToken
 	ignoreUnknown bool
@@ -227,9 +231,12 @@ func NewTokenAuthenticator(tokens []StaticToken, ignoreUnknown bool) *TokenAuthe
 			continue
 		}
 		cp := t
-		cp.Groups = slices.Clone(t.Groups)
 		cp.Roles = slices.Clone(t.Roles)
 		cp.Tags = slices.Clone(t.Tags)
+		cp.AllowModels = slices.Clone(t.AllowModels)
+		cp.DenyModels = slices.Clone(t.DenyModels)
+		cp.AllowMCPTools = slices.Clone(t.AllowMCPTools)
+		cp.DenyMCPTools = slices.Clone(t.DenyMCPTools)
 		copied = append(copied, cp)
 	}
 	return &TokenAuthenticator{
@@ -238,7 +245,7 @@ func NewTokenAuthenticator(tokens []StaticToken, ignoreUnknown bool) *TokenAuthe
 	}
 }
 
-// Authenticate validates a bearer or vendor API key header using constant-time comparison.
+// Authenticate validates a bearer, vendor header, or Gemini ?key= credential using constant-time comparison.
 func (t *TokenAuthenticator) Authenticate(r *http.Request) (*Principal, error) {
 	if len(t.tokens) == 0 || r == nil {
 		return nil, nil
@@ -276,14 +283,19 @@ func (t *TokenAuthenticator) Authenticate(r *http.Request) (*Principal, error) {
 		roles = []string{RoleUser}
 	}
 
+	allowModels := slices.Clone(tok.AllowModels)
+	if len(allowModels) == 0 {
+		allowModels = []string{"*"}
+	}
+
 	return &Principal{
 		Subject:     tok.Subject,
 		DisplayName: displayName,
 		NodeName:    tok.Name,
 		NodeIP:      remoteHost(r),
 		Tags:        slices.Clone(tok.Tags),
-		Groups:      slices.Clone(tok.Groups),
 		Roles:       roles,
+		RawCaps:     synthesizeGatewayCaps(roles, allowModels, tok.DenyModels, tok.AllowMCPTools, tok.DenyMCPTools),
 		AuthSource:  AuthSourceAPIKey,
 	}, nil
 }
@@ -315,6 +327,45 @@ func Middleware(authenticator Authenticator, onError func(http.ResponseWriter, *
 	}
 }
 
+type synthesizedGrant struct {
+	Role         string   `json:"role,omitempty"`
+	Models       []string `json:"models,omitempty"`
+	DenyModels   []string `json:"deny_models,omitempty"`
+	MCPTools     []string `json:"mcp_tools,omitempty"`
+	DenyMCPTools []string `json:"deny_mcp_tools,omitempty"`
+}
+
+func synthesizeGatewayCaps(roles, allowModels, denyModels, allowMCPTools, denyMCPTools []string) map[string][]byte {
+	grant := synthesizedGrant{
+		Role:         primaryRole(roles),
+		Models:       slices.Clone(allowModels),
+		DenyModels:   slices.Clone(denyModels),
+		MCPTools:     slices.Clone(allowMCPTools),
+		DenyMCPTools: slices.Clone(denyMCPTools),
+	}
+	encoded, err := json.Marshal([]synthesizedGrant{grant})
+	if err != nil {
+		return nil
+	}
+	return map[string][]byte{
+		CapHeadlampGateway: encoded,
+	}
+}
+
+func primaryRole(roles []string) string {
+	for _, r := range roles {
+		if strings.EqualFold(strings.TrimSpace(r), RoleAdmin) {
+			return RoleAdmin
+		}
+	}
+	for _, r := range roles {
+		if trimmed := strings.ToLower(strings.TrimSpace(r)); trimmed != "" {
+			return trimmed
+		}
+	}
+	return RoleUser
+}
+
 func writeUnauthorized(w http.ResponseWriter, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)
@@ -338,7 +389,24 @@ func extractRequestToken(r *http.Request) string {
 	if key := strings.TrimSpace(r.Header.Get("x-goog-api-key")); key != "" {
 		return key
 	}
+	if r.URL != nil && strings.HasPrefix(r.URL.Path, "/gemini/") {
+		if key := strings.TrimSpace(r.URL.Query().Get("key")); key != "" {
+			return key
+		}
+	}
 	return ""
+}
+
+func isLoopbackRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	host := remoteHost(r)
+	if host == "" {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func remoteHost(r *http.Request) string {

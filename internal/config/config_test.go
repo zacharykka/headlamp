@@ -24,6 +24,9 @@ func TestLoadExampleYAML(t *testing.T) {
 	if cfg.Server.TSNet.AuthKey != "tskey-auth-example" {
 		t.Fatalf("auth_key = %q, want tskey-auth-example", cfg.Server.TSNet.AuthKey)
 	}
+	if cfg.Server.DevAllowHeaderOverride {
+		t.Fatal("expected dev_allow_header_override default false")
+	}
 	if len(cfg.Providers) != 4 {
 		t.Fatalf("len(providers) = %d, want 4", len(cfg.Providers))
 	}
@@ -50,8 +53,13 @@ server:
     control_url: https://yaml.headscale.local
   tls:
     mode: none
-policy:
-  mode: local_only
+  api_tokens:
+    - name: ci-runner
+      token: "${MY_CI_TOKEN}"
+      subject: "tag:ci-runner"
+      roles: ["user"]
+      allow_models: ["openai/gpt-4.1*"]
+      deny_models: ["openai/o3*"]
 storage:
   driver: sqlite
   dsn: ./yaml.db
@@ -72,12 +80,12 @@ providers:
 	t.Setenv("HEADLAMP_AUTH_KEY", "tskey-from-env")
 	t.Setenv("HEADLAMP_LOCAL_LISTEN", "127.0.0.1:9090")
 	t.Setenv("HEADLAMP_DEV_MODE", "true")
-	t.Setenv("HEADLAMP_POLICY_MODE", "hybrid")
-	t.Setenv("HEADLAMP_BOOTSTRAP_ADMINS", "alice@example.com, bob@example.com")
+	t.Setenv("HEADLAMP_DEV_ALLOW_HEADER_OVERRIDE", "true")
 	t.Setenv("HEADLAMP_STORAGE_DSN", "/tmp/override.db")
 	t.Setenv("HEADLAMP_AUDIT_STORE_PAYLOADS", "true")
 	t.Setenv("HEADLAMP_AUDIT_RETENTION_DAYS", "14")
 	t.Setenv("MY_OPENAI_KEY", "sk-live-$literal")
+	t.Setenv("MY_CI_TOKEN", "hl_ci_secret")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -96,14 +104,13 @@ providers:
 	if cfg.Server.LocalListen != "127.0.0.1:9090" {
 		t.Fatalf("local_listen = %q", cfg.Server.LocalListen)
 	}
-	if !cfg.Server.DevMode || cfg.Server.DevUser != "dev@local" {
-		t.Fatalf("dev mode defaults not applied: mode=%v user=%q", cfg.Server.DevMode, cfg.Server.DevUser)
+	if !cfg.Server.DevMode || cfg.Server.DevUser != "dev@local" || !cfg.Server.DevAllowHeaderOverride {
+		t.Fatalf("dev mode defaults/override not applied: mode=%v user=%q allowHeader=%v",
+			cfg.Server.DevMode, cfg.Server.DevUser, cfg.Server.DevAllowHeaderOverride)
 	}
-	if cfg.Policy.Mode != PolicyModeHybrid {
-		t.Fatalf("policy.mode = %q", cfg.Policy.Mode)
-	}
-	if len(cfg.Policy.BootstrapAdmins) != 2 || cfg.Policy.BootstrapAdmins[1] != "bob@example.com" {
-		t.Fatalf("bootstrap_admins = %#v", cfg.Policy.BootstrapAdmins)
+	if len(cfg.Server.APITokens) != 1 || cfg.Server.APITokens[0].Token != "hl_ci_secret" ||
+		len(cfg.Server.APITokens[0].AllowModels) != 1 || len(cfg.Server.APITokens[0].DenyModels) != 1 {
+		t.Fatalf("api_tokens = %#v", cfg.Server.APITokens)
 	}
 	if cfg.Storage.DSN != "/tmp/override.db" {
 		t.Fatalf("storage.dsn = %q", cfg.Storage.DSN)
@@ -119,6 +126,42 @@ providers:
 	}
 	if !cfg.Providers[0].IsEnabled() {
 		t.Fatal("expected provider to default to enabled")
+	}
+}
+
+func TestDevModeLoopbackValidation(t *testing.T) {
+	allowed := []string{
+		"127.0.0.1:8080",
+		"127.0.0.1:0",
+		"[::1]:8080",
+		"localhost:8080",
+	}
+	for _, addr := range allowed {
+		cfg, err := LoadFromBytes([]byte("server:\n  tsnet:\n    enabled: false\n  local_listen: \"" + addr + "\"\n  dev_mode: true\n"))
+		if err != nil {
+			t.Fatalf("expected loopback %q to be allowed in dev_mode, got err: %v", addr, err)
+		}
+		if !cfg.Server.DevMode {
+			t.Fatalf("expected DevMode true for %q", addr)
+		}
+	}
+
+	rejected := []string{
+		"",
+		":8080",
+		"0.0.0.0:8080",
+		"[::]:8080",
+		"192.168.1.50:8080",
+		"100.64.0.10:8080",
+	}
+	for _, addr := range rejected {
+		_, err := LoadFromBytes([]byte("server:\n  tsnet:\n    enabled: true\n  local_listen: \"" + addr + "\"\n  dev_mode: true\n"))
+		if err == nil {
+			t.Fatalf("expected non-loopback %q to be rejected when dev_mode=true", addr)
+		}
+		if !strings.Contains(err.Error(), "loopback") {
+			t.Fatalf("error %q for %q does not mention loopback", err.Error(), addr)
+		}
 	}
 }
 
@@ -157,12 +200,12 @@ server:
 			wantSub: "dns_provider",
 		},
 		{
-			name: "invalid policy mode",
+			name: "removed policy block rejected",
 			yaml: `
 policy:
-  mode: unknown
+  mode: hybrid
 `,
-			wantSub: "policy.mode",
+			wantSub: "policy",
 		},
 		{
 			name: "invalid provider type",
@@ -188,12 +231,12 @@ routes:
 			wantSub: "does not match any configured provider",
 		},
 		{
-			name: "invalid policy glob",
+			name: "invalid api token allow_models glob",
 			yaml: `
-policy:
-  rules:
-    - name: bad
-      subject: "*"
+server:
+  api_tokens:
+    - token: tok-1
+      subject: ci
       allow_models: ["[unclosed"]
 `,
 			wantSub: "invalid glob",

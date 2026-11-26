@@ -14,7 +14,11 @@ import (
 
 // AnthropicRequestToOpenAI converts an Anthropic Messages API request body
 // into an OpenAI Chat Completions request body.
-func AnthropicRequestToOpenAI(body []byte, upstreamModel string) ([]byte, error) {
+//
+// When providerType is "ollama", req.MaxTokens is mapped to "max_tokens" for
+// Ollama compatibility; for "openai" (or empty default), it is mapped to
+// "max_completion_tokens" so o1/o3/o4-mini/gpt-5+ and modern chat models succeed.
+func AnthropicRequestToOpenAI(body []byte, upstreamModel, providerType string) ([]byte, error) {
 	var req anthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("translate: decode anthropic request: %w", err)
@@ -33,7 +37,11 @@ func AnthropicRequestToOpenAI(body []byte, upstreamModel string) ([]byte, error)
 	}
 	if req.MaxTokens > 0 {
 		maxTok := req.MaxTokens
-		out.MaxTokens = &maxTok
+		if strings.EqualFold(strings.TrimSpace(providerType), "ollama") {
+			out.MaxTokens = &maxTok
+		} else {
+			out.MaxCompletionTokens = &maxTok
+		}
 	}
 	if req.Stream {
 		out.StreamOptions = &openAIStreamOptions{IncludeUsage: true}
@@ -63,30 +71,32 @@ func AnthropicRequestToOpenAI(body []byte, upstreamModel string) ([]byte, error)
 				switch b.Type {
 				case "tool_result":
 					// Explode each Anthropic tool_result into its own OpenAI role="tool" turn.
-					toolText := extractAnthropicToolResultText(b.Content)
+					// Preserve is_error flag and carry any embedded images into the trailing user turn.
+					toolText, toolImages := extractAnthropicToolResult(b.Content)
+					if toolText == "" && len(toolImages) > 0 && !b.IsError {
+						toolText = "[Image attached in following user message]"
+					}
+					if b.IsError {
+						if toolText != "" {
+							toolText = "[Tool Error]\n" + toolText
+						} else {
+							toolText = "[Tool Error]"
+						}
+					}
 					contentJSON, _ := json.Marshal(toolText)
 					out.Messages = append(out.Messages, openAIMessage{
 						Role:       "tool",
 						ToolCallID: b.ToolUseID,
 						Content:    contentJSON,
 					})
+					if len(toolImages) > 0 {
+						userParts = append(userParts, toolImages...)
+					}
 				case "text":
 					userParts = append(userParts, openAIContentPart{Type: "text", Text: b.Text})
 				case "image":
-					if b.Source == nil {
-						continue
-					}
-					if b.Source.Type == "base64" {
-						uri := fmt.Sprintf("data:%s;base64,%s", b.Source.MediaType, b.Source.Data)
-						userParts = append(userParts, openAIContentPart{
-							Type:     "image_url",
-							ImageURL: &openAIImageURL{URL: uri},
-						})
-					} else if b.Source.Type == "url" && b.Source.URL != "" {
-						userParts = append(userParts, openAIContentPart{
-							Type:     "image_url",
-							ImageURL: &openAIImageURL{URL: b.Source.URL},
-						})
+					if part, ok := anthropicImageToOpenAIPart(b.Source); ok {
+						userParts = append(userParts, part)
 					}
 				}
 			}
@@ -348,7 +358,15 @@ func StreamOpenAIToAnthropic(upstream io.Reader, downstream io.Writer, flusher h
 	for {
 		ev, err := ReadSSEEvent(reader)
 		if errors.Is(err, io.EOF) {
-			return finishStream()
+			// Stream ended via EOF without receiving OpenAI's [DONE] terminator.
+			_ = emitEvent("error", map[string]any{
+				"type": "error",
+				"error": map[string]string{
+					"type":    "api_error",
+					"message": "unexpected upstream stream EOF",
+				},
+			})
+			return fmt.Errorf("translate: unexpected upstream stream EOF: %w", io.ErrUnexpectedEOF)
 		}
 		if err != nil {
 			return fmt.Errorf("translate: read openai sse: %w", err)
@@ -389,7 +407,11 @@ func StreamOpenAIToAnthropic(upstream io.Reader, downstream io.Writer, flusher h
 
 		if !started {
 			if chunk.ID != "" {
-				msgID = "msg_" + chunk.ID
+				if strings.HasPrefix(chunk.ID, "msg_") {
+					msgID = chunk.ID
+				} else {
+					msgID = "msg_" + chunk.ID
+				}
 			}
 			if model == "" {
 				model = chunk.Model
@@ -528,26 +550,54 @@ func parseAnthropicContentBlocks(raw json.RawMessage) []anthropicContentBlock {
 	return nil
 }
 
-func extractAnthropicToolResultText(raw json.RawMessage) string {
+func extractAnthropicToolResult(raw json.RawMessage) (string, []openAIContentPart) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
-		return ""
+		return "", nil
 	}
 	var s string
 	if err := json.Unmarshal(trimmed, &s); err == nil {
-		return s
+		return s, nil
 	}
 	var blocks []anthropicContentBlock
 	if err := json.Unmarshal(trimmed, &blocks); err == nil {
-		var parts []string
+		var (
+			parts  []string
+			images []openAIContentPart
+		)
 		for _, b := range blocks {
-			if b.Type == "text" {
+			switch b.Type {
+			case "text":
 				parts = append(parts, b.Text)
+			case "image":
+				if imgPart, ok := anthropicImageToOpenAIPart(b.Source); ok {
+					images = append(images, imgPart)
+				}
 			}
 		}
-		return strings.Join(parts, "\n")
+		return strings.Join(parts, "\n"), images
 	}
-	return string(trimmed)
+	return string(trimmed), nil
+}
+
+func anthropicImageToOpenAIPart(src *anthropicImageSource) (openAIContentPart, bool) {
+	if src == nil {
+		return openAIContentPart{}, false
+	}
+	if src.Type == "base64" {
+		uri := fmt.Sprintf("data:%s;base64,%s", src.MediaType, src.Data)
+		return openAIContentPart{
+			Type:     "image_url",
+			ImageURL: &openAIImageURL{URL: uri},
+		}, true
+	}
+	if src.Type == "url" && src.URL != "" {
+		return openAIContentPart{
+			Type:     "image_url",
+			ImageURL: &openAIImageURL{URL: src.URL},
+		}, true
+	}
+	return openAIContentPart{}, false
 }
 
 func encodeOpenAIUserParts(parts []openAIContentPart) (json.RawMessage, error) {

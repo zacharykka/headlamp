@@ -288,11 +288,20 @@ func (s *Server) Start(ctx context.Context) error {
 
 // Serve serves handler on all active listeners (Tailnet and/or local) until Close is called
 // or an unexpected listener error occurs. Returns nil on graceful shutdown.
+// Prefer ServeHandlers when the Tailnet and local listeners need isolated auth chains.
 func (s *Server) Serve(handler http.Handler) error {
 	if handler == nil {
 		return errors.New("netts: handler is required")
 	}
+	return s.ServeHandlers(handler, handler)
+}
 
+// ServeHandlers serves distinct handlers on the Tailnet and local listeners so each
+// listener can enforce its own authentication chain (e.g. Tailnet-only TSNetAuthenticator
+// on tailnetHandler, and static API tokens or loopback dev_mode on localHandler).
+// A handler may be nil only when its corresponding listener is not active.
+// Returns nil on graceful shutdown via Close.
+func (s *Server) ServeHandlers(tailnetHandler, localHandler http.Handler) error {
 	s.mu.Lock()
 	if !s.started {
 		s.mu.Unlock()
@@ -303,6 +312,15 @@ func (s *Server) Serve(handler http.Handler) error {
 		return nil
 	}
 
+	if s.tailnetLn != nil && tailnetHandler == nil {
+		s.mu.Unlock()
+		return errors.New("netts: tailnetHandler is required when tailnet listener is active")
+	}
+	if s.localLn != nil && localHandler == nil {
+		s.mu.Unlock()
+		return errors.New("netts: localHandler is required when local listener is active")
+	}
+
 	// Do not set WriteTimeout: LLM SSE streams can stay open for minutes.
 	var servers []struct {
 		name string
@@ -311,7 +329,7 @@ func (s *Server) Serve(handler http.Handler) error {
 	}
 	if s.tailnetLn != nil {
 		s.tailnetHTTP = &http.Server{
-			Handler:           handler,
+			Handler:           tailnetHandler,
 			ReadHeaderTimeout: defaultReadHeaderTimeout,
 		}
 		servers = append(servers, struct {
@@ -322,7 +340,7 @@ func (s *Server) Serve(handler http.Handler) error {
 	}
 	if s.localLn != nil {
 		s.localHTTP = &http.Server{
-			Handler:           handler,
+			Handler:           localHandler,
 			ReadHeaderTimeout: defaultReadHeaderTimeout,
 		}
 		servers = append(servers, struct {

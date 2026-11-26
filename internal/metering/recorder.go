@@ -138,17 +138,20 @@ func (r *Recorder) Start(_ context.Context, info RequestInfo) *RequestObserver {
 		// Release reference to potentially large request payload when payload auditing is off.
 		info.RequestBody = nil
 	}
+	var reqRedacted, respRedacted bool
 	if len(info.RequestHeaders) > 0 {
-		info.RequestHeaders = sanitizeHeaders(info.RequestHeaders)
+		info.RequestHeaders, reqRedacted = sanitizeHeaders(info.RequestHeaders)
 	}
 	if len(info.ResponseHeaders) > 0 {
-		info.ResponseHeaders = sanitizeHeaders(info.ResponseHeaders)
+		info.ResponseHeaders, respRedacted = sanitizeHeaders(info.ResponseHeaders)
 	}
 
 	return &RequestObserver{
-		recorder: r,
-		info:     info,
-		parser:   NewSSEUsageParser(info.Protocol),
+		recorder:     r,
+		info:         info,
+		parser:       NewSSEUsageParser(info.Protocol),
+		reqRedacted:  reqRedacted,
+		respRedacted: respRedacted,
 	}
 }
 
@@ -164,9 +167,10 @@ func (r *Recorder) Record(info RequestInfo, usage Usage, statusCode int, latency
 		respBody = string(capBytes(responseBody, r.maxAuditBodyBytes))
 	}
 	info.RequestBody = reqBody
-	info.RequestHeaders = sanitizeHeaders(info.RequestHeaders)
-	info.ResponseHeaders = sanitizeHeaders(info.ResponseHeaders)
-	r.enqueue(info, usage, statusCode, latencyMS, ttftMS, errMsg, respBody)
+	var reqRedacted, respRedacted bool
+	info.RequestHeaders, reqRedacted = sanitizeHeaders(info.RequestHeaders)
+	info.ResponseHeaders, respRedacted = sanitizeHeaders(info.ResponseHeaders)
+	r.enqueue(info, usage, statusCode, latencyMS, ttftMS, errMsg, respBody, reqRedacted || respRedacted)
 }
 
 // PurgeNow immediately deletes audit_payloads older than audit.RetentionDays.
@@ -212,7 +216,7 @@ func (r *Recorder) Close(ctx context.Context) error {
 	}
 }
 
-func (r *Recorder) enqueue(info RequestInfo, usage Usage, statusCode int, latencyMS, ttftMS int64, errMsg string, responseBody string) {
+func (r *Recorder) enqueue(info RequestInfo, usage Usage, statusCode int, latencyMS, ttftMS int64, errMsg string, responseBody string, redacted bool) {
 	if r == nil || r.store == nil {
 		return
 	}
@@ -276,6 +280,7 @@ func (r *Recorder) enqueue(info RequestInfo, usage Usage, statusCode int, latenc
 			RequestBody:     string(info.RequestBody),
 			ResponseHeaders: info.ResponseHeaders,
 			ResponseBody:    responseBody,
+			Redacted:        redacted,
 		}
 	}
 
@@ -346,6 +351,8 @@ type RequestObserver struct {
 	mu            sync.Mutex
 	jsonUsage     Usage
 	hasJSONUsage  bool
+	reqRedacted   bool
+	respRedacted  bool
 	respBuf       bytes.Buffer
 	respTruncated bool
 	finished      bool
@@ -398,9 +405,13 @@ func (o *RequestObserver) SetResponseHeaders(headers map[string]string) {
 	if o == nil || len(headers) == 0 {
 		return
 	}
+	clean, redacted := sanitizeHeaders(headers)
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.info.ResponseHeaders = sanitizeHeaders(headers)
+	o.info.ResponseHeaders = clean
+	if redacted {
+		o.respRedacted = true
+	}
 }
 
 // Usage returns the latest parsed Usage for this request.
@@ -434,12 +445,13 @@ func (o *RequestObserver) Finish(statusCode int, latencyMS, ttftMS int64, errMsg
 	hasJSON := o.hasJSONUsage
 	usage := o.jsonUsage
 	respBody := o.respBuf.String()
+	redacted := o.reqRedacted || o.respRedacted
 	o.mu.Unlock()
 
 	if !hasJSON {
 		usage = o.parser.Usage()
 	}
-	o.recorder.enqueue(info, usage, statusCode, latencyMS, ttftMS, errMsg, respBody)
+	o.recorder.enqueue(info, usage, statusCode, latencyMS, ttftMS, errMsg, respBody, redacted)
 }
 
 func (o *RequestObserver) appendAuditLocked(s string) {
@@ -481,16 +493,18 @@ func capBytes(src []byte, limit int) []byte {
 	return out
 }
 
-func sanitizeHeaders(headers map[string]string) map[string]string {
+func sanitizeHeaders(headers map[string]string) (map[string]string, bool) {
 	if len(headers) == 0 {
-		return nil
+		return nil, false
 	}
 	clean := maps.Clone(headers)
+	redacted := false
 	for k := range clean {
 		switch strings.ToLower(strings.TrimSpace(k)) {
 		case "authorization", "proxy-authorization", "x-api-key", "x-goog-api-key", "cookie", "set-cookie":
 			clean[k] = "[REDACTED]"
+			redacted = true
 		}
 	}
-	return clean
+	return clean, redacted
 }

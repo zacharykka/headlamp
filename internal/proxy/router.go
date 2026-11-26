@@ -24,15 +24,17 @@ type resolvedRoute struct {
 	//   - "<route.Alias>" for virtual model routes (e.g. "team/coding")
 	//   - "<provider.Name>/<upstreamModel>" for direct provider models
 	canonicalModel string
+	isAlias        bool
 	costOverride   *CostOverride
 	candidates     []routeCandidate
 }
 
 type catalogModel struct {
-	ID           string
-	ProviderName string
-	ProviderType string
-	IsAlias      bool
+	ID                 string
+	ProviderName       string
+	ProviderType       string
+	IsAlias            bool
+	HasGeminiCandidate bool
 }
 
 // resolveRoute resolves requestedModel against enabled store routes and providers.
@@ -87,6 +89,7 @@ func resolveRoute(ctx context.Context, st store.Store, ingressProtocol, requeste
 		}
 		return &resolvedRoute{
 			canonicalModel: r.Alias,
+			isAlias:        true,
 			costOverride:   routeCostOverride(r),
 			candidates:     cands,
 		}, nil
@@ -235,29 +238,42 @@ func listCatalogModels(ctx context.Context, st store.Store) ([]catalogModel, err
 		if !r.Enabled || r.Alias == "" {
 			continue
 		}
-		p, ok := byName[r.ProviderName]
-		if !ok {
-			// Check if any fallback provider is enabled.
-			for _, fb := range r.Fallbacks {
-				if fp, exists := byName[fb.Provider]; exists {
+		var (
+			p                  store.Provider
+			ok                 bool
+			hasGeminiCandidate bool
+		)
+		if primary, exists := byName[r.ProviderName]; exists {
+			p = primary
+			ok = true
+			if primary.Type == config.ProviderTypeGemini {
+				hasGeminiCandidate = true
+			}
+		}
+		for _, fb := range r.Fallbacks {
+			if fp, exists := byName[fb.Provider]; exists {
+				if !ok {
 					p = fp
 					ok = true
-					break
+				}
+				if fp.Type == config.ProviderTypeGemini {
+					hasGeminiCandidate = true
 				}
 			}
-			if !ok {
-				continue
-			}
+		}
+		if !ok {
+			continue
 		}
 		if _, dup := seen[r.Alias]; dup {
 			continue
 		}
 		seen[r.Alias] = struct{}{}
 		catalog = append(catalog, catalogModel{
-			ID:           r.Alias,
-			ProviderName: p.Name,
-			ProviderType: p.Type,
-			IsAlias:      true,
+			ID:                 r.Alias,
+			ProviderName:       p.Name,
+			ProviderType:       p.Type,
+			IsAlias:            true,
+			HasGeminiCandidate: hasGeminiCandidate,
 		})
 	}
 
@@ -276,9 +292,10 @@ func listCatalogModels(ctx context.Context, st store.Store) ([]catalogModel, err
 			}
 			seen[id] = struct{}{}
 			catalog = append(catalog, catalogModel{
-				ID:           id,
-				ProviderName: p.Name,
-				ProviderType: p.Type,
+				ID:                 id,
+				ProviderName:       p.Name,
+				ProviderType:       p.Type,
+				HasGeminiCandidate: p.Type == config.ProviderTypeGemini,
 			})
 		}
 	}

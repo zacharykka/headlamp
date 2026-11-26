@@ -94,9 +94,6 @@ func PrincipalFromWhoIs(who *apitype.WhoIsResponse, remoteAddr string) (*auth.Pr
 				loginName = rawLogin
 				displayName = strings.TrimSpace(who.UserProfile.DisplayName)
 			}
-			if len(who.UserProfile.Groups) > 0 {
-				p.Groups = cleanStrings(who.UserProfile.Groups)
-			}
 		}
 		p.Subject = cmp.Or(loginName, nodeName, string(who.Node.StableID))
 		p.DisplayName = cmp.Or(displayName, p.Subject, nodeName)

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -208,7 +209,7 @@ func TestAnthropicRequestToOpenAI(t *testing.T) {
 		"tool_choice": {"type": "tool", "name": "lookup"}
 	}`
 
-	outBytes, err := AnthropicRequestToOpenAI([]byte(input), "gpt-4.1")
+	outBytes, err := AnthropicRequestToOpenAI([]byte(input), "gpt-4.1", "openai")
 	if err != nil {
 		t.Fatalf("AnthropicRequestToOpenAI failed: %v", err)
 	}
@@ -220,6 +221,9 @@ func TestAnthropicRequestToOpenAI(t *testing.T) {
 
 	if out.Model != "gpt-4.1" {
 		t.Fatalf("expected gpt-4.1, got %q", out.Model)
+	}
+	if out.MaxCompletionTokens == nil || *out.MaxCompletionTokens != 1024 || out.MaxTokens != nil {
+		t.Fatalf("expected max_completion_tokens=1024 and nil max_tokens for openai, got max_completion_tokens=%v max_tokens=%v", out.MaxCompletionTokens, out.MaxTokens)
 	}
 	if out.StreamOptions == nil || !out.StreamOptions.IncludeUsage {
 		t.Fatalf("expected stream_options.include_usage=true for streaming request")
@@ -641,5 +645,203 @@ func TestStreamOpenAIToAnthropicMidStreamError(t *testing.T) {
 	}
 	if strings.Contains(body, "event: message_stop") {
 		t.Fatalf("must not emit message_stop after mid-stream error, got:\n%s", body)
+	}
+}
+
+func TestAnthropicRequestToOpenAI_MaxTokensByProviderType(t *testing.T) {
+	in := []byte(`{"model":"m","max_tokens":512,"messages":[{"role":"user","content":"hi"}]}`)
+
+	// OpenAI (and empty default) must emit max_completion_tokens, never max_tokens.
+	for _, prov := range []string{"openai", ""} {
+		out, err := AnthropicRequestToOpenAI(in, "o3", prov)
+		if err != nil {
+			t.Fatalf("provider %q failed: %v", prov, err)
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(out, &raw); err != nil {
+			t.Fatal(err)
+		}
+		if int(raw["max_completion_tokens"].(float64)) != 512 {
+			t.Fatalf("provider %q expected max_completion_tokens=512, got %s", prov, string(out))
+		}
+		if _, hasOld := raw["max_tokens"]; hasOld {
+			t.Fatalf("provider %q must not emit deprecated max_tokens: %s", prov, string(out))
+		}
+	}
+
+	// Ollama keeps max_tokens.
+	outOllama, err := AnthropicRequestToOpenAI(in, "qwen2.5-coder:32b", "ollama")
+	if err != nil {
+		t.Fatalf("ollama failed: %v", err)
+	}
+	var rawOllama map[string]any
+	if err := json.Unmarshal(outOllama, &rawOllama); err != nil {
+		t.Fatal(err)
+	}
+	if int(rawOllama["max_tokens"].(float64)) != 512 {
+		t.Fatalf("ollama expected max_tokens=512, got %s", string(outOllama))
+	}
+	if _, hasNew := rawOllama["max_completion_tokens"]; hasNew {
+		t.Fatalf("ollama should not emit max_completion_tokens: %s", string(outOllama))
+	}
+}
+
+func TestAnthropicRequestToOpenAI_ToolResultIsErrorAndEmbeddedImages(t *testing.T) {
+	input := `{
+		"model": "gpt-5",
+		"max_tokens": 256,
+		"messages": [
+			{"role": "assistant", "content": [
+				{"type": "tool_use", "id": "toolu_err", "name": "run_cmd", "input": {"cmd": "false"}},
+				{"type": "tool_use", "id": "toolu_img", "name": "screenshot", "input": {}}
+			]},
+			{"role": "user", "content": [
+				{"type": "tool_result", "tool_use_id": "toolu_err", "is_error": true, "content": "exit status 1"},
+				{"type": "tool_result", "tool_use_id": "toolu_img", "content": [
+					{"type": "text", "text": "captured screen"},
+					{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw=="}},
+					{"type": "image", "source": {"type": "url", "url": "https://example.com/shot.png"}}
+				]}
+			]}
+		]
+	}`
+
+	outBytes, err := AnthropicRequestToOpenAI([]byte(input), "gpt-5", "openai")
+	if err != nil {
+		t.Fatalf("AnthropicRequestToOpenAI failed: %v", err)
+	}
+	var out openAIChatRequest
+	if err := json.Unmarshal(outBytes, &out); err != nil {
+		t.Fatal(err)
+	}
+	// assistant + tool(err) + tool(img) + user(attached images) = 4 messages.
+	if len(out.Messages) != 4 {
+		t.Fatalf("expected 4 messages, got %d: %s", len(out.Messages), string(outBytes))
+	}
+	if got := extractOpenAIText(out.Messages[1].Content); got != "[Tool Error]\nexit status 1" {
+		t.Fatalf("expected [Tool Error] prefix on error tool_result, got %q", got)
+	}
+	if got := extractOpenAIText(out.Messages[2].Content); got != "captured screen" {
+		t.Fatalf("unexpected image tool_result text: %q", got)
+	}
+	if out.Messages[3].Role != "user" {
+		t.Fatalf("expected trailing user message for embedded tool images, got role=%q", out.Messages[3].Role)
+	}
+	var imgParts []openAIContentPart
+	if err := json.Unmarshal(out.Messages[3].Content, &imgParts); err != nil {
+		t.Fatalf("unmarshal trailing user image parts: %v", err)
+	}
+	if len(imgParts) != 2 ||
+		imgParts[0].ImageURL.URL != "data:image/png;base64,iVBORw==" ||
+		imgParts[1].ImageURL.URL != "https://example.com/shot.png" {
+		t.Fatalf("embedded tool_result images not preserved: %+v", imgParts)
+	}
+}
+
+func TestOpenAIRequestToAnthropic_LeadingUserAndEmptyGuard(t *testing.T) {
+	// Zero messages -> clean error.
+	if _, err := OpenAIRequestToAnthropic([]byte(`{"model":"x","messages":[]}`), "claude-sonnet-4-6"); err == nil {
+		t.Fatalf("expected error for zero messages")
+	}
+
+	// System-only message -> non-empty messages starting with user.
+	sysOnly, err := OpenAIRequestToAnthropic([]byte(`{"model":"x","messages":[{"role":"system","content":"be brief"}]}`), "claude-sonnet-4-6")
+	if err != nil {
+		t.Fatalf("system-only failed: %v", err)
+	}
+	var parsedSys anthropicRequest
+	if err := json.Unmarshal(sysOnly, &parsedSys); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsedSys.Messages) != 1 || parsedSys.Messages[0].Role != "user" {
+		t.Fatalf("expected synthetic leading user turn for system-only request, got %s", string(sysOnly))
+	}
+
+	// Assistant-first message -> prepends user turn before assistant.
+	asstFirst, err := OpenAIRequestToAnthropic([]byte(`{"model":"x","messages":[{"role":"assistant","content":"prefill"}]}`), "claude-sonnet-4-6")
+	if err != nil {
+		t.Fatalf("assistant-first failed: %v", err)
+	}
+	var parsedAsst anthropicRequest
+	if err := json.Unmarshal(asstFirst, &parsedAsst); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsedAsst.Messages) != 2 || parsedAsst.Messages[0].Role != "user" || parsedAsst.Messages[1].Role != "assistant" {
+		t.Fatalf("expected [user, assistant] turns, got %s", string(asstFirst))
+	}
+}
+
+func TestStreamingPrematureEOFDetection(t *testing.T) {
+	// 1. Anthropic -> OpenAI truncated before message_stop.
+	truncatedAnth := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_1","model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":1}}}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`,
+		``,
+	}, "\n")
+	rec1 := httptest.NewRecorder()
+	err1 := StreamAnthropicToOpenAI(strings.NewReader(truncatedAnth), rec1, rec1, StreamOptions{RequestedModel: "m"})
+	if !errors.Is(err1, io.ErrUnexpectedEOF) {
+		t.Fatalf("StreamAnthropicToOpenAI expected io.ErrUnexpectedEOF, got %v", err1)
+	}
+	if strings.Contains(rec1.Body.String(), "data: [DONE]") {
+		t.Fatalf("must not emit [DONE] on premature EOF: %s", rec1.Body.String())
+	}
+	if !strings.Contains(rec1.Body.String(), `"unexpected upstream stream EOF"`) {
+		t.Fatalf("expected OpenAI SSE error frame on premature EOF: %s", rec1.Body.String())
+	}
+
+	// 2. OpenAI -> Anthropic truncated before [DONE].
+	truncatedOAI := strings.Join([]string{
+		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","content":"half"},"finish_reason":null}]}`,
+		``,
+	}, "\n")
+	rec2 := httptest.NewRecorder()
+	err2 := StreamOpenAIToAnthropic(strings.NewReader(truncatedOAI), rec2, rec2, StreamOptions{RequestedModel: "m"})
+	if !errors.Is(err2, io.ErrUnexpectedEOF) {
+		t.Fatalf("StreamOpenAIToAnthropic expected io.ErrUnexpectedEOF, got %v", err2)
+	}
+	if strings.Contains(rec2.Body.String(), "event: message_stop") {
+		t.Fatalf("must not emit message_stop on premature EOF: %s", rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), "event: error\n") || !strings.Contains(rec2.Body.String(), `"unexpected upstream stream EOF"`) {
+		t.Fatalf("expected Anthropic SSE error frame on premature EOF: %s", rec2.Body.String())
+	}
+}
+
+func TestStreamingIDPrefixDeduplication(t *testing.T) {
+	anthSSE := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"chatcmpl-already","model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1}}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+	rec1 := httptest.NewRecorder()
+	if err := StreamAnthropicToOpenAI(strings.NewReader(anthSSE), rec1, rec1, StreamOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rec1.Body.String(), "chatcmpl-chatcmpl-") || !strings.Contains(rec1.Body.String(), `"id":"chatcmpl-already"`) {
+		t.Fatalf("chatcmpl- prefix duplicated: %s", rec1.Body.String())
+	}
+
+	oaiSSE := strings.Join([]string{
+		`data: {"id":"msg_already","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	rec2 := httptest.NewRecorder()
+	if err := StreamOpenAIToAnthropic(strings.NewReader(oaiSSE), rec2, rec2, StreamOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rec2.Body.String(), "msg_msg_") || !strings.Contains(rec2.Body.String(), `"id":"msg_already"`) {
+		t.Fatalf("msg_ prefix duplicated: %s", rec2.Body.String())
 	}
 }

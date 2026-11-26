@@ -1,10 +1,13 @@
 package metering
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -169,6 +172,15 @@ func TestParseJSONUsageAllProtocols(t *testing.T) {
 	}`))
 	if u.InputTokens != 2500 || u.OutputTokens != 300 || u.CacheReadTokens != 2000 || u.ReasoningTokens != 50 || u.TotalTokens != 2800 {
 		t.Fatalf("openai_chat usage = %+v", u)
+	}
+
+	// OpenAI Embeddings
+	uEmb := ParseJSONUsage(ProtocolOpenAIEmbeddings, []byte(`{
+		"object": "list",
+		"usage": {"prompt_tokens": 42, "total_tokens": 42}
+	}`))
+	if uEmb.InputTokens != 42 || uEmb.TotalTokens != 42 || uEmb.OutputTokens != 0 {
+		t.Fatalf("openai_embeddings usage = %+v", uEmb)
 	}
 
 	// OpenAI Responses
@@ -462,6 +474,9 @@ func TestRecorderAsyncFlushWithoutAndWithAuditPayloads(t *testing.T) {
 		if payload.RequestHeaders["Authorization"] != "[REDACTED]" {
 			t.Fatalf("Authorization header not redacted: %+v", payload.RequestHeaders)
 		}
+		if !payload.Redacted {
+			t.Fatal("expected AuditPayload.Redacted=true when Authorization header was redacted")
+		}
 		if !strings.HasSuffix(payload.RequestBody, truncationMarker) {
 			t.Fatalf("expected truncated request body, got len=%d %q", len(payload.RequestBody), payload.RequestBody)
 		}
@@ -513,4 +528,77 @@ func TestRecorderAsyncFlushWithoutAndWithAuditPayloads(t *testing.T) {
 			t.Fatalf("expected cloned tag [tag:original], got %#v", logs[0].Tags)
 		}
 	})
+
+	// Case D: AuditPayload.Redacted is false when no sensitive headers were present,
+	// and true when a response header (e.g. Set-Cookie) was redacted.
+	t.Run("audit_redacted_flag_tracking", func(t *testing.T) {
+		st := newTestSQLiteStore(t)
+		rec := NewRecorder(st, config.AuditConfig{StorePayloads: true, RetentionDays: 7}, pt, RecorderOptions{
+			DisableAutoPurge: true,
+		})
+
+		obsClean := rec.Start(ctx, RequestInfo{
+			RequestID:      "req-clean",
+			Principal:      &auth.Principal{Subject: "alice@example.com"},
+			Protocol:       ProtocolOpenAIChat,
+			Provider:       "openai",
+			ProviderType:   config.ProviderTypeOpenAI,
+			RequestedModel: "gpt-4.1",
+			UpstreamModel:  "gpt-4.1",
+			RequestHeaders: map[string]string{"Content-Type": "application/json"},
+		})
+		obsClean.SetResponseHeaders(map[string]string{"Content-Type": "application/json"})
+		obsClean.OnJSONResponse([]byte(`{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+		obsClean.Finish(200, 50, 0, "")
+
+		obsRespRedacted := rec.Start(ctx, RequestInfo{
+			RequestID:      "req-resp-redacted",
+			Principal:      &auth.Principal{Subject: "bob@example.com"},
+			Protocol:       ProtocolOpenAIChat,
+			Provider:       "openai",
+			ProviderType:   config.ProviderTypeOpenAI,
+			RequestedModel: "gpt-4.1",
+			UpstreamModel:  "gpt-4.1",
+			RequestHeaders: map[string]string{"Content-Type": "application/json"},
+		})
+		obsRespRedacted.SetResponseHeaders(map[string]string{
+			"Content-Type": "application/json",
+			"Set-Cookie":   "session=secret",
+		})
+		obsRespRedacted.OnJSONResponse([]byte(`{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+		obsRespRedacted.Finish(200, 50, 0, "")
+
+		if err := rec.Close(ctx); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		aliceLogs, _ := st.QueryUsageLogs(ctx, store.UsageFilter{Subject: "alice@example.com"})
+		pClean, err := st.GetAuditPayloadByUsageLogID(ctx, aliceLogs[0].ID)
+		if err != nil {
+			t.Fatalf("GetAuditPayloadByUsageLogID(clean): %v", err)
+		}
+		if pClean.Redacted {
+			t.Fatal("expected Redacted=false when no sensitive headers were present")
+		}
+
+		bobLogs, _ := st.QueryUsageLogs(ctx, store.UsageFilter{Subject: "bob@example.com"})
+		pResp, err := st.GetAuditPayloadByUsageLogID(ctx, bobLogs[0].ID)
+		if err != nil {
+			t.Fatalf("GetAuditPayloadByUsageLogID(resp): %v", err)
+		}
+		if !pResp.Redacted || pResp.ResponseHeaders["Set-Cookie"] != "[REDACTED]" {
+			t.Fatalf("expected Redacted=true and redacted Set-Cookie, got %+v", pResp)
+		}
+	})
+}
+
+func TestDefaultPricingSyncedWithSpec(t *testing.T) {
+	specPath := filepath.Join("..", "..", "docs", "specs", "default_pricing.json")
+	specBytes, err := os.ReadFile(specPath)
+	if err != nil {
+		t.Fatalf("read spec pricing %q: %v", specPath, err)
+	}
+	if !bytes.Equal(defaultPricingJSON, specBytes) {
+		t.Fatalf("internal/metering/default_pricing.json has drifted from %s", specPath)
+	}
 }

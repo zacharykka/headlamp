@@ -244,7 +244,7 @@ func canonicalProvider(providerOrProtocol string) string {
 	switch strings.ToLower(strings.TrimSpace(providerOrProtocol)) {
 	case "anthropic", ProtocolAnthropicMessages:
 		return "anthropic"
-	case "openai", ProtocolOpenAIChat, ProtocolOpenAIResponses:
+	case "openai", ProtocolOpenAIChat, ProtocolOpenAIResponses, ProtocolOpenAIEmbeddings:
 		return "openai"
 	case "gemini", "google":
 		return "gemini"

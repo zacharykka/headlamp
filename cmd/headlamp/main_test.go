@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/zacharykka/headlamp/internal/config"
@@ -36,7 +37,6 @@ func (f *fakeWhoIsClient) WhoIs(_ context.Context, remoteAddr string) (*apitype.
 	if resp, ok := f.peers[remoteAddr]; ok {
 		return resp, nil
 	}
-	// Allow matching on bare IP as well as ip:port.
 	if host, _, found := strings.Cut(remoteAddr, ":"); found {
 		if resp, ok := f.peers[host]; ok {
 			return resp, nil
@@ -47,11 +47,25 @@ func (f *fakeWhoIsClient) WhoIs(_ context.Context, remoteAddr string) (*apitype.
 
 func TestEndToEndGatewayStack(t *testing.T) {
 	// 1. Fake upstream servers for Anthropic, OpenAI, Gemini, and Ollama.
-	var gotAnthropicKey, gotAnthropicBeta string
+	var (
+		mu                        sync.Mutex
+		gotAnthropicKey           string
+		gotAnthropicBeta          string
+		gotOpenAIAuth             string
+		gotOpenAIStreamOptions    bool
+		gotOpenAIAnthropicReqBody map[string]any
+		gotGeminiKey              string
+		gotGeminiQueryKey         string
+	)
+
 	anthropicUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		gotAnthropicKey = r.Header.Get("x-api-key")
 		gotAnthropicBeta = r.Header.Get("anthropic-beta")
+		mu.Unlock()
+
 		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("X-Upstream-Provider", "anthropic")
 		flusher := w.(http.Flusher)
 
 		events := []string{
@@ -72,15 +86,40 @@ func TestEndToEndGatewayStack(t *testing.T) {
 	}))
 	defer anthropicUpstream.Close()
 
-	var gotOpenAIAuth string
-	var gotOpenAIStreamOptions bool
 	openAIUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotOpenAIAuth = r.Header.Get("Authorization")
 		body, _ := io.ReadAll(r.Body)
+		var parsed map[string]any
+		_ = json.Unmarshal(body, &parsed)
+
+		mu.Lock()
+		gotOpenAIAuth = r.Header.Get("Authorization")
 		if strings.Contains(string(body), `"include_usage":true`) {
 			gotOpenAIStreamOptions = true
 		}
+		if _, hasMCT := parsed["max_completion_tokens"]; hasMCT {
+			gotOpenAIAnthropicReqBody = parsed
+		}
+		mu.Unlock()
+
+		// Non-2xx error simulation for P1-5 audit body/header test.
+		if model, _ := parsed["model"].(string); model == "gpt-4.1-err" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Upstream-Err-Id", "err-req-42")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"upstream bad input","type":"invalid_request_error"}}`)
+			return
+		}
+
+		// Non-streaming OpenAI response (used by P1-1 Anthropic->OpenAI & alias fallback check).
+		if streamVal, _ := parsed["stream"].(bool); !streamVal {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Upstream-Provider", "openai")
+			_, _ = io.WriteString(w, `{"id":"chatcmpl-nonstream","object":"chat.completion","model":"gpt-5","choices":[{"index":0,"message":{"role":"assistant","content":"Non-stream GPT"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}`)
+			return
+		}
+
 		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("X-Upstream-Req-Id", "up-oai-999")
 		flusher := w.(http.Flusher)
 
 		chunks := []string{
@@ -96,10 +135,11 @@ func TestEndToEndGatewayStack(t *testing.T) {
 	}))
 	defer openAIUpstream.Close()
 
-	var gotGeminiKey, gotGeminiQueryKey string
 	geminiUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		gotGeminiKey = r.Header.Get("x-goog-api-key")
 		gotGeminiQueryKey = r.URL.Query().Get("key")
+		mu.Unlock()
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher := w.(http.Flusher)
 		_, _ = io.WriteString(w, `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hi from Gemini"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2000,"cachedContentTokenCount":1000,"candidatesTokenCount":400,"thoughtsTokenCount":100,"totalTokenCount":2500}}`+"\n\n")
@@ -113,7 +153,7 @@ func TestEndToEndGatewayStack(t *testing.T) {
 	}))
 	defer ollamaUpstream.Close()
 
-	// 2. Write real config YAML & open SQLite + crypto + policy + metering + proxy.
+	// 2. Write real grants-only YAML config & initialize SQLite + crypto + policy + metering + proxy.
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "headlamp.db")
 	cfgPath := filepath.Join(tmpDir, "headlamp.yaml")
@@ -130,15 +170,17 @@ server:
     enabled: false
     state_dir: %q
   local_listen: "127.0.0.1:0"
-  dev_mode: false
-policy:
-  mode: hybrid
-  rules:
-    - name: deny-o3-global
-      subject: "*"
-      deny_models:
-        - "openai/o3*"
-      priority: 100
+  dev_mode: true
+  dev_user: "dev@local"
+  dev_roles: ["user"]
+  dev_allow_header_override: false
+  api_tokens:
+    - name: local-ci
+      token: "hl_static_token_123"
+      subject: "tag:local-ci"
+      roles: ["user"]
+      allow_models: ["ollama/*", "gemini/*"]
+      deny_models: ["openai/*"]
 storage:
   driver: sqlite
   dsn: %q
@@ -152,7 +194,7 @@ providers:
     type: openai
     base_url: %q
     api_key: "sk-openai-managed-secret"
-    models: ["gpt-5", "o3"]
+    models: ["gpt-5", "o3", "gpt-4.1-err"]
   - name: gemini
     type: gemini
     base_url: %q
@@ -166,6 +208,18 @@ routes:
   - alias: "team/coding"
     provider: anthropic
     model: "claude-sonnet-4-6"
+  - alias: "team/oai-from-claude"
+    provider: openai
+    model: "gpt-5"
+  - alias: "team/o3-only"
+    provider: openai
+    model: "o3"
+  - alias: "team/o3-with-fallback"
+    provider: openai
+    model: "o3"
+    fallbacks:
+      - provider: openai
+        model: "gpt-5"
 audit:
   store_payloads: true
   retention_days: 7
@@ -198,9 +252,9 @@ audit:
 	recorder := metering.NewRecorder(st, cfg.Audit, pricing, metering.RecorderOptions{
 		DisableAutoPurge: true,
 	})
-	eval := policy.NewEvaluator(cfg.Policy, st)
+	eval := policy.NewEvaluator()
 
-	// Mock Tailnet WhoIs with Headscale v0.29.7 grants for Alice + tagged CI runner.
+	// Mock Tailnet WhoIs with Headscale v0.29.7 grants for Alice (with deny_models: ["openai/o3*"]) + tagged CI runner.
 	whoIs := &fakeWhoIsClient{
 		peers: map[string]*apitype.WhoIsResponse{
 			"100.64.0.10": {
@@ -214,7 +268,7 @@ audit:
 				},
 				CapMap: tailcfg.PeerCapMap{
 					policy.CapHeadlampGateway: []tailcfg.RawMessage{
-						`{"role":"user","models":["anthropic/*","openai/*","gemini/*","ollama/*","team/*"]}`,
+						`{"role":"user","models":["anthropic/*","openai/*","gemini/*","ollama/*","team/*"],"deny_models":["openai/o3*"]}`,
 					},
 				},
 			},
@@ -224,7 +278,6 @@ audit:
 					Addresses:    []netip.Prefix{netip.MustParsePrefix("100.64.0.20/32")},
 					Tags:         []string{"tag:ci-runner"},
 				},
-				// Headscale v0.29 reports synthetic tagged-devices profile for tagged nodes.
 				UserProfile: &tailcfg.UserProfile{
 					LoginName:   "tagged-devices",
 					DisplayName: "tagged-devices",
@@ -238,7 +291,6 @@ audit:
 		},
 	}
 
-	authChain := buildAuthChain(cfg.Server, netts.NewTSNetAuthenticator(whoIs))
 	gw, err := proxy.NewGateway(proxy.GatewayConfig{
 		Store:      st,
 		Authorizer: eval,
@@ -247,9 +299,12 @@ audit:
 	if err != nil {
 		t.Fatalf("NewGateway: %v", err)
 	}
-	handler := buildHandler(gw, eval, authChain)
 
-	doReq := func(remoteAddr, method, target, body string, headers map[string]string) *httptest.ResponseRecorder {
+	// P0-2 listener isolation: separate tailnetHandler (TSNet ONLY) vs localHandler (tokens + dev_mock).
+	tailnetHandler := buildHandler(gw, eval, netts.NewTSNetAuthenticator(whoIs))
+	localHandler := buildHandler(gw, eval, buildLocalAuthChain(cfg.Server))
+
+	doReq := func(h http.Handler, remoteAddr, method, target, body string, headers map[string]string) *httptest.ResponseRecorder {
 		t.Helper()
 		req := httptest.NewRequest(method, target, strings.NewReader(body))
 		req.RemoteAddr = remoteAddr
@@ -260,17 +315,57 @@ audit:
 			req.Header.Set(k, v)
 		}
 		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
+		h.ServeHTTP(rec, req)
 		return rec
 	}
 
-	// (a) Unauthenticated /healthz -> 200
-	if rec := doReq("192.0.2.1:1234", http.MethodGet, "/healthz", "", nil); rec.Code != http.StatusOK {
-		t.Fatalf("GET /healthz = %d, want 200", rec.Code)
+	// (a) Unauthenticated /healthz -> 200 on both listeners
+	if rec := doReq(tailnetHandler, "192.0.2.1:1234", http.MethodGet, "/healthz", "", nil); rec.Code != http.StatusOK {
+		t.Fatalf("GET /healthz (tailnet) = %d, want 200", rec.Code)
 	}
 
-	// (b) /whoami as Alice (Headscale grants applied)
-	recWhoAlice := doReq("100.64.0.10:51234", http.MethodGet, "/whoami", "", nil)
+	// (b) P0-2 isolation: tailnetHandler MUST reject non-tailnet callers even with a valid static API token or dev headers.
+	recIso := doReq(tailnetHandler, "192.0.2.1:1234", http.MethodGet, "/whoami", "", map[string]string{
+		"Authorization":        "Bearer hl_static_token_123",
+		"X-Headlamp-Dev-Roles": "admin",
+	})
+	if recIso.Code != http.StatusUnauthorized {
+		t.Fatalf("P0-2: tailnetHandler must reject non-tailnet caller, got %d: %s", recIso.Code, recIso.Body.String())
+	}
+
+	// (c) P0-2 dev header spoofing blocked by default (dev_allow_header_override=false) on localHandler.
+	recDevSpoof := doReq(localHandler, "127.0.0.1:54321", http.MethodGet, "/whoami", "", map[string]string{
+		"X-Headlamp-Dev-User":  "spoofed-admin@example.com",
+		"X-Headlamp-Dev-Roles": "admin",
+	})
+	if recDevSpoof.Code != http.StatusOK {
+		t.Fatalf("localHandler dev /whoami = %d: %s", recDevSpoof.Code, recDevSpoof.Body.String())
+	}
+	var devWho struct {
+		Principal struct {
+			Subject string `json:"subject"`
+		} `json:"principal"`
+		IsAdmin bool `json:"is_admin"`
+	}
+	if err := json.Unmarshal(recDevSpoof.Body.Bytes(), &devWho); err != nil {
+		t.Fatalf("decode local /whoami: %v", err)
+	}
+	if devWho.Principal.Subject != "dev@local" || devWho.IsAdmin {
+		t.Fatalf("P0-2: X-Headlamp-Dev-* headers must be ignored by default, got %+v", devWho)
+	}
+
+	// (d) Static API token with synthesized grants on localHandler (including Gemini ?key= auth).
+	recLocalTok := doReq(localHandler, "127.0.0.1:54321", http.MethodPost,
+		"/gemini/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=hl_static_token_123",
+		`{"contents":[{"parts":[{"text":"hi"}]}]}`,
+		nil,
+	)
+	if recLocalTok.Code != http.StatusOK {
+		t.Fatalf("localHandler Gemini ?key= token auth = %d: %s", recLocalTok.Code, recLocalTok.Body.String())
+	}
+
+	// (e) /whoami on tailnetHandler as Alice (Headscale grants applied) & tagged CI runner
+	recWhoAlice := doReq(tailnetHandler, "100.64.0.10:51234", http.MethodGet, "/whoami", "", nil)
 	if recWhoAlice.Code != http.StatusOK {
 		t.Fatalf("GET /whoami (alice) = %d: %s", recWhoAlice.Code, recWhoAlice.Body.String())
 	}
@@ -290,17 +385,13 @@ audit:
 		t.Fatalf("unexpected /whoami alice: %+v", whoAlice)
 	}
 
-	// (c) /whoami as tagged CI runner -> subject MUST be tag:ci-runner, never tagged-devices
-	recWhoCI := doReq("100.64.0.20:51235", http.MethodGet, "/whoami", "", nil)
-	if recWhoCI.Code != http.StatusOK {
-		t.Fatalf("GET /whoami (ci) = %d: %s", recWhoCI.Code, recWhoCI.Body.String())
-	}
-	if !strings.Contains(recWhoCI.Body.String(), `"subject":"tag:ci-runner"`) || strings.Contains(recWhoCI.Body.String(), `"tagged-devices"`) {
-		t.Fatalf("unexpected /whoami ci body: %s", recWhoCI.Body.String())
+	recWhoCI := doReq(tailnetHandler, "100.64.0.20:51235", http.MethodGet, "/whoami", "", nil)
+	if recWhoCI.Code != http.StatusOK || !strings.Contains(recWhoCI.Body.String(), `"subject":"tag:ci-runner"`) || strings.Contains(recWhoCI.Body.String(), `"tagged-devices"`) {
+		t.Fatalf("unexpected /whoami ci: %d %s", recWhoCI.Code, recWhoCI.Body.String())
 	}
 
-	// (d) Native Anthropic streaming passthrough (Claude Code)
-	recAnth := doReq("100.64.0.10:51234", http.MethodPost, "/anthropic/v1/messages",
+	// (f) Native Anthropic streaming passthrough (Claude Code)
+	recAnth := doReq(tailnetHandler, "100.64.0.10:51234", http.MethodPost, "/anthropic/v1/messages",
 		`{"model":"claude-sonnet-4-6","max_tokens":1024,"stream":true,"messages":[{"role":"user","content":"hi"}]}`,
 		map[string]string{
 			"x-api-key":         "placeholder-ignored",
@@ -311,18 +402,15 @@ audit:
 	if recAnth.Code != http.StatusOK {
 		t.Fatalf("Anthropic stream = %d: %s", recAnth.Code, recAnth.Body.String())
 	}
-	if gotAnthropicKey != "sk-ant-managed-secret" {
-		t.Fatalf("upstream x-api-key = %q, want managed key", gotAnthropicKey)
-	}
-	if gotAnthropicBeta != "prompt-caching-2024-07-31,interleaved-thinking-2025-05-14" {
-		t.Fatalf("anthropic-beta mutated: %q", gotAnthropicBeta)
+	if gotAnthropicKey != "sk-ant-managed-secret" || gotAnthropicBeta != "prompt-caching-2024-07-31,interleaved-thinking-2025-05-14" {
+		t.Fatalf("Anthropic upstream headers key=%q beta=%q", gotAnthropicKey, gotAnthropicBeta)
 	}
 	if !strings.Contains(recAnth.Body.String(), "sig_abc123") || !strings.Contains(recAnth.Body.String(), "Hello from Claude") {
 		t.Fatalf("Anthropic SSE missing expected frames: %s", recAnth.Body.String())
 	}
 
-	// (e) Native OpenAI Chat streaming passthrough (verifies stream_options injection)
-	recOAI := doReq("100.64.0.10:51234", http.MethodPost, "/v1/chat/completions",
+	// (g) Native OpenAI Chat streaming passthrough (verifies stream_options injection + audit headers/redacted)
+	recOAI := doReq(tailnetHandler, "100.64.0.10:51234", http.MethodPost, "/v1/chat/completions",
 		`{"model":"gpt-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`,
 		map[string]string{"Authorization": "Bearer dummy"},
 	)
@@ -333,57 +421,81 @@ audit:
 		t.Fatalf("OpenAI upstream auth=%q include_usage=%v", gotOpenAIAuth, gotOpenAIStreamOptions)
 	}
 
-	// (f) Cross-protocol streaming translation: OpenAI client -> virtual route "team/coding" (Anthropic upstream)
-	recXlat := doReq("100.64.0.10:51234", http.MethodPost, "/v1/chat/completions",
+	// (h) Cross-protocol streaming translation: OpenAI client -> virtual route "team/coding" (Anthropic upstream)
+	recXlat := doReq(tailnetHandler, "100.64.0.10:51234", http.MethodPost, "/v1/chat/completions",
 		`{"model":"team/coding","stream":true,"messages":[{"role":"user","content":"write go"}]}`,
 		map[string]string{"Authorization": "Bearer dummy"},
 	)
-	if recXlat.Code != http.StatusOK {
-		t.Fatalf("Translated stream = %d: %s", recXlat.Code, recXlat.Body.String())
-	}
-	if !strings.Contains(recXlat.Body.String(), `"chat.completion.chunk"`) || !strings.Contains(recXlat.Body.String(), "Hello from Claude") {
-		t.Fatalf("Translated OpenAI SSE unexpected: %s", recXlat.Body.String())
+	if recXlat.Code != http.StatusOK || !strings.Contains(recXlat.Body.String(), "Hello from Claude") {
+		t.Fatalf("Translated OpenAI->Anthropic stream = %d: %s", recXlat.Code, recXlat.Body.String())
 	}
 
-	// (g) Native Gemini streaming (?key= stripped, x-goog-api-key injected)
-	recGem := doReq("100.64.0.10:51234", http.MethodPost, "/gemini/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=client-dummy",
+	// (i) P1-1: Anthropic client -> OpenAI upstream sends max_completion_tokens (not deprecated max_tokens)
+	recAnthToOAI := doReq(tailnetHandler, "100.64.0.10:51234", http.MethodPost, "/anthropic/v1/messages",
+		`{"model":"team/oai-from-claude","max_tokens":512,"messages":[{"role":"user","content":"hi gpt-5"}]}`,
+		map[string]string{"anthropic-version": "2023-06-01"},
+	)
+	if recAnthToOAI.Code != http.StatusOK {
+		t.Fatalf("P1-1 Anthropic->OpenAI = %d: %s", recAnthToOAI.Code, recAnthToOAI.Body.String())
+	}
+	if gotOpenAIAnthropicReqBody == nil || gotOpenAIAnthropicReqBody["max_completion_tokens"] != float64(512) {
+		t.Fatalf("P1-1: expected max_completion_tokens=512 on OpenAI upstream, got %#v", gotOpenAIAnthropicReqBody)
+	}
+	if _, hasLegacy := gotOpenAIAnthropicReqBody["max_tokens"]; hasLegacy {
+		t.Fatalf("P1-1: deprecated max_tokens must not be sent to OpenAI upstream: %#v", gotOpenAIAnthropicReqBody)
+	}
+
+	// (j) P1-2: Virtual alias pointing only to denied openai/o3 returns 403;
+	// virtual alias with primary openai/o3 + fallback openai/gpt-5 skips denied o3 and succeeds on gpt-5!
+	recAliasDeny := doReq(tailnetHandler, "100.64.0.10:51234", http.MethodPost, "/v1/chat/completions",
+		`{"model":"team/o3-only","messages":[{"role":"user","content":"bypass?"}]}`,
+		nil,
+	)
+	if recAliasDeny.Code != http.StatusForbidden {
+		t.Fatalf("P1-2: team/o3-only must be denied (403), got %d: %s", recAliasDeny.Code, recAliasDeny.Body.String())
+	}
+	recAliasFallback := doReq(tailnetHandler, "100.64.0.10:51234", http.MethodPost, "/v1/chat/completions",
+		`{"model":"team/o3-with-fallback","messages":[{"role":"user","content":"fallback please"}]}`,
+		nil,
+	)
+	if recAliasFallback.Code != http.StatusOK || !strings.Contains(recAliasFallback.Body.String(), "Non-stream GPT") {
+		t.Fatalf("P1-2: team/o3-with-fallback should skip denied o3 and succeed on gpt-5, got %d: %s", recAliasFallback.Code, recAliasFallback.Body.String())
+	}
+
+	// (k) Native Gemini streaming (?key= stripped, x-goog-api-key injected)
+	recGem := doReq(tailnetHandler, "100.64.0.10:51234", http.MethodPost, "/gemini/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=client-dummy",
 		`{"contents":[{"parts":[{"text":"hi"}]}]}`,
 		nil,
 	)
-	if recGem.Code != http.StatusOK {
-		t.Fatalf("Gemini stream = %d: %s", recGem.Code, recGem.Body.String())
-	}
-	if gotGeminiKey != "gemini-managed-secret" || gotGeminiQueryKey != "" {
-		t.Fatalf("Gemini upstream key=%q query_key=%q", gotGeminiKey, gotGeminiQueryKey)
+	if recGem.Code != http.StatusOK || gotGeminiKey != "gemini-managed-secret" || gotGeminiQueryKey != "" {
+		t.Fatalf("Gemini stream = %d key=%q qkey=%q", recGem.Code, gotGeminiKey, gotGeminiQueryKey)
 	}
 
-	// (h) Tagged CI runner allowed Ollama (zero cost), denied Anthropic (403)
-	recCIAllow := doReq("100.64.0.20:51235", http.MethodPost, "/v1/chat/completions",
+	// (l) P1-5: Non-2xx upstream error stores error response body & headers in audit_payloads
+	recErr := doReq(tailnetHandler, "100.64.0.10:51234", http.MethodPost, "/v1/chat/completions",
+		`{"model":"gpt-4.1-err","messages":[{"role":"user","content":"trigger 400"}]}`,
+		map[string]string{"Authorization": "Bearer dummy"},
+	)
+	if recErr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 from gpt-4.1-err, got %d", recErr.Code)
+	}
+
+	// (m) Tagged CI runner allowed Ollama (zero cost), denied Anthropic (403)
+	recCIAllow := doReq(tailnetHandler, "100.64.0.20:51235", http.MethodPost, "/v1/chat/completions",
 		`{"model":"ollama/qwen2.5-coder:32b","messages":[{"role":"user","content":"lint"}]}`,
 		nil,
 	)
 	if recCIAllow.Code != http.StatusOK {
 		t.Fatalf("CI Ollama = %d: %s", recCIAllow.Code, recCIAllow.Body.String())
 	}
-
-	recCIDeny := doReq("100.64.0.20:51235", http.MethodPost, "/anthropic/v1/messages",
+	if recCIDeny := doReq(tailnetHandler, "100.64.0.20:51235", http.MethodPost, "/anthropic/v1/messages",
 		`{"model":"claude-sonnet-4-6","max_tokens":64,"messages":[{"role":"user","content":"nope"}]}`,
 		nil,
-	)
-	if recCIDeny.Code != http.StatusForbidden {
+	); recCIDeny.Code != http.StatusForbidden {
 		t.Fatalf("CI Anthropic = %d, want 403", recCIDeny.Code)
 	}
 
-	// (i) Explicit Deny Wins: Alice denied openai/o3 despite openai/* grant
-	recDenyO3 := doReq("100.64.0.10:51234", http.MethodPost, "/v1/chat/completions",
-		`{"model":"o3","messages":[{"role":"user","content":"nope"}]}`,
-		nil,
-	)
-	if recDenyO3.Code != http.StatusForbidden {
-		t.Fatalf("Alice o3 = %d, want 403", recDenyO3.Code)
-	}
-
-	// (j) Flush async metering recorder and verify persisted usage_logs, USD costs, and audit payloads.
+	// (n) Flush async metering recorder and verify usage_logs, USD costs, and P1-5 audit_payloads.
 	if err := recorder.Close(ctx); err != nil {
 		t.Fatalf("recorder.Close: %v", err)
 	}
@@ -392,60 +504,70 @@ audit:
 	if err != nil {
 		t.Fatalf("QueryUsageLogs: %v", err)
 	}
-	// 5 successful upstream calls: Anthropic native, OpenAI native, Translated team/coding, Gemini native, CI Ollama.
-	if len(logs) != 5 {
-		t.Fatalf("len(usage_logs) = %d, want 5", len(logs))
+	// 9 upstream invocations:
+	// localToken Gemini, Anthropic native, OpenAI native, team/coding, team/oai-from-claude,
+	// team/o3-with-fallback, Alice Gemini, gpt-4.1-err (400), CI Ollama.
+	if len(logs) != 9 {
+		t.Fatalf("len(usage_logs) = %d, want 9", len(logs))
 	}
 
 	byModel := make(map[string]store.UsageLog, len(logs))
 	for _, l := range logs {
-		byModel[l.RequestedModel] = l
+		if l.Subject == "alice@example.com" || l.Subject == "tag:ci-runner" {
+			byModel[l.RequestedModel] = l
+		}
 	}
 
-	// Anthropic claude-sonnet-4-6:
-	// (1000*3.0 + 500*0.30 + 200*3.75 + 100*6.00 + 200*15.0) / 1M = (3000+150+750+600+3000)/1M = 0.0075
-	if got := byModel["claude-sonnet-4-6"]; math.Abs(got.CostUSD-0.0075) > 1e-9 || got.Subject != "alice@example.com" {
+	if got := byModel["claude-sonnet-4-6"]; math.Abs(got.CostUSD-0.0075) > 1e-9 {
 		t.Fatalf("anthropic usage log mismatch: %+v", got)
 	}
-
-	// Translated team/coding -> anthropic/claude-sonnet-4-6: same upstream tokens & cost, Translated=true
 	if got := byModel["team/coding"]; !got.Translated || got.ProviderName != "anthropic" || math.Abs(got.CostUSD-0.0075) > 1e-9 {
 		t.Fatalf("translated usage log mismatch: %+v", got)
 	}
-
-	// OpenAI gpt-5:
-	// uncached_in = 1000*1.25 = 1250; cache_read = 1000*0.125 = 125; out = 500*10.0 = 5000 => 6375/1M = 0.006375
 	if got := byModel["gpt-5"]; math.Abs(got.CostUSD-0.006375) > 1e-9 || got.ReasoningTokens != 200 {
 		t.Fatalf("openai usage log mismatch: %+v", got)
 	}
-
-	// Gemini gemini-2.5-flash:
-	// uncached_in = 1000*0.30 = 300; cache_read = 1000*0.03 = 30; billable_out = (400+100)*2.50 = 1250 => 1580/1M = 0.00158
+	if got := byModel["team/o3-with-fallback"]; got.UpstreamModel != "gpt-5" {
+		t.Fatalf("P1-2 fallback usage log expected upstream gpt-5, got %+v", got)
+	}
 	if got := byModel["gemini-2.5-flash"]; math.Abs(got.CostUSD-0.00158) > 1e-9 || got.ReasoningTokens != 100 {
 		t.Fatalf("gemini usage log mismatch: %+v", got)
 	}
-
-	// Ollama qwen2.5-coder:32b: tagged CI runner, zero cost
-	if got := byModel["ollama/qwen2.5-coder:32b"]; got.Subject != "tag:ci-runner" || got.CostUSD != 0 || got.InputTokens != 500 {
+	if got := byModel["ollama/qwen2.5-coder:32b"]; got.Subject != "tag:ci-runner" || got.CostUSD != 0 {
 		t.Fatalf("ollama usage log mismatch: %+v", got)
 	}
 
-	// Verify audit payload stored with redacted Authorization header.
-	payload, err := st.GetAuditPayloadByUsageLogID(ctx, byModel["gpt-5"].ID)
+	// P1-5: verify 2xx audit payload has populated ResponseHeaders AND Redacted=true.
+	oaiPayload, err := st.GetAuditPayloadByUsageLogID(ctx, byModel["gpt-5"].ID)
 	if err != nil {
 		t.Fatalf("GetAuditPayloadByUsageLogID(gpt-5): %v", err)
 	}
-	if payload.RequestHeaders["Authorization"] != "[REDACTED]" {
-		t.Fatalf("expected redacted Authorization header in audit_payloads, got %+v", payload.RequestHeaders)
+	if oaiPayload.RequestHeaders["Authorization"] != "[REDACTED]" || !oaiPayload.Redacted {
+		t.Fatalf("P1-5: expected Redacted=true and redacted Authorization, got %+v", oaiPayload)
+	}
+	if oaiPayload.ResponseHeaders["X-Upstream-Req-Id"] != "up-oai-999" {
+		t.Fatalf("P1-5: expected populated ResponseHeaders, got %+v", oaiPayload.ResponseHeaders)
 	}
 
-	// (k) Run `headlamp usage` CLI command against the populated SQLite DB.
+	// P1-5: verify non-2xx audit payload stores error response body AND headers.
+	errPayload, err := st.GetAuditPayloadByUsageLogID(ctx, byModel["gpt-4.1-err"].ID)
+	if err != nil {
+		t.Fatalf("GetAuditPayloadByUsageLogID(gpt-4.1-err): %v", err)
+	}
+	if !strings.Contains(errPayload.ResponseBody, "upstream bad input") {
+		t.Fatalf("P1-5: expected non-2xx error body in audit_payloads, got %q", errPayload.ResponseBody)
+	}
+	if errPayload.ResponseHeaders["X-Upstream-Err-Id"] != "err-req-42" || !errPayload.Redacted {
+		t.Fatalf("P1-5: expected non-2xx response headers and Redacted=true, got %+v", errPayload)
+	}
+
+	// (o) Run `headlamp usage` CLI command against the populated SQLite DB.
 	var stdout, stderr bytes.Buffer
 	if err := run([]string{"usage", "-config", cfgPath, "-limit", "10"}, &stdout, &stderr); err != nil {
 		t.Fatalf("run usage: %v (stderr=%s)", err, stderr.String())
 	}
 	out := stdout.String()
-	if !strings.Contains(out, "alice@example.com") || !strings.Contains(out, "tag:ci-runner") || !strings.Contains(out, "Total: 5 requests") {
+	if !strings.Contains(out, "alice@example.com") || !strings.Contains(out, "tag:ci-runner") || !strings.Contains(out, "Total: 9 requests") {
 		t.Fatalf("unexpected usage CLI output:\n%s", out)
 	}
 }
@@ -457,13 +579,19 @@ func TestCLIInitAndVersion(t *testing.T) {
 	if err := run([]string{"init", "-out", outPath}, &stdout, &stderr); err != nil {
 		t.Fatalf("init failed: %v", err)
 	}
-	// Second init without -force must fail.
 	if err := run([]string{"init", "-out", outPath}, &stdout, &stderr); err == nil {
 		t.Fatal("expected init without -force to refuse overwrite")
 	}
-	// With -force must succeed.
 	if err := run([]string{"init", "-out", outPath, "-force"}, &stdout, &stderr); err != nil {
 		t.Fatalf("init -force failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read starter config: %v", err)
+	}
+	if strings.Contains(string(raw), "\npolicy:") || strings.Contains(string(raw), "priority:") {
+		t.Fatalf("starter config must not contain legacy policy/priority blocks:\n%s", string(raw))
 	}
 
 	// Starter config must parse and validate cleanly via config.Load.

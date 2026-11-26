@@ -41,6 +41,6 @@ web/dist/
 *.swo
 
 # Agent Prompts
-AGNETS.md
+AGENTS.md
 DESIGN.md
 CLAUDE.md

@@ -133,7 +133,7 @@ In Headscale v0.29+, tagged pre-auth keys register the node directly under `tag:
 headscale preauthkeys create --reusable --expiration 24h --tags tag:headlamp
 ```
 
-If you prefer not to use tags yet (e.g. `policy.mode: local_only`), create a user-scoped key instead:
+If you prefer not to tag Headlamp (for example, when targeting Headlamp by user in your Headscale `grants`), create a user-scoped key instead:
 
 ```bash
 headscale preauthkeys create --user alice --reusable --expiration 24h
@@ -142,6 +142,8 @@ headscale preauthkeys create --user alice --reusable --expiration 24h
 ---
 
 ## 4. Configure and Run Headlamp
+
+Headlamp uses pure **grants-only** authorization: Tailnet permissions come exclusively from Headscale `grants` (no local `policy:` block in `headlamp.yaml`).
 
 Copy [`headlamp.example.yaml`](../headlamp.example.yaml) to `headlamp.yaml` and set:
 
@@ -154,10 +156,6 @@ server:
     state_dir: "./data"
   tls:
     mode: none # WireGuard already encrypts tailnet traffic; use mode: static for custom HTTPS certs
-policy:
-  mode: hybrid # Combines local SQLite policies with Headscale grants (or use local_only / grants_only)
-  bootstrap_admins:
-    - "alice@example.com"
 ```
 
 Start Headlamp with your Headscale auth key, master encryption key, and upstream provider keys:
@@ -257,5 +255,5 @@ claude
 - **Connection refused / timeout to `http://headlamp`**: Verify your grant includes `"ip": ["tcp:80", "tcp:443"]` (not just `"app"`).
 - **`capability name must not be in the tailscale.com domain`**: Headscale v0.29.7 forbids `tailscale.com/cap/*` capability names in policies. Use `"headlamp.dev/cap/gateway"` on Headscale (Headlamp's `"tailscale.com/cap/aperture"` compatibility is for official Tailscale SaaS only).
 - **Tagged devices show `tagged-devices` in Headscale**: Expected in Headscale v0.28/v0.29+. Headlamp inspects `Node.IsTagged()` first and resolves the caller subject to `tag:<name>` (e.g. `tag:ci-runner`) rather than `tagged-devices`.
-- **Non-OIDC local users**: In Headscale v0.29.7, policy `src` / `groups` entries use a trailing `@` (for example `"alice@"`), while `WhoIs.UserProfile.LoginName`—and therefore Headlamp's `bootstrap_admins` and local policy `subject`—uses `"alice"` without the trailing `@`. Run `curl http://headlamp/whoami` from a tailnet device to confirm the exact resolved `principal.subject`.
+- **Non-OIDC local users**: In Headscale v0.29.7, policy `src` / `groups` entries use a trailing `@` (for example `"alice@"`), while `WhoIs.UserProfile.LoginName` (shown in `GET /whoami` and recorded in `usage_logs.subject`) reports `"alice"` without the trailing `@`. Run `curl http://headlamp/whoami` from a tailnet device to confirm the exact resolved `principal.subject` and effective grants.
 - **HTTPS on Headscale**: Tailscale SaaS automatic `*.ts.net` certs (`ListenTLS`) are not available on Headscale. Use `tls.mode: none` inside WireGuard (default) or `tls.mode: static` with your own certificate and key.

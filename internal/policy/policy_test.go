@@ -9,36 +9,15 @@ import (
 	"testing"
 
 	"github.com/zacharykka/headlamp/internal/auth"
-	"github.com/zacharykka/headlamp/internal/config"
-	"github.com/zacharykka/headlamp/internal/crypto"
 	"github.com/zacharykka/headlamp/internal/netts"
-	"github.com/zacharykka/headlamp/internal/store"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
 )
 
-func newTestStore(t *testing.T) *store.SQLiteStore {
-	t.Helper()
-	key, err := crypto.GenerateKey()
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-	cipher, err := crypto.NewCipher(key)
-	if err != nil {
-		t.Fatalf("new cipher: %v", err)
-	}
-	st, err := store.NewSQLiteStore(context.Background(), ":memory:", cipher)
-	if err != nil {
-		t.Fatalf("new sqlite store: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-	return st
-}
-
 func TestParseGrants_HeadlampAndApertureFormats(t *testing.T) {
 	rawCaps := map[string][]byte{
 		CapHeadlampGateway: []byte(`[
-			{"role":"user","models":["openai/gpt-5*","ollama/*"],"deny_models":"openai/gpt-5-pro","mcp_tools":["docs/*"]}
+			{"role":"user","models":["openai/gpt-5*","ollama/*"],"deny_models":"openai/gpt-5-pro","mcp_tools":["docs/*"],"deny_mcp_tools":["docs/delete_*"]}
 		]`),
 		CapApertureCompat: []byte(`[
 			{"role":"admin"},
@@ -68,212 +47,158 @@ func TestParseGrants_HeadlampAndApertureFormats(t *testing.T) {
 	if !slices.Equal(parsed.AllowMCPTools, wantTools) {
 		t.Errorf("AllowMCPTools = %v, want %v", parsed.AllowMCPTools, wantTools)
 	}
+	if !slices.Equal(parsed.DenyMCPTools, []string{"docs/delete_*"}) {
+		t.Errorf("DenyMCPTools = %v, want [docs/delete_*]", parsed.DenyMCPTools)
+	}
 }
 
 func TestParseGrants_MalformedJSONFailsClosed(t *testing.T) {
-	_, err := ParseGrants(map[string][]byte{
-		CapHeadlampGateway: []byte(`[{"role": "admin", "models": 12345}]`),
-	})
-	if err == nil {
-		t.Fatal("expected error on malformed capability JSON")
+	ev := NewEvaluator()
+	badPrincipal := &auth.Principal{
+		Subject: "alice@example.com",
+		RawCaps: map[string][]byte{
+			CapHeadlampGateway: []byte(`[{"role": "admin", "models": 12345}]`),
+		},
+	}
+
+	if _, err := ParseGrants(badPrincipal.RawCaps); err == nil {
+		t.Fatal("expected ParseGrants error on malformed capability JSON")
+	}
+	if ok, _, err := ev.AuthorizeModel(context.Background(), badPrincipal, "openai/gpt-5"); err == nil || ok {
+		t.Fatalf("expected AuthorizeModel fail-closed error, got ok=%v err=%v", ok, err)
+	}
+	if denied, _, err := ev.IsModelDenied(context.Background(), badPrincipal, "openai/gpt-5"); err == nil || denied {
+		t.Fatalf("expected IsModelDenied fail-closed error, got denied=%v err=%v", denied, err)
 	}
 }
 
-func TestEvaluator_AllThreeModes(t *testing.T) {
+func TestEvaluator_NoGrantsAllowsNothing(t *testing.T) {
 	ctx := context.Background()
-	st := newTestStore(t)
+	ev := NewEvaluator()
 
-	if err := st.UpsertGroup(ctx, store.Group{
-		Name:    "engineering",
-		Members: []string{"bob@example.com"},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.UpsertPolicy(ctx, store.Policy{
-		ID:          "eng-local",
-		Name:        "eng-local",
-		Subject:     "group:engineering",
-		Role:        auth.RoleUser,
-		AllowModels: []string{"openai/*"},
-		DenyModels:  []string{"openai/o3*"},
-		Enabled:     true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	bob := &auth.Principal{
-		Subject: "bob@example.com",
-		RawCaps: map[string][]byte{
-			CapApertureCompat: []byte(`[{"role":"admin"},{"models":"anthropic/**"}]`),
-		},
+	// Even if Principal.Roles were populated out-of-band without RawCaps, grants-only allows nothing.
+	noGrants := &auth.Principal{
+		Subject:    "bob@example.com",
+		Roles:      []string{auth.RoleAdmin, auth.RoleUser},
 		AuthSource: auth.AuthSourceTSNet,
 	}
 
-	t.Run("hybrid merges local and grants with explicit deny wins", func(t *testing.T) {
-		ev := NewEvaluator(config.PolicyConfig{Mode: config.PolicyModeHybrid}, st)
+	ep, err := ev.Evaluate(ctx, noGrants)
+	if err != nil {
+		t.Fatalf("Evaluate failed: %v", err)
+	}
+	if ep.GrantsApplied {
+		t.Error("expected GrantsApplied=false when RawCaps is empty")
+	}
+	if ep.IsAdmin() || len(ep.Roles) != 0 {
+		t.Errorf("expected no roles without grants, got %v", ep.Roles)
+	}
+	if ok, reason, err := ev.AuthorizeModel(ctx, noGrants, "openai/gpt-5"); err != nil || ok || reason == "" {
+		t.Fatalf("expected model denied with reason, got ok=%v reason=%q err=%v", ok, reason, err)
+	}
+	if denied, reason, err := ev.IsModelDenied(ctx, noGrants, "openai/gpt-5"); err != nil || denied || reason != "" {
+		t.Fatalf("expected IsModelDenied=false with no deny rules, got denied=%v reason=%q err=%v", denied, reason, err)
+	}
+	if isAdmin, err := ev.IsAdmin(ctx, noGrants); err != nil || isAdmin {
+		t.Fatalf("expected IsAdmin=false without grants, got %v, %v", isAdmin, err)
+	}
 
-		ok, _, err := ev.AuthorizeModel(ctx, bob, "openai/gpt-5")
-		if err != nil || !ok {
-			t.Fatalf("expected local allow openai/gpt-5, got ok=%v err=%v", ok, err)
-		}
-		ok, _, err = ev.AuthorizeModel(ctx, bob, "anthropic/claude-sonnet-4-6")
-		if err != nil || !ok {
-			t.Fatalf("expected grant allow anthropic/claude-sonnet-4-6, got ok=%v err=%v", ok, err)
-		}
-		ok, reason, err := ev.AuthorizeModel(ctx, bob, "openai/o3")
-		if err != nil || ok {
-			t.Fatalf("expected explicit deny for openai/o3, got ok=%v reason=%q err=%v", ok, reason, err)
-		}
-		ok, _, err = ev.AuthorizeModel(ctx, bob, "gemini/gemini-2.5-pro")
-		if err != nil || ok {
-			t.Fatalf("expected default deny for gemini/gemini-2.5-pro, got ok=%v err=%v", ok, err)
-		}
-		isAdmin, err := ev.IsAdmin(ctx, bob)
-		if err != nil || !isAdmin {
-			t.Fatalf("expected admin role from Aperture grant in hybrid mode, got %v, %v", isAdmin, err)
-		}
-	})
-
-	t.Run("local_only ignores Headscale grants completely", func(t *testing.T) {
-		ev := NewEvaluator(config.PolicyConfig{Mode: config.PolicyModeLocalOnly}, st)
-
-		ok, _, err := ev.AuthorizeModel(ctx, bob, "openai/gpt-5")
-		if err != nil || !ok {
-			t.Fatalf("expected local allow openai/gpt-5, got ok=%v err=%v", ok, err)
-		}
-		ok, _, err = ev.AuthorizeModel(ctx, bob, "anthropic/claude-sonnet-4-6")
-		if err != nil || ok {
-			t.Fatalf("expected anthropic denied when grants ignored in local_only, got ok=%v err=%v", ok, err)
-		}
-		isAdmin, err := ev.IsAdmin(ctx, bob)
-		if err != nil || isAdmin {
-			t.Fatalf("expected IsAdmin=false in local_only mode (grant admin ignored), got %v, %v", isAdmin, err)
-		}
-	})
-
-	t.Run("grants_only ignores local policies completely", func(t *testing.T) {
-		ev := NewEvaluator(config.PolicyConfig{Mode: config.PolicyModeGrantsOnly}, st)
-
-		ok, _, err := ev.AuthorizeModel(ctx, bob, "anthropic/claude-sonnet-4-6")
-		if err != nil || !ok {
-			t.Fatalf("expected grant allow anthropic/claude-sonnet-4-6, got ok=%v err=%v", ok, err)
-		}
-		ok, _, err = ev.AuthorizeModel(ctx, bob, "openai/gpt-5")
-		if err != nil || ok {
-			t.Fatalf("expected local openai/gpt-5 denied in grants_only mode, got ok=%v err=%v", ok, err)
-		}
-
-		// User with no grants is denied cleanly.
-		noGrants := &auth.Principal{Subject: "bob@example.com"}
-		ok, reason, err := ev.AuthorizeModel(ctx, noGrants, "openai/gpt-5")
-		if err != nil || ok || reason == "" {
-			t.Fatalf("expected denied with reason when no grants present, got ok=%v reason=%q err=%v", ok, reason, err)
-		}
-	})
+	// Nil principal must return ErrUnauthenticated.
+	if _, err := ev.Evaluate(ctx, nil); err != auth.ErrUnauthenticated {
+		t.Fatalf("expected ErrUnauthenticated for nil principal, got %v", err)
+	}
+	if _, _, err := ev.IsModelDenied(ctx, nil, "openai/gpt-5"); err != auth.ErrUnauthenticated {
+		t.Fatalf("expected ErrUnauthenticated from IsModelDenied for nil principal, got %v", err)
+	}
 }
 
-func TestEvaluator_ExplicitDenyWinsAcrossTracks(t *testing.T) {
+func TestEvaluator_ExplicitDenyWinsAndIsModelDenied(t *testing.T) {
 	ctx := context.Background()
-	st := newTestStore(t)
+	ev := NewEvaluator()
 
-	// Local deny-only rule blocking Opus models for everyone.
-	if err := st.UpsertPolicy(ctx, store.Policy{
-		ID:         "global-deny-opus",
-		Name:       "global-deny-opus",
-		Subject:    "*",
-		DenyModels: []string{"anthropic/claude-opus-*", "o3*"},
-		Enabled:    true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	// Disabled policy should have no effect.
-	if err := st.UpsertPolicy(ctx, store.Policy{
-		ID:          "disabled-allow",
-		Name:        "disabled-allow",
-		Subject:     "*",
-		AllowModels: []string{"gemini/*"},
-		Enabled:     false,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	ev := NewEvaluator(config.PolicyConfig{
-		Mode:            config.PolicyModeHybrid,
-		BootstrapAdmins: []string{"alice@example.com"},
-	}, st)
-
-	// Bootstrap admin has wildcard allow, yet Explicit Deny still wins!
+	// Principal is allowed virtual alias "team/*" and wildcard "*" via one grant,
+	// while explicit deny rules block "openai/o3*" and bare "claude-opus-*".
 	alice := &auth.Principal{
 		Subject: "alice@example.com",
 		RawCaps: map[string][]byte{
-			CapHeadlampGateway: []byte(`[{"role":"admin","models":["**"],"deny_models":["openai/gpt-5.4"]}]`),
+			CapHeadlampGateway: []byte(`[
+				{"role":"admin","models":["team/*","anthropic/*","openai/*"],"deny_models":["openai/o3*","claude-opus-*"],"mcp_tools":["docs/*"],"deny_mcp_tools":["docs/secret_*"]}
+			]`),
 		},
 	}
 
-	isAdmin, err := ev.IsAdmin(ctx, alice)
-	if err != nil || !isAdmin {
-		t.Fatalf("expected bootstrap admin IsAdmin=true, got %v, %v", isAdmin, err)
-	}
-
-	cases := []struct {
+	// AuthorizeModel checks: Explicit Deny Wins over allows.
+	authCases := []struct {
 		model string
 		want  bool
 	}{
+		{"team/coding", true},
 		{"anthropic/claude-sonnet-4-6", true},
-		{"anthropic/claude-opus-4-6", false}, // local deny overrides bootstrap & grant wildcard
-		{"openai/o3-mini", false},            // bare deny pattern "o3*" matches "openai/o3-mini"
-		{"o3", false},                        // bare deny pattern matches bare "o3"
-		{"openai/gpt-5.4", false},            // grant deny_models overrides bootstrap wildcard
+		{"anthropic/claude-opus-4-6", false}, // bare deny pattern matches provider/model
+		{"claude-opus-4-6", false},           // bare deny pattern matches bare model
+		{"openai/o3", false},                 // provider/model deny wins over openai/*
+		{"openai/o3-mini", false},
 		{"openai/gpt-5-mini", true},
+		{"gemini/gemini-2.5-flash", false}, // not allowed
 	}
-	for _, tc := range cases {
+	for _, tc := range authCases {
 		got, reason, err := ev.AuthorizeModel(ctx, alice, tc.model)
 		if err != nil {
-			t.Fatalf("AuthorizeModel(%q) err: %v", tc.model, err)
+			t.Fatalf("AuthorizeModel(%q) error: %v", tc.model, err)
 		}
 		if got != tc.want {
 			t.Errorf("AuthorizeModel(%q) = %v (%s), want %v", tc.model, got, reason, tc.want)
 		}
 	}
 
-	// Regular user with grant allow still obeys disabled policy check (gemini not granted).
-	carol := &auth.Principal{
-		Subject: "carol@example.com",
-		RawCaps: map[string][]byte{
-			CapHeadlampGateway: []byte(`[{"role":"user","models":["anthropic/*"]}]`),
-		},
+	// IsModelDenied checks (P1-2): catches concrete upstream candidates behind allowed virtual aliases.
+	denyCases := []struct {
+		model      string
+		wantDenied bool
+	}{
+		{"team/coding", false},
+		{"openai/o3", true},
+		{"openai/o3-mini", true},
+		{"anthropic/claude-opus-4-6", true},
+		{"claude-opus-4-6", true},
+		{"openai/gpt-5-mini", false},
+		{"gemini/gemini-2.5-flash", false}, // not in AllowModels, also not in DenyModels
+		{"", false},
 	}
-	ok, _, err := ev.AuthorizeModel(ctx, carol, "gemini/gemini-2.5-flash")
-	if err != nil || ok {
-		t.Fatalf("disabled local policy should not allow gemini, got ok=%v err=%v", ok, err)
+	for _, tc := range denyCases {
+		got, reason, err := ev.IsModelDenied(ctx, alice, tc.model)
+		if err != nil {
+			t.Fatalf("IsModelDenied(%q) error: %v", tc.model, err)
+		}
+		if got != tc.wantDenied {
+			t.Errorf("IsModelDenied(%q) = %v (%q), want %v", tc.model, got, reason, tc.wantDenied)
+		}
+		if tc.wantDenied && reason == "" {
+			t.Errorf("IsModelDenied(%q) returned empty reason", tc.model)
+		}
+	}
+
+	// MCP tool Explicit Deny Wins check.
+	if ok, _, err := ev.AuthorizeMCPTool(ctx, alice, "docs/read"); err != nil || !ok {
+		t.Fatalf("expected docs/read allowed, got ok=%v err=%v", ok, err)
+	}
+	if ok, _, err := ev.AuthorizeMCPTool(ctx, alice, "docs/secret_keys"); err != nil || ok {
+		t.Fatalf("expected docs/secret_keys denied, got ok=%v err=%v", ok, err)
 	}
 }
 
 func TestEvaluator_GlobMatchingAndFilterModels(t *testing.T) {
 	ctx := context.Background()
-	st := newTestStore(t)
+	ev := NewEvaluator()
 
-	if err := st.UpsertGroup(ctx, store.Group{
-		Name:    "ci",
-		Members: []string{"tag:ci-runner"},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.UpsertPolicy(ctx, store.Policy{
-		ID:          "ci-models",
-		Name:        "ci-models",
-		Subject:     "group:ci",
-		AllowModels: []string{"anthropic/claude-haiku-*", "gpt-4.1-mini", "team/*"},
-		DenyModels:  []string{"team/expensive"},
-		Enabled:     true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	ev := NewEvaluator(config.PolicyConfig{Mode: config.PolicyModeHybrid}, st)
 	ciPrincipal := &auth.Principal{
 		Subject: "tag:ci-runner",
 		Tags:    []string{"tag:ci-runner"},
+		RawCaps: map[string][]byte{
+			CapHeadlampGateway: []byte(`[
+				{"role":"user","models":["anthropic/claude-haiku-*","gpt-4.1-mini","team/*"],"deny_models":["team/expensive"]}
+			]`),
+		},
 	}
 
 	candidates := []string{
@@ -302,53 +227,14 @@ func TestEvaluator_GlobMatchingAndFilterModels(t *testing.T) {
 	}
 }
 
-func TestEvaluator_BootstrapAdminWithoutSyncConfig(t *testing.T) {
-	ctx := context.Background()
-
-	// nil store verifies Evaluator handles BootstrapAdmins directly even without SyncConfig.
-	ev := NewEvaluator(config.PolicyConfig{
-		Mode:            config.PolicyModeLocalOnly,
-		BootstrapAdmins: []string{"alice@example.com"},
-	}, nil)
-
-	alice := &auth.Principal{Subject: "alice@example.com"}
-	isAdmin, err := ev.IsAdmin(ctx, alice)
-	if err != nil || !isAdmin {
-		t.Fatalf("expected IsAdmin=true for bootstrap admin, got %v, %v", isAdmin, err)
-	}
-	ok, _, err := ev.AuthorizeModel(ctx, alice, "anthropic/claude-sonnet-4-6")
-	if err != nil || !ok {
-		t.Fatalf("expected bootstrap admin allowed in local_only mode, got ok=%v err=%v", ok, err)
-	}
-
-	// Nil principal must return ErrUnauthenticated.
-	if _, err := ev.Evaluate(ctx, nil); err != auth.ErrUnauthenticated {
-		t.Fatalf("expected ErrUnauthenticated for nil principal, got %v", err)
-	}
-}
-
 func TestEvaluator_AdminRoleImpliesUserRole(t *testing.T) {
 	ctx := context.Background()
-	st := newTestStore(t)
+	ev := NewEvaluator()
 
-	if err := st.UpsertPolicy(ctx, store.Policy{
-		ID:          "local-admin",
-		Name:        "local-admin",
-		Subject:     "local-admin@example.com",
-		Role:        auth.RoleAdmin,
-		AllowModels: []string{"*"},
-		Enabled:     true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	ev := NewEvaluator(config.PolicyConfig{Mode: config.PolicyModeHybrid}, st)
-
-	// 1. Admin via Headscale grant only.
 	grantAdmin := &auth.Principal{
-		Subject: "grant-admin@example.com",
+		Subject: "admin@example.com",
 		RawCaps: map[string][]byte{
-			CapHeadlampGateway: []byte(`[{"role":"admin","models":["anthropic/*"]}]`),
+			CapHeadlampGateway: []byte(`[{"role":"admin","models":["*"]}]`),
 		},
 	}
 	ep, err := ev.Evaluate(ctx, grantAdmin)
@@ -362,23 +248,64 @@ func TestEvaluator_AdminRoleImpliesUserRole(t *testing.T) {
 		t.Errorf("grantAdmin Roles = %v, want [admin user]", ep.Roles)
 	}
 
-	// 2. Admin via local policy only.
-	localAdmin := &auth.Principal{Subject: "local-admin@example.com"}
-	ep, err = ev.Evaluate(ctx, localAdmin)
-	if err != nil {
-		t.Fatalf("Evaluate(localAdmin) failed: %v", err)
-	}
-	if !ep.IsAdmin() || !ep.HasRole(auth.RoleUser) {
-		t.Fatalf("local policy admin must imply user role: roles=%v", ep.Roles)
-	}
-	if !slices.Equal(ep.Roles, []string{auth.RoleAdmin, auth.RoleUser}) {
-		t.Errorf("localAdmin Roles = %v, want [admin user]", ep.Roles)
-	}
-
-	// 3. Direct EffectivePolicy.HasRole check when constructed manually with only RoleAdmin.
 	manual := &EffectivePolicy{Roles: []string{auth.RoleAdmin}}
 	if !manual.HasRole(auth.RoleUser) {
 		t.Error("EffectivePolicy.HasRole(user) must be true when admin role is present")
+	}
+}
+
+func TestEvaluator_SynthesizedDevAndTokenRawCaps(t *testing.T) {
+	ctx := context.Background()
+	ev := NewEvaluator()
+
+	// 1. DevAuthenticator synthesizes headlamp.dev/cap/gateway allowing "*" with configured roles.
+	devAuth := auth.NewDevAuthenticator("dev@local", []string{auth.RoleAdmin}, false)
+	devReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/v1/models", nil)
+	devReq.RemoteAddr = "127.0.0.1:54321"
+	devPrincipal, err := devAuth.Authenticate(devReq)
+	if err != nil {
+		t.Fatalf("DevAuthenticator failed: %v", err)
+	}
+	if isAdmin, err := ev.IsAdmin(ctx, devPrincipal); err != nil || !isAdmin {
+		t.Fatalf("expected dev principal IsAdmin=true via synthesized grant, got %v, %v", isAdmin, err)
+	}
+	if ok, _, err := ev.AuthorizeModel(ctx, devPrincipal, "anthropic/claude-sonnet-4-6"); err != nil || !ok {
+		t.Fatalf("expected dev principal allowed via synthesized wildcard grant, got ok=%v err=%v", ok, err)
+	}
+
+	// 2. TokenAuthenticator synthesizes scoped allow/deny models & MCP tools into RawCaps.
+	tokAuth := auth.NewTokenAuthenticator([]auth.StaticToken{
+		{
+			Name:          "ci-bot",
+			Token:         "hl_secret_ci_token",
+			Subject:       "tag:ci-runner",
+			Roles:         []string{auth.RoleUser},
+			AllowModels:   []string{"openai/*", "team/*"},
+			DenyModels:    []string{"openai/o3*"},
+			AllowMCPTools: []string{"github/read_*"},
+		},
+	}, false)
+	tokReq := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/v1/chat/completions", nil)
+	tokReq.Header.Set("Authorization", "Bearer hl_secret_ci_token")
+	tokPrincipal, err := tokAuth.Authenticate(tokReq)
+	if err != nil {
+		t.Fatalf("TokenAuthenticator failed: %v", err)
+	}
+
+	if isAdmin, err := ev.IsAdmin(ctx, tokPrincipal); err != nil || isAdmin {
+		t.Fatalf("expected token principal IsAdmin=false, got %v, %v", isAdmin, err)
+	}
+	if ok, _, err := ev.AuthorizeModel(ctx, tokPrincipal, "openai/gpt-4.1"); err != nil || !ok {
+		t.Fatalf("expected openai/gpt-4.1 allowed for static token, got ok=%v err=%v", ok, err)
+	}
+	if denied, _, err := ev.IsModelDenied(ctx, tokPrincipal, "openai/o3"); err != nil || !denied {
+		t.Fatalf("expected openai/o3 explicitly denied for static token, got denied=%v err=%v", denied, err)
+	}
+	if ok, _, err := ev.AuthorizeModel(ctx, tokPrincipal, "anthropic/claude-sonnet-4-6"); err != nil || ok {
+		t.Fatalf("expected anthropic denied for static token, got ok=%v err=%v", ok, err)
+	}
+	if ok, _, err := ev.AuthorizeMCPTool(ctx, tokPrincipal, "github/read_issue"); err != nil || !ok {
+		t.Fatalf("expected github/read_issue allowed for static token, got ok=%v err=%v", ok, err)
 	}
 }
 
@@ -392,7 +319,6 @@ func (s stubWhoIs) WhoIs(ctx context.Context, remoteAddr string) (*apitype.WhoIs
 
 func TestEndToEnd_TSNetWhoIsToPolicyEvaluator(t *testing.T) {
 	ctx := context.Background()
-	st := newTestStore(t)
 
 	tsAuth := netts.NewTSNetAuthenticator(stubWhoIs{
 		resp: &apitype.WhoIsResponse{
@@ -422,17 +348,14 @@ func TestEndToEnd_TSNetWhoIsToPolicyEvaluator(t *testing.T) {
 		t.Fatalf("tsAuth.Authenticate failed: %v", err)
 	}
 
-	ev := NewEvaluator(config.PolicyConfig{Mode: config.PolicyModeHybrid}, st)
-	ok, _, err := ev.AuthorizeModel(ctx, principal, "anthropic/claude-sonnet-4-6")
-	if err != nil || !ok {
+	ev := NewEvaluator()
+	if ok, _, err := ev.AuthorizeModel(ctx, principal, "anthropic/claude-sonnet-4-6"); err != nil || !ok {
 		t.Fatalf("expected anthropic model allowed via Aperture grant, got ok=%v err=%v", ok, err)
 	}
-	ok, _, err = ev.AuthorizeModel(ctx, principal, "openai/gpt-5")
-	if err != nil || ok {
+	if ok, _, err := ev.AuthorizeModel(ctx, principal, "openai/gpt-5"); err != nil || ok {
 		t.Fatalf("expected openai model denied, got ok=%v err=%v", ok, err)
 	}
-	toolOK, _, err := ev.AuthorizeMCPTool(ctx, principal, "docs/search")
-	if err != nil || !toolOK {
+	if toolOK, _, err := ev.AuthorizeMCPTool(ctx, principal, "docs/search"); err != nil || !toolOK {
 		t.Fatalf("expected docs/search MCP tool allowed via Aperture connectors, got ok=%v err=%v", toolOK, err)
 	}
 }

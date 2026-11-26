@@ -10,9 +10,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,14 +27,27 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
+type configSnapshot struct {
+	providers       []Provider
+	providersByName map[string]Provider
+	routes          []ModelRoute
+	routesByAlias   map[string]ModelRoute
+}
+
 // SQLiteStore implements Store backed by pure-Go modernc.org/sqlite.
+// Decrypted providers and model routes are served from an in-memory snapshot cache
+// that is atomically invalidated on mutations.
 type SQLiteStore struct {
 	db     *sql.DB
 	cipher *crypto.Cipher
+
+	cacheMu    sync.RWMutex
+	cache      *configSnapshot
+	cacheLoads atomic.Int64
 }
 
 // NewSQLiteStore opens a SQLite database with WAL mode, busy_timeout, and foreign_keys ON,
-// then runs all embedded SQL migrations.
+// tightens file-backed directory/file permissions (0700/0600), and runs all embedded SQL migrations.
 func NewSQLiteStore(ctx context.Context, dsn string, cipher *crypto.Cipher) (*SQLiteStore, error) {
 	if cipher == nil {
 		return nil, errors.New("store: cipher is required")
@@ -40,7 +56,7 @@ func NewSQLiteStore(ctx context.Context, dsn string, cipher *crypto.Cipher) (*SQ
 		return nil, errors.New("store: sqlite dsn is required")
 	}
 
-	connDSN, isMemory, err := prepareSQLiteDSN(dsn)
+	connDSN, filePath, isMemory, err := prepareSQLiteDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -85,6 +101,20 @@ func NewSQLiteStore(ctx context.Context, dsn string, cipher *crypto.Cipher) (*SQ
 		_ = db.Close()
 		return nil, err
 	}
+
+	if !isMemory && filePath != "" {
+		if err := os.Chmod(filePath, 0o600); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("store: chmod sqlite db %q: %w", filePath, err)
+		}
+		for _, suffix := range []string{"-wal", "-shm"} {
+			if err := os.Chmod(filePath+suffix, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+				_ = db.Close()
+				return nil, fmt.Errorf("store: chmod sqlite file %q: %w", filePath+suffix, err)
+			}
+		}
+	}
+
 	return s, nil
 }
 
@@ -197,13 +227,17 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 	return nil
 }
 
-// SyncConfig idempotently seeds/syncs YAML providers, routes, groups, bootstrap admins,
-// and static policy rules into SQLite without disturbing local UI-created records.
+// SyncConfig idempotently syncs YAML providers and model routes into SQLite within a single
+// transaction, deleting any stale source='config' providers/routes removed from cfg while
+// leaving source='local' records untouched.
 // If a YAML provider omits api_key while a stored provider already exists, the existing encrypted key is preserved.
 func (s *SQLiteStore) SyncConfig(ctx context.Context, cfg *config.Config) error {
 	if cfg == nil {
 		return nil
 	}
+
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -213,7 +247,10 @@ func (s *SQLiteStore) SyncConfig(ctx context.Context, cfg *config.Config) error 
 
 	now := time.Now().UTC()
 
+	providerNames := make([]string, 0, len(cfg.Providers))
 	for _, p := range cfg.Providers {
+		providerNames = append(providerNames, p.Name)
+
 		apiKeyEnc := ""
 		if p.APIKey != "" {
 			apiKeyEnc, err = s.cipher.EncryptString(p.APIKey)
@@ -256,7 +293,10 @@ ON CONFLICT(name) DO UPDATE SET
 		}
 	}
 
+	routeAliases := make([]string, 0, len(cfg.Routes))
 	for _, r := range cfg.Routes {
+		routeAliases = append(routeAliases, r.Alias)
+
 		fallbacks := make([]RouteTarget, len(r.Fallbacks))
 		for i, fb := range r.Fallbacks {
 			fallbacks[i] = RouteTarget{Provider: fb.Provider, Model: fb.Model}
@@ -295,74 +335,157 @@ ON CONFLICT(alias) DO UPDATE SET
 		}
 	}
 
-	for _, g := range cfg.Policy.Groups {
-		_, err = tx.ExecContext(ctx, `
-INSERT INTO groups (name, description, source, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?)
-ON CONFLICT(name) DO UPDATE SET
-	description = excluded.description,
-	source = excluded.source,
-	updated_at = excluded.updated_at`,
-			g.Name, g.Description, SourceConfig, formatTime(now), formatTime(now),
-		)
-		if err != nil {
-			return fmt.Errorf("store: sync group %q: %w", g.Name, err)
-		}
-		if err := replaceGroupMembersTx(ctx, tx, g.Name, g.Members, now); err != nil {
-			return err
-		}
+	// Delete stale config-managed routes BEFORE stale providers to respect foreign keys.
+	if err := deleteStaleConfigRowsTx(ctx, tx, "model_routes", "alias", routeAliases); err != nil {
+		return err
 	}
-
-	for _, admin := range cfg.Policy.BootstrapAdmins {
-		subject := strings.TrimSpace(admin)
-		if subject == "" {
-			continue
-		}
-		pol := Policy{
-			ID:            "bootstrap-admin:" + subject,
-			Name:          "bootstrap-admin:" + subject,
-			Subject:       subject,
-			Role:          "admin",
-			AllowModels:   []string{"*"},
-			AllowMCPTools: []string{"*"},
-			Priority:      1000,
-			Enabled:       true,
-			Source:        SourceConfig,
-		}
-		if err := upsertPolicyTx(ctx, tx, pol, now); err != nil {
-			return fmt.Errorf("store: sync bootstrap admin %q: %w", subject, err)
-		}
-	}
-
-	for i, rule := range cfg.Policy.Rules {
-		name := strings.TrimSpace(rule.Name)
-		idSuffix := name
-		if idSuffix == "" {
-			idSuffix = fmt.Sprintf("rule-%d", i)
-			name = idSuffix
-		}
-		pol := Policy{
-			ID:            "cfg-rule:" + idSuffix,
-			Name:          name,
-			Subject:       rule.Subject,
-			Role:          rule.Role,
-			AllowModels:   rule.AllowModels,
-			DenyModels:    rule.DenyModels,
-			AllowMCPTools: rule.AllowMCPTools,
-			DenyMCPTools:  rule.DenyMCPTools,
-			Priority:      rule.Priority,
-			Enabled:       true,
-			Source:        SourceConfig,
-		}
-		if err := upsertPolicyTx(ctx, tx, pol, now); err != nil {
-			return fmt.Errorf("store: sync policy rule %q: %w", name, err)
-		}
+	if err := deleteStaleConfigRowsTx(ctx, tx, "providers", "name", providerNames); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: sync config commit: %w", err)
 	}
+
+	s.cache = nil
 	return nil
+}
+
+func deleteStaleConfigRowsTx(ctx context.Context, tx *sql.Tx, table, keyCol string, keepKeys []string) error {
+	if len(keepKeys) == 0 {
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s WHERE source = ?`, table), SourceConfig); err != nil {
+			return fmt.Errorf("store: delete stale config rows from %s: %w", table, err)
+		}
+		return nil
+	}
+
+	placeholders := make([]string, len(keepKeys))
+	args := make([]any, 0, len(keepKeys)+1)
+	args = append(args, SourceConfig)
+	for i, k := range keepKeys {
+		placeholders[i] = "?"
+		args = append(args, k)
+	}
+	query := fmt.Sprintf(
+		`DELETE FROM %s WHERE source = ? AND %s NOT IN (%s)`,
+		table, keyCol, strings.Join(placeholders, ","),
+	)
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		return fmt.Errorf("store: delete stale config rows from %s: %w", table, err)
+	}
+	return nil
+}
+
+// --- Snapshot Cache ---
+
+func (s *SQLiteStore) snapshot(ctx context.Context) (*configSnapshot, error) {
+	s.cacheMu.RLock()
+	snap := s.cache
+	s.cacheMu.RUnlock()
+	if snap != nil {
+		return snap, nil
+	}
+
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if s.cache != nil {
+		return s.cache, nil
+	}
+
+	loaded, err := s.loadSnapshotLocked(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.cache = loaded
+	s.cacheLoads.Add(1)
+	return loaded, nil
+}
+
+func (s *SQLiteStore) loadSnapshotLocked(ctx context.Context) (*configSnapshot, error) {
+	provRows, err := s.db.QueryContext(ctx, `
+SELECT name, type, base_url, api_key_enc, passthrough, models_json, enabled, source, created_at, updated_at
+FROM providers ORDER BY name ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("store: load providers snapshot: %w", err)
+	}
+	var providers []Provider
+	for provRows.Next() {
+		p, err := s.scanProvider(provRows)
+		if err != nil {
+			_ = provRows.Close()
+			return nil, err
+		}
+		providers = append(providers, p)
+	}
+	if err := provRows.Close(); err != nil {
+		return nil, fmt.Errorf("store: close provider snapshot rows: %w", err)
+	}
+	if err := provRows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate provider snapshot rows: %w", err)
+	}
+
+	routeRows, err := s.db.QueryContext(ctx, `
+SELECT alias, provider_name, upstream_model, fallbacks_json,
+       input_cost_per_million, output_cost_per_million,
+       cache_read_cost_per_million, cache_write_cost_per_million,
+       enabled, source, created_at, updated_at
+FROM model_routes ORDER BY alias ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("store: load model routes snapshot: %w", err)
+	}
+	var routes []ModelRoute
+	for routeRows.Next() {
+		r, err := scanModelRoute(routeRows)
+		if err != nil {
+			_ = routeRows.Close()
+			return nil, err
+		}
+		routes = append(routes, r)
+	}
+	if err := routeRows.Close(); err != nil {
+		return nil, fmt.Errorf("store: close model routes snapshot rows: %w", err)
+	}
+	if err := routeRows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate model routes snapshot rows: %w", err)
+	}
+
+	byName := make(map[string]Provider, len(providers))
+	for _, p := range providers {
+		byName[p.Name] = p
+	}
+	byAlias := make(map[string]ModelRoute, len(routes))
+	for _, r := range routes {
+		byAlias[r.Alias] = r
+	}
+
+	return &configSnapshot{
+		providers:       providers,
+		providersByName: byName,
+		routes:          routes,
+		routesByAlias:   byAlias,
+	}, nil
+}
+
+func cloneProvider(p Provider) Provider {
+	p.Models = slices.Clone(p.Models)
+	return p
+}
+
+func cloneModelRoute(r ModelRoute) ModelRoute {
+	r.Fallbacks = slices.Clone(r.Fallbacks)
+	r.InputCostPerMillion = cloneFloatPtr(r.InputCostPerMillion)
+	r.OutputCostPerMillion = cloneFloatPtr(r.OutputCostPerMillion)
+	r.CacheReadCostPerMillion = cloneFloatPtr(r.CacheReadCostPerMillion)
+	r.CacheWriteCostPerMillion = cloneFloatPtr(r.CacheWriteCostPerMillion)
+	return r
+}
+
+func cloneFloatPtr(v *float64) *float64 {
+	if v == nil {
+		return nil
+	}
+	cp := *v
+	return &cp
 }
 
 // --- Providers ---
@@ -388,6 +511,9 @@ func (s *SQLiteStore) UpsertProvider(ctx context.Context, p Provider) error {
 	now := time.Now().UTC()
 	source := defaultSource(p.Source)
 
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO providers (name, type, base_url, api_key_enc, passthrough, models_json, enabled, source, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -406,53 +532,51 @@ ON CONFLICT(name) DO UPDATE SET
 	if err != nil {
 		return fmt.Errorf("store: upsert provider %q: %w", p.Name, err)
 	}
+	s.cache = nil
 	return nil
 }
 
 func (s *SQLiteStore) GetProvider(ctx context.Context, name string) (*Provider, error) {
-	row := s.db.QueryRowContext(ctx, `
-SELECT name, type, base_url, api_key_enc, passthrough, models_json, enabled, source, created_at, updated_at
-FROM providers WHERE name = ?`, name)
-
-	p, err := s.scanProvider(row)
+	snap, err := s.snapshot(ctx)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
-		}
 		return nil, err
 	}
-	return &p, nil
+	p, ok := snap.providersByName[name]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := cloneProvider(p)
+	return &cp, nil
 }
 
 func (s *SQLiteStore) ListProviders(ctx context.Context) ([]Provider, error) {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT name, type, base_url, api_key_enc, passthrough, models_json, enabled, source, created_at, updated_at
-FROM providers ORDER BY name ASC`)
+	snap, err := s.snapshot(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("store: list providers: %w", err)
+		return nil, err
 	}
-	defer rows.Close()
-
-	var out []Provider
-	for rows.Next() {
-		p, err := s.scanProvider(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, p)
+	if len(snap.providers) == 0 {
+		return nil, nil
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("store: iterate providers: %w", err)
+	out := make([]Provider, len(snap.providers))
+	for i, p := range snap.providers {
+		out[i] = cloneProvider(p)
 	}
 	return out, nil
 }
 
 func (s *SQLiteStore) DeleteProvider(ctx context.Context, name string) error {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+
 	res, err := s.db.ExecContext(ctx, `DELETE FROM providers WHERE name = ?`, name)
 	if err != nil {
 		return fmt.Errorf("store: delete provider %q: %w", name, err)
 	}
-	return checkAffected(res)
+	if err := checkAffected(res); err != nil {
+		return err
+	}
+	s.cache = nil
+	return nil
 }
 
 func (s *SQLiteStore) scanProvider(sc scanner) (Provider, error) {
@@ -508,6 +632,9 @@ func (s *SQLiteStore) UpsertModelRoute(ctx context.Context, r ModelRoute) error 
 	now := time.Now().UTC()
 	source := defaultSource(r.Source)
 
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO model_routes (
 	alias, provider_name, upstream_model, fallbacks_json,
@@ -535,59 +662,51 @@ ON CONFLICT(alias) DO UPDATE SET
 	if err != nil {
 		return fmt.Errorf("store: upsert model route %q: %w", r.Alias, err)
 	}
+	s.cache = nil
 	return nil
 }
 
 func (s *SQLiteStore) GetModelRoute(ctx context.Context, alias string) (*ModelRoute, error) {
-	row := s.db.QueryRowContext(ctx, `
-SELECT alias, provider_name, upstream_model, fallbacks_json,
-       input_cost_per_million, output_cost_per_million,
-       cache_read_cost_per_million, cache_write_cost_per_million,
-       enabled, source, created_at, updated_at
-FROM model_routes WHERE alias = ?`, alias)
-
-	r, err := scanModelRoute(row)
+	snap, err := s.snapshot(ctx)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
-		}
 		return nil, err
 	}
-	return &r, nil
+	r, ok := snap.routesByAlias[alias]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := cloneModelRoute(r)
+	return &cp, nil
 }
 
 func (s *SQLiteStore) ListModelRoutes(ctx context.Context) ([]ModelRoute, error) {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT alias, provider_name, upstream_model, fallbacks_json,
-       input_cost_per_million, output_cost_per_million,
-       cache_read_cost_per_million, cache_write_cost_per_million,
-       enabled, source, created_at, updated_at
-FROM model_routes ORDER BY alias ASC`)
+	snap, err := s.snapshot(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("store: list model routes: %w", err)
+		return nil, err
 	}
-	defer rows.Close()
-
-	var out []ModelRoute
-	for rows.Next() {
-		r, err := scanModelRoute(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, r)
+	if len(snap.routes) == 0 {
+		return nil, nil
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("store: iterate model routes: %w", err)
+	out := make([]ModelRoute, len(snap.routes))
+	for i, r := range snap.routes {
+		out[i] = cloneModelRoute(r)
 	}
 	return out, nil
 }
 
 func (s *SQLiteStore) DeleteModelRoute(ctx context.Context, alias string) error {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+
 	res, err := s.db.ExecContext(ctx, `DELETE FROM model_routes WHERE alias = ?`, alias)
 	if err != nil {
 		return fmt.Errorf("store: delete model route %q: %w", alias, err)
 	}
-	return checkAffected(res)
+	if err := checkAffected(res); err != nil {
+		return err
+	}
+	s.cache = nil
+	return nil
 }
 
 func scanModelRoute(sc scanner) (ModelRoute, error) {
@@ -622,367 +741,6 @@ func scanModelRoute(sc scanner) (ModelRoute, error) {
 	r.CreatedAt = parseTime(createdAtStr)
 	r.UpdatedAt = parseTime(updatedAtStr)
 	return r, nil
-}
-
-// --- Groups & Members ---
-
-func (s *SQLiteStore) UpsertGroup(ctx context.Context, g Group) error {
-	if strings.TrimSpace(g.Name) == "" {
-		return errors.New("store: group name is required")
-	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("store: upsert group begin tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	now := time.Now().UTC()
-	source := defaultSource(g.Source)
-
-	_, err = tx.ExecContext(ctx, `
-INSERT INTO groups (name, description, source, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?)
-ON CONFLICT(name) DO UPDATE SET
-	description = excluded.description,
-	source = excluded.source,
-	updated_at = excluded.updated_at`,
-		g.Name, g.Description, source, formatTime(now), formatTime(now),
-	)
-	if err != nil {
-		return fmt.Errorf("store: upsert group %q: %w", g.Name, err)
-	}
-
-	if g.Members != nil {
-		if err := replaceGroupMembersTx(ctx, tx, g.Name, g.Members, now); err != nil {
-			return err
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: upsert group commit: %w", err)
-	}
-	return nil
-}
-
-func (s *SQLiteStore) GetGroup(ctx context.Context, name string) (*Group, error) {
-	var (
-		g            Group
-		createdAtStr string
-		updatedAtStr string
-	)
-	err := s.db.QueryRowContext(ctx, `
-SELECT name, description, source, created_at, updated_at FROM groups WHERE name = ?`, name).
-		Scan(&g.Name, &g.Description, &g.Source, &createdAtStr, &updatedAtStr)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		return nil, fmt.Errorf("store: get group %q: %w", name, err)
-	}
-	g.CreatedAt = parseTime(createdAtStr)
-	g.UpdatedAt = parseTime(updatedAtStr)
-
-	members, err := s.listMembersOfGroup(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-	g.Members = members
-	return &g, nil
-}
-
-func (s *SQLiteStore) ListGroups(ctx context.Context) ([]Group, error) {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT name, description, source, created_at, updated_at FROM groups ORDER BY name ASC`)
-	if err != nil {
-		return nil, fmt.Errorf("store: list groups: %w", err)
-	}
-
-	var groups []Group
-	for rows.Next() {
-		var (
-			g            Group
-			createdAtStr string
-			updatedAtStr string
-		)
-		if err := rows.Scan(&g.Name, &g.Description, &g.Source, &createdAtStr, &updatedAtStr); err != nil {
-			_ = rows.Close()
-			return nil, fmt.Errorf("store: scan group: %w", err)
-		}
-		g.CreatedAt = parseTime(createdAtStr)
-		g.UpdatedAt = parseTime(updatedAtStr)
-		groups = append(groups, g)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	for i := range groups {
-		members, err := s.listMembersOfGroup(ctx, groups[i].Name)
-		if err != nil {
-			return nil, err
-		}
-		groups[i].Members = members
-	}
-	return groups, nil
-}
-
-func (s *SQLiteStore) DeleteGroup(ctx context.Context, name string) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM groups WHERE name = ?`, name)
-	if err != nil {
-		return fmt.Errorf("store: delete group %q: %w", name, err)
-	}
-	return checkAffected(res)
-}
-
-func (s *SQLiteStore) SetGroupMembers(ctx context.Context, groupName string, members []string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("store: set group members begin tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	if err := replaceGroupMembersTx(ctx, tx, groupName, members, time.Now().UTC()); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: set group members commit: %w", err)
-	}
-	return nil
-}
-
-func (s *SQLiteStore) ListGroupsForMember(ctx context.Context, members ...string) ([]string, error) {
-	cleaned := make([]any, 0, len(members))
-	placeholders := make([]string, 0, len(members))
-	for _, m := range members {
-		if trimmed := strings.TrimSpace(m); trimmed != "" {
-			cleaned = append(cleaned, trimmed)
-			placeholders = append(placeholders, "?")
-		}
-	}
-	if len(cleaned) == 0 {
-		return nil, nil
-	}
-
-	query := fmt.Sprintf(
-		`SELECT DISTINCT group_name FROM group_members WHERE member IN (%s) ORDER BY group_name ASC`,
-		strings.Join(placeholders, ","),
-	)
-	rows, err := s.db.QueryContext(ctx, query, cleaned...)
-	if err != nil {
-		return nil, fmt.Errorf("store: list groups for member: %w", err)
-	}
-	defer rows.Close()
-
-	var out []string
-	for rows.Next() {
-		var groupName string
-		if err := rows.Scan(&groupName); err != nil {
-			return nil, fmt.Errorf("store: scan group membership: %w", err)
-		}
-		out = append(out, groupName)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (s *SQLiteStore) listMembersOfGroup(ctx context.Context, groupName string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT member FROM group_members WHERE group_name = ? ORDER BY member ASC`, groupName)
-	if err != nil {
-		return nil, fmt.Errorf("store: list members of group %q: %w", groupName, err)
-	}
-	defer rows.Close()
-
-	var members []string
-	for rows.Next() {
-		var m string
-		if err := rows.Scan(&m); err != nil {
-			return nil, fmt.Errorf("store: scan group member: %w", err)
-		}
-		members = append(members, m)
-	}
-	return members, rows.Err()
-}
-
-func replaceGroupMembersTx(ctx context.Context, tx *sql.Tx, groupName string, members []string, now time.Time) error {
-	if _, err := tx.ExecContext(ctx, `DELETE FROM group_members WHERE group_name = ?`, groupName); err != nil {
-		return fmt.Errorf("store: clear members for group %q: %w", groupName, err)
-	}
-	seen := make(map[string]struct{}, len(members))
-	for _, m := range members {
-		trimmed := strings.TrimSpace(m)
-		if trimmed == "" {
-			continue
-		}
-		if _, dup := seen[trimmed]; dup {
-			continue
-		}
-		seen[trimmed] = struct{}{}
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO group_members (group_name, member, created_at) VALUES (?, ?, ?)`,
-			groupName, trimmed, formatTime(now),
-		); err != nil {
-			return fmt.Errorf("store: add member %q to group %q: %w", trimmed, groupName, err)
-		}
-	}
-	return nil
-}
-
-// --- Policies ---
-
-func (s *SQLiteStore) UpsertPolicy(ctx context.Context, p Policy) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("store: upsert policy begin tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	if err := upsertPolicyTx(ctx, tx, p, time.Now().UTC()); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-func upsertPolicyTx(ctx context.Context, tx *sql.Tx, p Policy, now time.Time) error {
-	if strings.TrimSpace(p.Subject) == "" {
-		return errors.New("store: policy subject is required")
-	}
-	if strings.TrimSpace(p.ID) == "" {
-		p.ID = uuid.NewString()
-	}
-
-	allowModels, err := marshalStringSlice(p.AllowModels)
-	if err != nil {
-		return err
-	}
-	denyModels, err := marshalStringSlice(p.DenyModels)
-	if err != nil {
-		return err
-	}
-	allowMCP, err := marshalStringSlice(p.AllowMCPTools)
-	if err != nil {
-		return err
-	}
-	denyMCP, err := marshalStringSlice(p.DenyMCPTools)
-	if err != nil {
-		return err
-	}
-
-	source := defaultSource(p.Source)
-
-	_, err = tx.ExecContext(ctx, `
-INSERT INTO policies (
-	id, name, subject, role, allow_models_json, deny_models_json,
-	allow_mcp_tools_json, deny_mcp_tools_json, priority, enabled, source, created_at, updated_at
-)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
-	name = excluded.name,
-	subject = excluded.subject,
-	role = excluded.role,
-	allow_models_json = excluded.allow_models_json,
-	deny_models_json = excluded.deny_models_json,
-	allow_mcp_tools_json = excluded.allow_mcp_tools_json,
-	deny_mcp_tools_json = excluded.deny_mcp_tools_json,
-	priority = excluded.priority,
-	enabled = excluded.enabled,
-	source = excluded.source,
-	updated_at = excluded.updated_at`,
-		p.ID, p.Name, p.Subject, p.Role, allowModels, denyModels,
-		allowMCP, denyMCP, p.Priority, boolToInt(p.Enabled), source,
-		formatTime(now), formatTime(now),
-	)
-	if err != nil {
-		return fmt.Errorf("store: upsert policy %q: %w", p.ID, err)
-	}
-	return nil
-}
-
-func (s *SQLiteStore) GetPolicy(ctx context.Context, id string) (*Policy, error) {
-	row := s.db.QueryRowContext(ctx, `
-SELECT id, name, subject, role, allow_models_json, deny_models_json,
-       allow_mcp_tools_json, deny_mcp_tools_json, priority, enabled, source, created_at, updated_at
-FROM policies WHERE id = ?`, id)
-
-	p, err := scanPolicy(row)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
-		}
-		return nil, err
-	}
-	return &p, nil
-}
-
-func (s *SQLiteStore) ListPolicies(ctx context.Context) ([]Policy, error) {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT id, name, subject, role, allow_models_json, deny_models_json,
-       allow_mcp_tools_json, deny_mcp_tools_json, priority, enabled, source, created_at, updated_at
-FROM policies ORDER BY priority DESC, id ASC`)
-	if err != nil {
-		return nil, fmt.Errorf("store: list policies: %w", err)
-	}
-	defer rows.Close()
-
-	var out []Policy
-	for rows.Next() {
-		p, err := scanPolicy(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, p)
-	}
-	return out, rows.Err()
-}
-
-func (s *SQLiteStore) DeletePolicy(ctx context.Context, id string) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM policies WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("store: delete policy %q: %w", id, err)
-	}
-	return checkAffected(res)
-}
-
-func scanPolicy(sc scanner) (Policy, error) {
-	var (
-		p            Policy
-		allowModels  string
-		denyModels   string
-		allowMCP     string
-		denyMCP      string
-		enabled      int
-		createdAtStr string
-		updatedAtStr string
-	)
-	if err := sc.Scan(
-		&p.ID, &p.Name, &p.Subject, &p.Role, &allowModels, &denyModels,
-		&allowMCP, &denyMCP, &p.Priority, &enabled, &p.Source, &createdAtStr, &updatedAtStr,
-	); err != nil {
-		return Policy{}, err
-	}
-	var err error
-	if p.AllowModels, err = unmarshalStringSlice(allowModels); err != nil {
-		return Policy{}, err
-	}
-	if p.DenyModels, err = unmarshalStringSlice(denyModels); err != nil {
-		return Policy{}, err
-	}
-	if p.AllowMCPTools, err = unmarshalStringSlice(allowMCP); err != nil {
-		return Policy{}, err
-	}
-	if p.DenyMCPTools, err = unmarshalStringSlice(denyMCP); err != nil {
-		return Policy{}, err
-	}
-	p.Enabled = enabled != 0
-	p.CreatedAt = parseTime(createdAtStr)
-	p.UpdatedAt = parseTime(updatedAtStr)
-	return p, nil
 }
 
 // --- Usage Logs ---
@@ -1252,18 +1010,29 @@ type scanner interface {
 	Scan(dest ...any) error
 }
 
-func prepareSQLiteDSN(raw string) (dsn string, isMemory bool, err error) {
+func prepareSQLiteDSN(raw string) (dsn, filePath string, isMemory bool, err error) {
 	trimmed := strings.TrimSpace(raw)
 	isMemory = trimmed == ":memory:" || strings.Contains(trimmed, "mode=memory")
 
-	if !isMemory && !strings.HasPrefix(trimmed, "file:") {
-		dir := filepath.Dir(trimmed)
-		if dir != "" && dir != "." {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return "", false, fmt.Errorf("store: create db directory %q: %w", dir, err)
+	if !isMemory {
+		if strings.HasPrefix(trimmed, "file:") {
+			pathPart := strings.TrimPrefix(trimmed, "file:")
+			if idx := strings.IndexByte(pathPart, '?'); idx >= 0 {
+				pathPart = pathPart[:idx]
+			}
+			filePath = pathPart
+		} else {
+			filePath = trimmed
+			trimmed = "file:" + trimmed
+		}
+		if filePath != "" {
+			dir := filepath.Dir(filePath)
+			if dir != "" && dir != "." {
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					return "", "", false, fmt.Errorf("store: create db directory %q: %w", dir, err)
+				}
 			}
 		}
-		trimmed = "file:" + trimmed
 	}
 
 	params := []string{"_pragma=busy_timeout(5000)", "_pragma=foreign_keys(ON)"}
@@ -1275,7 +1044,7 @@ func prepareSQLiteDSN(raw string) (dsn string, isMemory bool, err error) {
 	if strings.Contains(trimmed, "?") {
 		sep = "&"
 	}
-	return trimmed + sep + strings.Join(params, "&"), isMemory, nil
+	return trimmed + sep + strings.Join(params, "&"), filePath, isMemory, nil
 }
 
 func checkAffected(res sql.Result) error {

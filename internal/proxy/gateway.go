@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -36,6 +37,7 @@ type GatewayConfig struct {
 	HTTPClient           *http.Client
 	MaxRequestBodyBytes  int64
 	MaxResponseBodyBytes int64
+	Logf                 func(format string, args ...any)
 }
 
 // Gateway is an http.Handler implementing Headlamp's multi-protocol LLM proxy:
@@ -49,6 +51,7 @@ type Gateway struct {
 	httpClient           *http.Client
 	maxRequestBodyBytes  int64
 	maxResponseBodyBytes int64
+	logf                 func(format string, args ...any)
 	mux                  *http.ServeMux
 }
 
@@ -71,6 +74,10 @@ func NewGateway(cfg GatewayConfig) (*Gateway, error) {
 	if maxResp <= 0 {
 		maxResp = defaultMaxResponseBodyBytes
 	}
+	logf := cfg.Logf
+	if logf == nil {
+		logf = log.Printf
+	}
 
 	g := &Gateway{
 		store:                cfg.Store,
@@ -79,6 +86,7 @@ func NewGateway(cfg GatewayConfig) (*Gateway, error) {
 		httpClient:           client,
 		maxRequestBodyBytes:  maxReq,
 		maxResponseBodyBytes: maxResp,
+		logf:                 logf,
 		mux:                  http.NewServeMux(),
 	}
 	g.registerRoutes()
@@ -212,7 +220,7 @@ func (g *Gateway) makeModelsHandler(protocol string) http.HandlerFunc {
 			items := make([]geminiModelItem, 0, len(ids))
 			for _, id := range ids {
 				m := byID[id]
-				if m.ProviderType != config.ProviderTypeGemini && !m.IsAlias {
+				if !m.HasGeminiCandidate {
 					continue
 				}
 				name := id
@@ -354,46 +362,109 @@ func (g *Gateway) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	cand := resolved.candidates[0]
-	if cand.provider.Type != config.ProviderTypeAnthropic {
+	var anthropicCands []routeCandidate
+	for _, cand := range resolved.candidates {
+		if cand.provider.Type == config.ProviderTypeAnthropic {
+			anthropicCands = append(anthropicCands, cand)
+		}
+	}
+	if len(anthropicCands) == 0 {
 		WriteError(w, ProtocolAnthropicMessages, http.StatusBadRequest, "invalid_request_error", "count_tokens is only supported for Anthropic upstreams")
 		return
 	}
 
-	bodyToSend := reqBody
-	if cand.upstreamModel != meta.Model {
-		bodyToSend, err = patchJSONRequest(reqBody, cand.upstreamModel, false)
-		if err != nil {
-			WriteError(w, ProtocolAnthropicMessages, http.StatusBadRequest, "invalid_request_error", "failed to rewrite model field")
+	if resolved.isAlias && g.authorizer != nil {
+		filtered := make([]routeCandidate, 0, len(anthropicCands))
+		var lastDenyReason string
+		for _, cand := range anthropicCands {
+			candModel := cand.provider.Name + "/" + cand.upstreamModel
+			denied, reason, denyErr := g.authorizer.IsModelDenied(r.Context(), principal, candModel)
+			if denyErr != nil {
+				WriteError(w, ProtocolAnthropicMessages, http.StatusInternalServerError, "api_error", "authorization check failed")
+				return
+			}
+			if denied {
+				if reason == "" {
+					reason = fmt.Sprintf("underlying model %q denied by policy", candModel)
+				}
+				lastDenyReason = reason
+				continue
+			}
+			filtered = append(filtered, cand)
+		}
+		if len(filtered) == 0 {
+			WriteError(w, ProtocolAnthropicMessages, http.StatusForbidden, "permission_error", lastDenyReason)
 			return
 		}
+		anthropicCands = filtered
 	}
 
-	targetURL := buildUpstreamURL(cand.provider, "/v1/messages/count_tokens", "")
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(bodyToSend))
-	if err != nil {
-		WriteError(w, ProtocolAnthropicMessages, http.StatusBadGateway, "api_error", "failed to construct upstream request")
+	var lastResp *http.Response
+	for i, cand := range anthropicCands {
+		bodyToSend := reqBody
+		if cand.upstreamModel != meta.Model {
+			bodyToSend, _, err = patchJSONRequest(reqBody, cand.upstreamModel, false)
+			if err != nil {
+				if i+1 < len(anthropicCands) {
+					continue
+				}
+				WriteError(w, ProtocolAnthropicMessages, http.StatusBadRequest, "invalid_request_error", "failed to rewrite model field")
+				return
+			}
+		}
+
+		targetURL := buildUpstreamURL(cand.provider, "/v1/messages/count_tokens", "")
+		upReq, reqErr := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(bodyToSend))
+		if reqErr != nil {
+			if i+1 < len(anthropicCands) {
+				continue
+			}
+			WriteError(w, ProtocolAnthropicMessages, http.StatusBadGateway, "api_error", "failed to construct upstream request")
+			return
+		}
+		applyUpstreamHeaders(upReq, r, cand.provider, true)
+
+		resp, doErr := g.httpClient.Do(upReq)
+		if doErr != nil {
+			safeErr := sanitizeUpstreamError(doErr)
+			if i+1 < len(anthropicCands) {
+				next := anthropicCands[i+1]
+				g.logf("headlamp proxy: count_tokens model=%s candidate %s/%s failed (%s), falling back to %s/%s",
+					meta.Model, cand.provider.Name, cand.upstreamModel, safeErr, next.provider.Name, next.upstreamModel)
+				continue
+			}
+			WriteError(w, ProtocolAnthropicMessages, http.StatusBadGateway, "api_error", "upstream request failed: "+safeErr)
+			return
+		}
+
+		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) && i+1 < len(anthropicCands) {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 16*1024))
+			_ = resp.Body.Close()
+			next := anthropicCands[i+1]
+			g.logf("headlamp proxy: count_tokens model=%s candidate %s/%s returned HTTP %d, falling back to %s/%s",
+				meta.Model, cand.provider.Name, cand.upstreamModel, resp.StatusCode, next.provider.Name, next.upstreamModel)
+			continue
+		}
+
+		lastResp = resp
+		break
+	}
+	if lastResp == nil {
+		WriteError(w, ProtocolAnthropicMessages, http.StatusBadGateway, "api_error", "no Anthropic upstream succeeded for count_tokens")
 		return
 	}
-	applyUpstreamHeaders(upReq, r, cand.provider, true)
+	defer lastResp.Body.Close()
 
-	resp, err := g.httpClient.Do(upReq)
-	if err != nil {
-		WriteError(w, ProtocolAnthropicMessages, http.StatusBadGateway, "api_error", "upstream request failed: "+sanitizeUpstreamError(err))
-		return
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, g.maxResponseBodyBytes))
+	respBody, err := io.ReadAll(io.LimitReader(lastResp.Body, g.maxResponseBodyBytes))
 	if err != nil {
 		WriteError(w, ProtocolAnthropicMessages, http.StatusBadGateway, "api_error", "failed to read upstream response")
 		return
 	}
-	copyResponseHeaders(w.Header(), resp.Header)
+	copyResponseHeaders(w.Header(), lastResp.Header)
 	if w.Header().Get("Content-Type") == "" {
 		w.Header().Set("Content-Type", "application/json")
 	}
-	w.WriteHeader(resp.StatusCode)
+	w.WriteHeader(lastResp.StatusCode)
 	_, _ = w.Write(respBody)
 }
 
@@ -517,11 +588,40 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 		return
 	}
 
+	// Enforce explicit DenyModels on concrete underlying candidates of a virtual route alias.
+	if resolved.isAlias && g.authorizer != nil {
+		allowedCands := make([]compatibleCandidate, 0, len(compatible))
+		var lastDenyReason string
+		for _, item := range compatible {
+			candModel := item.cand.provider.Name + "/" + item.cand.upstreamModel
+			denied, reason, denyErr := g.authorizer.IsModelDenied(r.Context(), inv.principal, candModel)
+			if denyErr != nil {
+				WriteError(w, inv.ingressProtocol, http.StatusInternalServerError, "server_error", "authorization check failed")
+				return
+			}
+			if denied {
+				if reason == "" {
+					reason = fmt.Sprintf("underlying model %q denied by policy", candModel)
+				}
+				lastDenyReason = reason
+				continue
+			}
+			allowedCands = append(allowedCands, item)
+		}
+		if len(allowedCands) == 0 {
+			WriteError(w, inv.ingressProtocol, http.StatusForbidden, "model_not_allowed", lastDenyReason)
+			return
+		}
+		compatible = allowedCands
+	}
+
 	var (
-		lastResp       *http.Response
-		lastCand       routeCandidate
-		lastTranslated bool
-		lastErr        error
+		lastResp          *http.Response
+		lastCand          routeCandidate
+		lastTranslated    bool
+		lastInjectedUsage bool
+		lastAttemptStart  time.Time
+		lastErr           error
 	)
 
 	for i, item := range compatible {
@@ -529,10 +629,13 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 		isNative := item.isNative
 		isTranslated := item.isTranslated
 
-		upBody, upURL, err := g.prepareUpstreamRequestPayload(inv, cand, isNative)
+		upBody, upURL, injectedIncludeUsage, err := g.prepareUpstreamRequestPayload(inv, cand, isNative)
 		if err != nil {
 			lastErr = err
 			if i+1 < len(compatible) {
+				next := compatible[i+1].cand
+				g.logf("headlamp proxy: request_id=%s model=%s candidate %s/%s payload error (%v), falling back to %s/%s",
+					requestID, inv.requestedModel, cand.provider.Name, cand.upstreamModel, err, next.provider.Name, next.upstreamModel)
 				continue
 			}
 			WriteError(w, inv.ingressProtocol, http.StatusBadRequest, "invalid_request", err.Error())
@@ -550,6 +653,7 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 		}
 		applyUpstreamHeaders(upReq, r, cand.provider, isNative)
 
+		attemptStart := time.Now()
 		resp, err := g.httpClient.Do(upReq)
 		if err != nil {
 			safeErr := sanitizeUpstreamError(err)
@@ -557,6 +661,9 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 			lastCand = cand
 			lastTranslated = isTranslated
 			if i+1 < len(compatible) {
+				next := compatible[i+1].cand
+				g.logf("headlamp proxy: request_id=%s model=%s candidate %s/%s network error (%s), falling back to %s/%s",
+					requestID, inv.requestedModel, cand.provider.Name, cand.upstreamModel, safeErr, next.provider.Name, next.upstreamModel)
 				continue
 			}
 			// Network failure on last compatible candidate.
@@ -564,6 +671,7 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 			obs.Finish(TelemetryFinish{
 				StatusCode:   http.StatusBadGateway,
 				LatencyMS:    time.Since(startTime).Milliseconds(),
+				TTFTMS:       time.Since(attemptStart).Milliseconds(),
 				ErrorMessage: safeErr,
 			})
 			WriteError(w, inv.ingressProtocol, http.StatusBadGateway, "upstream_error", "upstream request failed: "+safeErr)
@@ -574,6 +682,9 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) && i+1 < len(compatible) {
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 16*1024))
 			_ = resp.Body.Close()
+			next := compatible[i+1].cand
+			g.logf("headlamp proxy: request_id=%s model=%s candidate %s/%s returned HTTP %d, falling back to %s/%s",
+				requestID, inv.requestedModel, cand.provider.Name, cand.upstreamModel, resp.StatusCode, next.provider.Name, next.upstreamModel)
 			lastErr = fmt.Errorf("upstream %s returned HTTP %d", cand.provider.Name, resp.StatusCode)
 			continue
 		}
@@ -581,6 +692,8 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 		lastResp = resp
 		lastCand = cand
 		lastTranslated = isTranslated
+		lastInjectedUsage = injectedIncludeUsage
+		lastAttemptStart = attemptStart
 		break
 	}
 
@@ -595,11 +708,16 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 	defer lastResp.Body.Close()
 
 	observer := g.startTelemetry(r.Context(), requestID, startTime, inv, lastCand, resolved.costOverride, lastTranslated)
+	observer.SetResponseHeaders(flattenHeaders(lastResp.Header))
 
 	// Handle non-2xx upstream response (status + error envelope).
 	if lastResp.StatusCode < 200 || lastResp.StatusCode >= 300 {
 		errBody, readErr := io.ReadAll(io.LimitReader(lastResp.Body, g.maxResponseBodyBytes))
+		if len(errBody) > 0 {
+			observer.OnJSONResponse(errBody)
+		}
 		latency := time.Since(startTime).Milliseconds()
+		ttft := time.Since(lastAttemptStart).Milliseconds()
 		errMsg := extractUpstreamErrorMessage(errBody, fmt.Sprintf("upstream returned HTTP %d", lastResp.StatusCode))
 		if readErr != nil {
 			errMsg = readErr.Error()
@@ -607,7 +725,7 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 		observer.Finish(TelemetryFinish{
 			StatusCode:   lastResp.StatusCode,
 			LatencyMS:    latency,
-			TTFTMS:       latency,
+			TTFTMS:       ttft,
 			ErrorMessage: errMsg,
 		})
 		if lastTranslated {
@@ -628,11 +746,11 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 	isStreamingResp := isEventStream || inv.stream
 
 	if isStreamingResp {
-		g.handleStreamingResponse(w, lastResp, observer, startTime, inv, lastCand, lastTranslated, isEventStream)
+		g.handleStreamingResponse(w, lastResp, observer, startTime, lastAttemptStart, inv, lastCand, lastTranslated, isEventStream, lastInjectedUsage)
 		return
 	}
 
-	g.handleJSONResponse(w, lastResp, observer, startTime, inv, lastCand, lastTranslated)
+	g.handleJSONResponse(w, lastResp, observer, startTime, lastAttemptStart, inv, lastCand, lastTranslated)
 }
 
 func (g *Gateway) startTelemetry(
@@ -677,7 +795,7 @@ func (inv llmInvocation) endpointPath() string {
 	return inv.upstreamPath
 }
 
-func (g *Gateway) prepareUpstreamRequestPayload(inv llmInvocation, cand routeCandidate, isNative bool) ([]byte, string, error) {
+func (g *Gateway) prepareUpstreamRequestPayload(inv llmInvocation, cand routeCandidate, isNative bool) (body []byte, targetURL string, injectedIncludeUsage bool, err error) {
 	if isNative {
 		switch inv.ingressProtocol {
 		case ProtocolGemini:
@@ -686,37 +804,35 @@ func (g *Gateway) prepareUpstreamRequestPayload(inv llmInvocation, cand routeCan
 				rawQuery = stripQueryParam(rawQuery, "key")
 			}
 			path := "/v1beta/models/" + url.PathEscape(cand.upstreamModel) + ":" + inv.geminiAction
-			return inv.reqBody, buildUpstreamURL(cand.provider, path, rawQuery), nil
+			return inv.reqBody, buildUpstreamURL(cand.provider, path, rawQuery), false, nil
 
 		case ProtocolOpenAIChat:
 			needModelRewrite := cand.upstreamModel != inv.requestedModel
 			needStreamOpts := inv.stream
-			body := inv.reqBody
+			body = inv.reqBody
 			if needModelRewrite || needStreamOpts {
 				newModel := ""
 				if needModelRewrite {
 					newModel = cand.upstreamModel
 				}
-				var err error
-				body, err = patchJSONRequest(inv.reqBody, newModel, needStreamOpts)
+				body, injectedIncludeUsage, err = patchJSONRequest(inv.reqBody, newModel, needStreamOpts)
 				if err != nil {
-					return nil, "", err
+					return nil, "", false, err
 				}
 			}
-			return body, buildUpstreamURL(cand.provider, inv.upstreamPath, ""), nil
+			return body, buildUpstreamURL(cand.provider, inv.upstreamPath, ""), injectedIncludeUsage, nil
 
 		default:
 			// OpenAI Responses, OpenAI Embeddings, Anthropic Messages:
 			// zero JSON restructuring when model name matches!
-			body := inv.reqBody
+			body = inv.reqBody
 			if cand.upstreamModel != inv.requestedModel {
-				var err error
-				body, err = patchJSONRequest(inv.reqBody, cand.upstreamModel, false)
+				body, _, err = patchJSONRequest(inv.reqBody, cand.upstreamModel, false)
 				if err != nil {
-					return nil, "", err
+					return nil, "", false, err
 				}
 			}
-			return body, buildUpstreamURL(cand.provider, inv.upstreamPath, ""), nil
+			return body, buildUpstreamURL(cand.provider, inv.upstreamPath, ""), false, nil
 		}
 	}
 
@@ -726,20 +842,20 @@ func (g *Gateway) prepareUpstreamRequestPayload(inv llmInvocation, cand routeCan
 		// OpenAI Chat -> Anthropic Messages.
 		translatedBody, err := translate.OpenAIRequestToAnthropic(inv.reqBody, cand.upstreamModel)
 		if err != nil {
-			return nil, "", err
+			return nil, "", false, err
 		}
-		return translatedBody, buildUpstreamURL(cand.provider, "/v1/messages", ""), nil
+		return translatedBody, buildUpstreamURL(cand.provider, "/v1/messages", ""), false, nil
 
 	case ProtocolAnthropicMessages:
 		// Anthropic Messages -> OpenAI Chat (OpenAI or Ollama).
-		translatedBody, err := translate.AnthropicRequestToOpenAI(inv.reqBody, cand.upstreamModel)
+		translatedBody, err := translate.AnthropicRequestToOpenAI(inv.reqBody, cand.upstreamModel, cand.provider.Type)
 		if err != nil {
-			return nil, "", err
+			return nil, "", false, err
 		}
-		return translatedBody, buildUpstreamURL(cand.provider, "/v1/chat/completions", ""), nil
+		return translatedBody, buildUpstreamURL(cand.provider, "/v1/chat/completions", ""), false, nil
 
 	default:
-		return nil, "", fmt.Errorf("unsupported cross-protocol translation from %s to %s", inv.ingressProtocol, cand.provider.Type)
+		return nil, "", false, fmt.Errorf("unsupported cross-protocol translation from %s to %s", inv.ingressProtocol, cand.provider.Type)
 	}
 }
 
@@ -748,17 +864,18 @@ func (g *Gateway) handleJSONResponse(
 	resp *http.Response,
 	observer StreamObserver,
 	startTime time.Time,
+	attemptStart time.Time,
 	inv llmInvocation,
 	cand routeCandidate,
 	translated bool,
 ) {
 	upBody, err := io.ReadAll(io.LimitReader(resp.Body, g.maxResponseBodyBytes))
-	latency := time.Since(startTime).Milliseconds()
+	ttft := time.Since(attemptStart).Milliseconds()
 	if err != nil {
 		observer.Finish(TelemetryFinish{
 			StatusCode:   http.StatusBadGateway,
-			LatencyMS:    latency,
-			TTFTMS:       latency,
+			LatencyMS:    time.Since(startTime).Milliseconds(),
+			TTFTMS:       ttft,
 			ErrorMessage: err.Error(),
 		})
 		WriteError(w, inv.ingressProtocol, http.StatusBadGateway, "upstream_error", "failed to read upstream response")
@@ -782,7 +899,7 @@ func (g *Gateway) handleJSONResponse(
 		observer.Finish(TelemetryFinish{
 			StatusCode:   resp.StatusCode,
 			LatencyMS:    time.Since(startTime).Milliseconds(),
-			TTFTMS:       latency,
+			TTFTMS:       ttft,
 			ErrorMessage: errMsg,
 		})
 		return
@@ -801,7 +918,7 @@ func (g *Gateway) handleJSONResponse(
 		observer.Finish(TelemetryFinish{
 			StatusCode:   http.StatusBadGateway,
 			LatencyMS:    time.Since(startTime).Milliseconds(),
-			TTFTMS:       latency,
+			TTFTMS:       ttft,
 			ErrorMessage: err.Error(),
 		})
 		WriteError(w, inv.ingressProtocol, http.StatusBadGateway, "upstream_error", "failed to translate upstream response")
@@ -818,7 +935,7 @@ func (g *Gateway) handleJSONResponse(
 	observer.Finish(TelemetryFinish{
 		StatusCode:   resp.StatusCode,
 		LatencyMS:    time.Since(startTime).Milliseconds(),
-		TTFTMS:       latency,
+		TTFTMS:       ttft,
 		ErrorMessage: errMsg,
 	})
 }
@@ -828,10 +945,12 @@ func (g *Gateway) handleStreamingResponse(
 	resp *http.Response,
 	observer StreamObserver,
 	startTime time.Time,
+	attemptStart time.Time,
 	inv llmInvocation,
 	cand routeCandidate,
 	translated bool,
 	isEventStream bool,
+	suppressSyntheticUsage bool,
 ) {
 	flusher, _ := w.(http.Flusher)
 
@@ -850,14 +969,14 @@ func (g *Gateway) handleStreamingResponse(
 	}
 
 	var (
-		ttftMS      int64
-		gotFirst    bool
-		streamErr   error
+		ttftMS    int64
+		gotFirst  bool
+		streamErr error
 	)
 	recordFirstToken := func() {
 		if !gotFirst {
 			gotFirst = true
-			ttftMS = time.Since(startTime).Milliseconds()
+			ttftMS = time.Since(attemptStart).Milliseconds()
 		}
 	}
 
@@ -876,7 +995,7 @@ func (g *Gateway) handleStreamingResponse(
 
 	if !translated {
 		if isEventStream || (inv.ingressProtocol != ProtocolGemini && inv.stream) {
-			streamErr = streamNativeSSE(resp.Body, w, flusher, observer, recordFirstToken)
+			streamErr = streamNativeSSE(resp.Body, w, flusher, observer, suppressSyntheticUsage, recordFirstToken)
 			return
 		}
 		// Fallback for non-SSE streaming (e.g. Gemini :streamGenerateContent without ?alt=sse).
@@ -903,14 +1022,20 @@ func (g *Gateway) handleStreamingResponse(
 	}
 }
 
-// streamNativeSSE relays raw upstream SSE bytes losslessly using bufio.Reader
-// (no 64 KiB Scanner limit), flushing at every event boundary and delivering
-// decoded (eventName, data) frames to observer.OnSSEEvent.
+// streamNativeSSE relays upstream SSE bytes using bufio.Reader (no 64 KiB Scanner
+// limit), flushing at every event boundary and delivering decoded (eventName, data)
+// frames to observer.OnSSEEvent.
+//
+// When suppressSyntheticUsage is true (meaning Headlamp injected stream_options.include_usage
+// on behalf of a client that did not ask for it), the pure usage-only chunk
+// (choices: [] && usage != nil && error == nil) is still delivered to observer.OnSSEEvent
+// for metering but withheld from the downstream client.
 func streamNativeSSE(
 	upstream io.Reader,
 	downstream io.Writer,
 	flusher http.Flusher,
 	observer StreamObserver,
+	suppressSyntheticUsage bool,
 	onFirstFrame func(),
 ) error {
 	reader := bufio.NewReaderSize(upstream, 64*1024)
@@ -918,44 +1043,82 @@ func streamNativeSSE(
 	var (
 		eventName string
 		dataBuf   bytes.Buffer
+		frameBuf  bytes.Buffer
 		hasData   bool
 		hasEvent  bool
 	)
 
-	dispatchEvent := func() {
-		if !hasData && !hasEvent {
-			return
-		}
-		data := bytes.Clone(dataBuf.Bytes())
-		evName := eventName
-		eventName = ""
-		dataBuf.Reset()
-		hasData = false
-		hasEvent = false
+	flushAndDispatch := func() error {
+		var (
+			data   []byte
+			evName string
+			hasEv  = hasData || hasEvent
+		)
+		if hasEv {
+			data = bytes.Clone(dataBuf.Bytes())
+			evName = eventName
+			eventName = ""
+			dataBuf.Reset()
+			hasData = false
+			hasEvent = false
 
-		trimmed := bytes.TrimSpace(data)
-		if !bytes.Equal(trimmed, []byte("[DONE]")) {
-			observer.OnSSEEvent(evName, data)
+			trimmed := bytes.TrimSpace(data)
+			if !bytes.Equal(trimmed, []byte("[DONE]")) {
+				observer.OnSSEEvent(evName, data)
+			}
 		}
+
+		if suppressSyntheticUsage {
+			if frameBuf.Len() > 0 {
+				skipDownstream := hasEv && isSyntheticUsageOnlyChunk(data)
+				if !skipDownstream {
+					if onFirstFrame != nil {
+						onFirstFrame()
+					}
+					if _, writeErr := downstream.Write(frameBuf.Bytes()); writeErr != nil {
+						frameBuf.Reset()
+						return writeErr
+					}
+					if flusher != nil {
+						flusher.Flush()
+					}
+				}
+				frameBuf.Reset()
+			}
+			return nil
+		}
+
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return nil
 	}
 
 	for {
 		line, readErr := translate.ReadLineLimited(reader, translate.MaxSSELineBytes)
 		if len(line) > 0 {
-			if onFirstFrame != nil {
-				onFirstFrame()
-			}
-			if _, writeErr := downstream.Write(line); writeErr != nil {
-				dispatchEvent()
-				return writeErr
+			if suppressSyntheticUsage {
+				frameBuf.Write(line)
+			} else {
+				if onFirstFrame != nil {
+					onFirstFrame()
+				}
+				if _, writeErr := downstream.Write(line); writeErr != nil {
+					if hasData || hasEvent {
+						data := bytes.Clone(dataBuf.Bytes())
+						if !bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
+							observer.OnSSEEvent(eventName, data)
+						}
+					}
+					return writeErr
+				}
 			}
 
 			trimmed := bytes.TrimRight(line, "\r\n")
 			if len(trimmed) == 0 {
-				if flusher != nil {
-					flusher.Flush()
+				if writeErr := flushAndDispatch(); writeErr != nil {
+					return writeErr
 				}
-				dispatchEvent()
 			} else if trimmed[0] != ':' {
 				colon := bytes.IndexByte(trimmed, ':')
 				var field, value string
@@ -984,16 +1147,45 @@ func streamNativeSSE(
 		}
 
 		if readErr != nil {
-			if flusher != nil {
-				flusher.Flush()
+			writeErr := flushAndDispatch()
+			if writeErr != nil {
+				return writeErr
 			}
-			dispatchEvent()
 			if errors.Is(readErr, io.EOF) {
 				return nil
 			}
 			return readErr
 		}
 	}
+}
+
+func isSyntheticUsageOnlyChunk(data []byte) bool {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return false
+	}
+	var probe struct {
+		Choices json.RawMessage `json:"choices"`
+		Usage   json.RawMessage `json:"usage"`
+		Error   json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(trimmed, &probe); err != nil {
+		return false
+	}
+	if isJSONEmptyOrNull(probe.Usage) || !isJSONEmptyOrNull(probe.Error) {
+		return false
+	}
+	choicesRaw := bytes.TrimSpace(probe.Choices)
+	if len(choicesRaw) == 0 || bytes.Equal(choicesRaw, []byte("null")) {
+		return true
+	}
+	var choices []json.RawMessage
+	return json.Unmarshal(choicesRaw, &choices) == nil && len(choices) == 0
+}
+
+func isJSONEmptyOrNull(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
 }
 
 // streamNativeJSONChunks relays non-SSE streaming responses (such as Gemini
@@ -1056,23 +1248,27 @@ func feedJSONArrayOrObject(raw []byte, observer StreamObserver) {
 	observer.OnJSONResponse(trimmed)
 }
 
-// patchJSONRequest rewrites only top-level "model" and/or injects
-// "stream_options":{"include_usage":true} when absent, preserving all other
-// JSON fields untouched.
-func patchJSONRequest(body []byte, newModel string, injectStreamOptions bool) ([]byte, error) {
+// patchJSONRequest rewrites only top-level "model" and/or force-merges
+// "stream_options":{"include_usage":true}, preserving all other JSON fields
+// (including sibling keys inside "stream_options") untouched.
+//
+// injectedIncludeUsage is true whenever injectStreamOptions was requested and
+// the client did not already supply "stream_options": {"include_usage": true}.
+func patchJSONRequest(body []byte, newModel string, injectStreamOptions bool) ([]byte, bool, error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(body, &fields); err != nil {
-		return nil, fmt.Errorf("invalid JSON object: %w", err)
+		return nil, false, fmt.Errorf("invalid JSON object: %w", err)
 	}
 	if fields == nil {
-		return nil, errors.New("JSON body must be an object")
+		return nil, false, errors.New("JSON body must be an object")
 	}
 
 	modified := false
+	injectedIncludeUsage := false
 	if newModel != "" {
 		encodedModel, err := json.Marshal(newModel)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		fields["model"] = encodedModel
 		modified = true
@@ -1084,13 +1280,51 @@ func patchJSONRequest(body []byte, newModel string, injectStreamOptions bool) ([
 		if !exists || len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 			fields["stream_options"] = json.RawMessage(`{"include_usage":true}`)
 			modified = true
+			injectedIncludeUsage = true
+		} else {
+			var opts map[string]json.RawMessage
+			if err := json.Unmarshal(trimmed, &opts); err != nil || opts == nil {
+				fields["stream_options"] = json.RawMessage(`{"include_usage":true}`)
+				modified = true
+				injectedIncludeUsage = true
+			} else {
+				var alreadyTrue bool
+				if incRaw, hasInc := opts["include_usage"]; hasInc {
+					_ = json.Unmarshal(incRaw, &alreadyTrue)
+				}
+				if !alreadyTrue {
+					opts["include_usage"] = json.RawMessage("true")
+					encodedOpts, err := json.Marshal(opts)
+					if err != nil {
+						return nil, false, err
+					}
+					fields["stream_options"] = encodedOpts
+					modified = true
+					injectedIncludeUsage = true
+				}
+			}
 		}
 	}
 
 	if !modified {
-		return body, nil
+		return body, false, nil
 	}
-	return json.Marshal(fields)
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		return nil, false, err
+	}
+	return encoded, injectedIncludeUsage, nil
+}
+
+func flattenHeaders(h http.Header) map[string]string {
+	if len(h) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(h))
+	for k, vals := range h {
+		out[k] = strings.Join(vals, ", ")
+	}
+	return out
 }
 
 // sanitizeUpstreamError strips query strings and userinfo from *url.Error URLs

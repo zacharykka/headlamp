@@ -10,6 +10,7 @@ import (
 const (
 	ProtocolOpenAIChat        = "openai_chat"
 	ProtocolOpenAIResponses   = "openai_responses"
+	ProtocolOpenAIEmbeddings  = "openai_embeddings"
 	ProtocolAnthropicMessages = "anthropic_messages"
 	ProtocolGemini            = "gemini"
 	ProtocolOllama            = "ollama"
@@ -56,7 +57,7 @@ func ParseJSONUsage(protocol string, body []byte) Usage {
 	}
 
 	switch normalizeProtocol(protocol) {
-	case ProtocolOpenAIChat:
+	case ProtocolOpenAIChat, ProtocolOpenAIEmbeddings:
 		return parseOpenAIChatUsage(trimmed)
 	case ProtocolOpenAIResponses:
 		return parseOpenAIResponsesUsage(trimmed)
@@ -139,6 +140,8 @@ func normalizeProtocol(protocol string) string {
 		return ProtocolOpenAIChat
 	case ProtocolOpenAIResponses, "responses":
 		return ProtocolOpenAIResponses
+	case ProtocolOpenAIEmbeddings, "embeddings":
+		return ProtocolOpenAIEmbeddings
 	case ProtocolAnthropicMessages, "anthropic":
 		return ProtocolAnthropicMessages
 	case ProtocolGemini, "google":

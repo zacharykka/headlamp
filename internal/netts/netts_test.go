@@ -62,7 +62,6 @@ func TestTSNetAuthenticator_UserNodeAndCapMap(t *testing.T) {
 					ID:          1,
 					LoginName:   "alice@example.com",
 					DisplayName: "Alice Smith",
-					Groups:      []string{"engineering"},
 				},
 				CapMap: tailcfg.PeerCapMap{
 					tailcfg.PeerCapability("headlamp.dev/cap/gateway"): {
@@ -109,9 +108,6 @@ func TestTSNetAuthenticator_UserNodeAndCapMap(t *testing.T) {
 	}
 	if p.AuthSource != auth.AuthSourceTSNet {
 		t.Errorf("AuthSource = %q, want %q", p.AuthSource, auth.AuthSourceTSNet)
-	}
-	if !slices.Equal(p.Groups, []string{"engineering"}) {
-		t.Errorf("Groups = %v, want [engineering]", p.Groups)
 	}
 
 	// Verify CapMap entries were marshaled as JSON arrays preserving all objects.
@@ -235,7 +231,7 @@ func TestTSNetAuthenticator_PeerNotFoundFallsThroughChain(t *testing.T) {
 	}
 
 	tsAuth := NewTSNetAuthenticator(mock)
-	devAuth := auth.NewDevAuthenticator("dev@local", []string{auth.RoleAdmin})
+	devAuth := auth.NewDevAuthenticator("dev@local", []string{auth.RoleAdmin}, false)
 	chain := auth.NewChainAuthenticator(tsAuth, devAuth)
 
 	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/v1/models", nil)
@@ -482,6 +478,129 @@ func TestNewServer_Validation(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "M2") {
 		t.Fatalf("expected M2 error for acme_dns01, got %v", err)
+	}
+}
+
+func TestServer_ServeHandlersListenerIsolation(t *testing.T) {
+	tailnetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tailnet mock: %v", err)
+	}
+	localLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		_ = tailnetLn.Close()
+		t.Fatalf("listen local mock: %v", err)
+	}
+
+	srv := &Server{
+		started:   true,
+		tailnetLn: tailnetLn,
+		localLn:   localLn,
+	}
+
+	// Nil handler for an active listener must fail before serving.
+	if err := srv.ServeHandlers(nil, http.NotFoundHandler()); err == nil {
+		t.Fatal("expected error when tailnetHandler is nil with active tailnet listener")
+	}
+	if err := srv.ServeHandlers(http.NotFoundHandler(), nil); err == nil {
+		t.Fatal("expected error when localHandler is nil with active local listener")
+	}
+
+	// Tailnet listener enforces Tailnet-only WhoIs (never falls back to DevAuthenticator or tokens).
+	tsOnlyAuth := NewTSNetAuthenticator(&mockWhoIsClient{
+		fn: func(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, error) {
+			return nil, local.ErrPeerNotFound
+		},
+	})
+	tailnetHandler := auth.Middleware(tsOnlyAuth, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("tailnet-ok"))
+	}))
+
+	// Local listener accepts loopback dev_mode / static token callers.
+	localAuth := auth.NewDevAuthenticator("dev@local", []string{auth.RoleAdmin}, false)
+	localHandler := auth.Middleware(localAuth, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p, _ := auth.FromContext(r.Context())
+		_, _ = w.Write([]byte("local:" + p.Subject))
+	}))
+
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- srv.ServeHandlers(tailnetHandler, localHandler)
+	}()
+
+	// Non-tailnet caller hitting tailnet listener MUST receive 401 (never dev_mock).
+	tailResp, err := http.Get("http://" + srv.TailnetAddr() + "/whoami")
+	if err != nil {
+		t.Fatalf("GET tailnet listener failed: %v", err)
+	}
+	_ = tailResp.Body.Close()
+	if tailResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("tailnet listener status = %d, want 401 Unauthorized", tailResp.StatusCode)
+	}
+
+	// Caller hitting local listener uses isolated local handler.
+	localResp, err := http.Get("http://" + srv.LocalAddr() + "/whoami")
+	if err != nil {
+		t.Fatalf("GET local listener failed: %v", err)
+	}
+	localBody, _ := io.ReadAll(localResp.Body)
+	_ = localResp.Body.Close()
+	if localResp.StatusCode != http.StatusOK || string(localBody) != "local:dev@local" {
+		t.Fatalf("local listener response = (%d, %q), want (200, %q)", localResp.StatusCode, string(localBody), "local:dev@local")
+	}
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := srv.Close(closeCtx); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatalf("ServeHandlers returned error on graceful Close: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for ServeHandlers to exit")
+	}
+}
+
+func TestServer_ServeHandlersAllowsNilForInactiveListener(t *testing.T) {
+	srv, err := NewServer(config.ServerConfig{
+		TSNet:       config.TSNetConfig{Enabled: false},
+		LocalListen: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	if err := srv.Start(context.Background()); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	serveErr := make(chan error, 1)
+	go func() {
+		// tailnetHandler is nil because tsnet is disabled.
+		serveErr <- srv.ServeHandlers(nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte("local-only"))
+		}))
+	}()
+
+	resp, err := http.Get("http://" + srv.LocalAddr())
+	if err != nil {
+		t.Fatalf("GET local listener failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "local-only" {
+		t.Fatalf("got (%d, %q), want (200, local-only)", resp.StatusCode, string(body))
+	}
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := srv.Close(closeCtx); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if err := <-serveErr; err != nil {
+		t.Fatalf("ServeHandlers returned error: %v", err)
 	}
 }
 

@@ -10,9 +10,10 @@ import (
 )
 
 const (
-	// CapHeadlampGateway is Headlamp's native Headscale/Tailscale peer capability name.
-	CapHeadlampGateway = "headlamp.dev/cap/gateway"
-	// CapApertureCompat is Tailscale Aperture's peer capability name supported as a drop-in alias.
+	// CapHeadlampGateway is Headlamp's native Headscale v0.29+ / Tailscale peer capability name.
+	CapHeadlampGateway = auth.CapHeadlampGateway
+	// CapApertureCompat is Tailscale Aperture's peer capability name supported on official Tailscale SaaS
+	// (Headscale v0.29.7 rejects tailscale.com/* capability names and uses headlamp.dev/cap/gateway).
 	CapApertureCompat = "tailscale.com/cap/aperture"
 )
 

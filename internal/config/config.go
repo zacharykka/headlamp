@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"regexp"
@@ -20,10 +21,6 @@ const (
 	TLSModeStatic    = "static"
 	TLSModeACMEDNS01 = "acme_dns01"
 
-	PolicyModeHybrid     = "hybrid"
-	PolicyModeLocalOnly  = "local_only"
-	PolicyModeGrantsOnly = "grants_only"
-
 	StorageDriverSQLite   = "sqlite"
 	StorageDriverPostgres = "postgres"
 
@@ -34,9 +31,9 @@ const (
 )
 
 // Config holds the full Headlamp gateway configuration.
+// Authorization is driven purely by Tailnet/Headscale grants (or synthesized grants for static API tokens and dev mode).
 type Config struct {
 	Server    ServerConfig     `yaml:"server"`
-	Policy    PolicyConfig     `yaml:"policy"`
 	Storage   StorageConfig    `yaml:"storage"`
 	Providers []ProviderConfig `yaml:"providers"`
 	Routes    []RouteConfig    `yaml:"routes"`
@@ -48,13 +45,14 @@ type Config struct {
 
 // ServerConfig controls Tailnet/local listeners, TLS, dev mock mode, and fallback API tokens.
 type ServerConfig struct {
-	TSNet       TSNetConfig      `yaml:"tsnet"`
-	TLS         TLSConfig        `yaml:"tls"`
-	LocalListen string           `yaml:"local_listen"`
-	DevMode     bool             `yaml:"dev_mode"`
-	DevUser     string           `yaml:"dev_user"`
-	DevRoles    []string         `yaml:"dev_roles"`
-	APITokens   []APITokenConfig `yaml:"api_tokens"`
+	TSNet                  TSNetConfig      `yaml:"tsnet"`
+	TLS                    TLSConfig        `yaml:"tls"`
+	LocalListen            string           `yaml:"local_listen"`
+	DevMode                bool             `yaml:"dev_mode"`
+	DevUser                string           `yaml:"dev_user"`
+	DevRoles               []string         `yaml:"dev_roles"`
+	DevAllowHeaderOverride bool             `yaml:"dev_allow_header_override"`
+	APITokens              []APITokenConfig `yaml:"api_tokens"`
 }
 
 // TSNetConfig configures the embedded Tailscale/Headscale tsnet node.
@@ -79,41 +77,18 @@ type TLSConfig struct {
 }
 
 // APITokenConfig defines a static fallback API token for non-Tailnet callers.
+// AllowModels defaults to ["*"] when omitted so simple tokens work out of the box.
 type APITokenConfig struct {
-	Name        string   `yaml:"name"`
-	Token       string   `yaml:"token"`
-	Subject     string   `yaml:"subject"`
-	DisplayName string   `yaml:"display_name"`
-	Groups      []string `yaml:"groups"`
-	Roles       []string `yaml:"roles"`
-	Tags        []string `yaml:"tags"`
-}
-
-// PolicyConfig configures dual-track authorization (local rules + Headscale grants).
-type PolicyConfig struct {
-	Mode            string             `yaml:"mode"` // hybrid | local_only | grants_only
-	BootstrapAdmins []string           `yaml:"bootstrap_admins"`
-	Groups          []GroupConfig      `yaml:"groups"`
-	Rules           []PolicyRuleConfig `yaml:"rules"`
-}
-
-// GroupConfig defines a static gateway group seeded into storage.
-type GroupConfig struct {
-	Name        string   `yaml:"name"`
-	Description string   `yaml:"description"`
-	Members     []string `yaml:"members"`
-}
-
-// PolicyRuleConfig defines a static authorization rule seeded into storage.
-type PolicyRuleConfig struct {
 	Name          string   `yaml:"name"`
+	Token         string   `yaml:"token"`
 	Subject       string   `yaml:"subject"`
-	Role          string   `yaml:"role"`
+	DisplayName   string   `yaml:"display_name"`
+	Roles         []string `yaml:"roles"`
+	Tags          []string `yaml:"tags"`
 	AllowModels   []string `yaml:"allow_models"`
 	DenyModels    []string `yaml:"deny_models"`
 	AllowMCPTools []string `yaml:"allow_mcp_tools"`
 	DenyMCPTools  []string `yaml:"deny_mcp_tools"`
-	Priority      int      `yaml:"priority"`
 }
 
 // StorageConfig configures the backing database.
@@ -186,9 +161,6 @@ func DefaultConfig() *Config {
 			TLS: TLSConfig{
 				Mode: TLSModeNone,
 			},
-		},
-		Policy: PolicyConfig{
-			Mode: PolicyModeHybrid,
 		},
 		Storage: StorageConfig{
 			Driver: StorageDriverSQLite,
@@ -338,12 +310,12 @@ func applyEnvOverrides(cfg *Config, lookupEnv func(string) (string, bool)) error
 	if v, ok := lookupEnv("HEADLAMP_DEV_USER"); ok && strings.TrimSpace(v) != "" {
 		cfg.Server.DevUser = strings.TrimSpace(v)
 	}
-
-	if v, ok := lookupEnv("HEADLAMP_POLICY_MODE"); ok && strings.TrimSpace(v) != "" {
-		cfg.Policy.Mode = strings.TrimSpace(v)
-	}
-	if v, ok := lookupEnv("HEADLAMP_BOOTSTRAP_ADMINS"); ok {
-		cfg.Policy.BootstrapAdmins = splitCSV(v)
+	if v, ok := lookupEnv("HEADLAMP_DEV_ALLOW_HEADER_OVERRIDE"); ok && strings.TrimSpace(v) != "" {
+		b, err := strconv.ParseBool(strings.TrimSpace(v))
+		if err != nil {
+			return fmt.Errorf("config: invalid HEADLAMP_DEV_ALLOW_HEADER_OVERRIDE %q: %w", v, err)
+		}
+		cfg.Server.DevAllowHeaderOverride = b
 	}
 
 	if v, ok := lookupEnv("HEADLAMP_STORAGE_DRIVER"); ok && strings.TrimSpace(v) != "" {
@@ -417,11 +389,6 @@ func applyDerivedDefaults(cfg *Config) {
 		}
 	}
 
-	cfg.Policy.Mode = strings.ToLower(strings.TrimSpace(cfg.Policy.Mode))
-	if cfg.Policy.Mode == "" {
-		cfg.Policy.Mode = PolicyModeHybrid
-	}
-
 	cfg.Storage.Driver = strings.ToLower(strings.TrimSpace(cfg.Storage.Driver))
 	if cfg.Storage.Driver == "" {
 		cfg.Storage.Driver = StorageDriverSQLite
@@ -448,6 +415,12 @@ func (c *Config) Validate() error {
 
 	if !c.Server.TSNet.Enabled && strings.TrimSpace(c.Server.LocalListen) == "" {
 		errs = append(errs, "at least one listener must be enabled (server.tsnet.enabled or server.local_listen)")
+	}
+
+	if c.Server.DevMode {
+		if strings.TrimSpace(c.Server.LocalListen) == "" || !isLoopbackListenAddr(c.Server.LocalListen) {
+			errs = append(errs, fmt.Sprintf("server.dev_mode requires server.local_listen to bind a loopback host (127.0.0.1, ::1, or localhost), got %q", c.Server.LocalListen))
+		}
 	}
 
 	if c.Server.TSNet.Enabled {
@@ -494,52 +467,30 @@ func (c *Config) Validate() error {
 		if strings.TrimSpace(tok.Subject) == "" {
 			errs = append(errs, fmt.Sprintf("server.api_tokens[%d].subject is required", i))
 		}
-	}
-
-	switch c.Policy.Mode {
-	case PolicyModeHybrid, PolicyModeLocalOnly, PolicyModeGrantsOnly:
-	default:
-		errs = append(errs, fmt.Sprintf("policy.mode %q must be one of hybrid, local_only, grants_only", c.Policy.Mode))
-	}
-
-	seenGroups := make(map[string]struct{}, len(c.Policy.Groups))
-	for i, g := range c.Policy.Groups {
-		name := strings.TrimSpace(g.Name)
-		if name == "" {
-			errs = append(errs, fmt.Sprintf("policy.groups[%d].name is required", i))
-			continue
-		}
-		if _, dup := seenGroups[name]; dup {
-			errs = append(errs, fmt.Sprintf("policy.groups[%d].name %q is duplicated", i, name))
-		}
-		seenGroups[name] = struct{}{}
-	}
-
-	for i, rule := range c.Policy.Rules {
-		if strings.TrimSpace(rule.Subject) == "" {
-			errs = append(errs, fmt.Sprintf("policy.rules[%d].subject is required", i))
-		}
-		if rule.Role != "" && rule.Role != "user" && rule.Role != "admin" {
-			errs = append(errs, fmt.Sprintf("policy.rules[%d].role %q must be empty, user, or admin", i, rule.Role))
-		}
-		for _, pat := range rule.AllowModels {
-			if !doublestar.ValidatePattern(pat) {
-				errs = append(errs, fmt.Sprintf("policy.rules[%d].allow_models invalid glob %q", i, pat))
+		for _, role := range tok.Roles {
+			r := strings.ToLower(strings.TrimSpace(role))
+			if r != "" && r != "user" && r != "admin" {
+				errs = append(errs, fmt.Sprintf("server.api_tokens[%d].roles contains invalid role %q (must be user or admin)", i, role))
 			}
 		}
-		for _, pat := range rule.DenyModels {
+		for _, pat := range tok.AllowModels {
 			if !doublestar.ValidatePattern(pat) {
-				errs = append(errs, fmt.Sprintf("policy.rules[%d].deny_models invalid glob %q", i, pat))
+				errs = append(errs, fmt.Sprintf("server.api_tokens[%d].allow_models invalid glob %q", i, pat))
 			}
 		}
-		for _, pat := range rule.AllowMCPTools {
+		for _, pat := range tok.DenyModels {
 			if !doublestar.ValidatePattern(pat) {
-				errs = append(errs, fmt.Sprintf("policy.rules[%d].allow_mcp_tools invalid glob %q", i, pat))
+				errs = append(errs, fmt.Sprintf("server.api_tokens[%d].deny_models invalid glob %q", i, pat))
 			}
 		}
-		for _, pat := range rule.DenyMCPTools {
+		for _, pat := range tok.AllowMCPTools {
 			if !doublestar.ValidatePattern(pat) {
-				errs = append(errs, fmt.Sprintf("policy.rules[%d].deny_mcp_tools invalid glob %q", i, pat))
+				errs = append(errs, fmt.Sprintf("server.api_tokens[%d].allow_mcp_tools invalid glob %q", i, pat))
+			}
+		}
+		for _, pat := range tok.DenyMCPTools {
+			if !doublestar.ValidatePattern(pat) {
+				errs = append(errs, fmt.Sprintf("server.api_tokens[%d].deny_mcp_tools invalid glob %q", i, pat))
 			}
 		}
 	}
@@ -624,6 +575,18 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil || host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func validateHTTPURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -636,15 +599,4 @@ func validateHTTPURL(raw string) error {
 		return fmt.Errorf("url %q must include a host", raw)
 	}
 	return nil
-}
-
-func splitCSV(raw string) []string {
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if trimmed := strings.TrimSpace(p); trimmed != "" {
-			out = append(out, trimmed)
-		}
-	}
-	return out
 }

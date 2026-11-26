@@ -22,6 +22,7 @@ const (
 // filters model listings according to active policies/grants.
 type Authorizer interface {
 	AuthorizeModel(ctx context.Context, p *auth.Principal, model string) (allowed bool, reason string, err error)
+	IsModelDenied(ctx context.Context, p *auth.Principal, model string) (denied bool, reason string, err error)
 	FilterModels(ctx context.Context, p *auth.Principal, models []string) ([]string, error)
 }
 
@@ -67,6 +68,7 @@ type TelemetryFinish struct {
 // StreamObserver receives side-channel SSE frames or non-streaming JSON bodies
 // from a single proxied request for token accounting and optional payload audit.
 type StreamObserver interface {
+	SetResponseHeaders(headers map[string]string)
 	OnSSEEvent(eventName string, data []byte)
 	OnJSONResponse(body []byte)
 	Finish(TelemetryFinish)
@@ -79,6 +81,7 @@ type TelemetryFactory interface {
 
 type noopObserver struct{}
 
-func (noopObserver) OnSSEEvent(string, []byte) {}
-func (noopObserver) OnJSONResponse([]byte)     {}
-func (noopObserver) Finish(TelemetryFinish)    {}
+func (noopObserver) SetResponseHeaders(map[string]string) {}
+func (noopObserver) OnSSEEvent(string, []byte)            {}
+func (noopObserver) OnJSONResponse([]byte)                {}
+func (noopObserver) Finish(TelemetryFinish)               {}

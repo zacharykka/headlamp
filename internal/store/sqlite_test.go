@@ -3,8 +3,10 @@ package store
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,10 +32,27 @@ func newTestStore(t *testing.T, dsn string) (*SQLiteStore, *crypto.Cipher) {
 	return st, cipher
 }
 
-func TestSQLitePragmasAndIdempotentMigration(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "nested", "headlamp.db")
+func TestSQLitePragmasPermissionsAndIdempotentMigration(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), "nested")
+	dbPath := filepath.Join(dbDir, "headlamp.db")
 	st, _ := newTestStore(t, dbPath)
 	ctx := context.Background()
+
+	// P3: verify 0700 parent dir and 0600 SQLite DB file permissions.
+	dirInfo, err := os.Stat(dbDir)
+	if err != nil {
+		t.Fatalf("stat dbDir: %v", err)
+	}
+	if perm := dirInfo.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("db dir perm = %04o, want 0700", perm)
+	}
+	fileInfo, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("stat dbPath: %v", err)
+	}
+	if perm := fileInfo.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("db file perm = %04o, want 0600", perm)
+	}
 
 	var journalMode string
 	if err := st.DB().QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&journalMode); err != nil {
@@ -65,7 +84,7 @@ func TestSQLitePragmasAndIdempotentMigration(t *testing.T) {
 	}
 }
 
-func TestProvidersEncryptedAtRestAndRoutesCRUD(t *testing.T) {
+func TestProvidersEncryptedAtRestRoutesCRUDAndSnapshotCache(t *testing.T) {
 	st, _ := newTestStore(t, ":memory:")
 	ctx := context.Background()
 
@@ -76,7 +95,7 @@ func TestProvidersEncryptedAtRestAndRoutesCRUD(t *testing.T) {
 		BaseURL:     "https://api.anthropic.com",
 		APIKey:      secret,
 		Passthrough: false,
-		Models:      []string{"claude-sonnet-4-20250514"},
+		Models:      []string{"claude-sonnet-4-6"},
 		Enabled:     true,
 	}); err != nil {
 		t.Fatalf("UpsertProvider: %v", err)
@@ -91,6 +110,21 @@ func TestProvidersEncryptedAtRestAndRoutesCRUD(t *testing.T) {
 		t.Fatalf("expected encrypted api_key_enc, got %q", rawEnc)
 	}
 
+	zeroCost := 0.0
+	inputCost := 3.0
+	if err := st.UpsertModelRoute(ctx, ModelRoute{
+		Alias:                "team/coding",
+		ProviderName:         "anthropic",
+		UpstreamModel:        "claude-sonnet-4-6",
+		Fallbacks:            []RouteTarget{{Provider: "anthropic", Model: "claude-haiku-4-5"}},
+		InputCostPerMillion:  &inputCost,
+		OutputCostPerMillion: &zeroCost,
+		Enabled:              true,
+	}); err != nil {
+		t.Fatalf("UpsertModelRoute: %v", err)
+	}
+
+	// P2-1: first read loads snapshot once; subsequent reads hit memory cache with 0 DB reloads.
 	got, err := st.GetProvider(ctx, "anthropic")
 	if err != nil {
 		t.Fatalf("GetProvider: %v", err)
@@ -98,19 +132,15 @@ func TestProvidersEncryptedAtRestAndRoutesCRUD(t *testing.T) {
 	if got.APIKey != secret || len(got.Models) != 1 || !got.Enabled {
 		t.Fatalf("unexpected provider: %+v", got)
 	}
+	if loads := st.cacheLoads.Load(); loads != 1 {
+		t.Fatalf("cacheLoads = %d, want 1", loads)
+	}
 
-	zeroCost := 0.0
-	inputCost := 3.0
-	if err := st.UpsertModelRoute(ctx, ModelRoute{
-		Alias:                "team/coding",
-		ProviderName:         "anthropic",
-		UpstreamModel:        "claude-sonnet-4-20250514",
-		Fallbacks:            []RouteTarget{{Provider: "anthropic", Model: "claude-3-5-haiku-20241022"}},
-		InputCostPerMillion:  &inputCost,
-		OutputCostPerMillion: &zeroCost,
-		Enabled:              true,
-	}); err != nil {
-		t.Fatalf("UpsertModelRoute: %v", err)
+	// Mutating returned structs must NOT corrupt the cached snapshot.
+	got.Models[0] = "mutated-model"
+	list, err := st.ListProviders(ctx)
+	if err != nil || len(list) != 1 || list[0].Models[0] != "claude-sonnet-4-6" {
+		t.Fatalf("cache clone isolation failed: %+v (err=%v)", list, err)
 	}
 
 	route, err := st.GetModelRoute(ctx, "team/coding")
@@ -129,72 +159,51 @@ func TestProvidersEncryptedAtRestAndRoutesCRUD(t *testing.T) {
 	if route.CacheReadCostPerMillion != nil {
 		t.Fatalf("CacheReadCostPerMillion = %v, want nil", route.CacheReadCostPerMillion)
 	}
+	*route.InputCostPerMillion = 999.0
+	routes, err := st.ListModelRoutes(ctx)
+	if err != nil || len(routes) != 1 || *routes[0].InputCostPerMillion != 3.0 {
+		t.Fatalf("route cache clone isolation failed: %+v (err=%v)", routes, err)
+	}
 
-	// Deleting the provider should cascade-delete dependent routes (proves foreign keys ON).
+	// All four reads above must have shared the single cached snapshot.
+	if loads := st.cacheLoads.Load(); loads != 1 {
+		t.Fatalf("expected 1 snapshot load across repeated reads, got %d", loads)
+	}
+
+	// Concurrent reads + writes under -race.
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				_, _ = st.ListProviders(ctx)
+				_, _ = st.ListModelRoutes(ctx)
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for j := 0; j < 5; j++ {
+			_ = st.UpsertProvider(ctx, Provider{
+				Name:    "anthropic",
+				Type:    config.ProviderTypeAnthropic,
+				BaseURL: "https://api.anthropic.com",
+				APIKey:  secret,
+				Models:  []string{"claude-sonnet-4-6"},
+				Enabled: true,
+			})
+		}
+	}()
+	wg.Wait()
+
+	// Deleting the provider invalidates cache and cascade-deletes dependent routes.
 	if err := st.DeleteProvider(ctx, "anthropic"); err != nil {
 		t.Fatalf("DeleteProvider: %v", err)
 	}
 	if _, err := st.GetModelRoute(ctx, "team/coding"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound after cascade delete, got %v", err)
-	}
-}
-
-func TestGroupsAndPoliciesCRUD(t *testing.T) {
-	st, _ := newTestStore(t, ":memory:")
-	ctx := context.Background()
-
-	if err := st.UpsertGroup(ctx, Group{
-		Name:        "engineering",
-		Description: "Core engineers",
-		Members:     []string{"alice@example.com", "tag:dev-box"},
-	}); err != nil {
-		t.Fatalf("UpsertGroup: %v", err)
-	}
-	if err := st.UpsertGroup(ctx, Group{
-		Name:    "ci",
-		Members: []string{"tag:ci-runner"},
-	}); err != nil {
-		t.Fatalf("UpsertGroup ci: %v", err)
-	}
-
-	groups, err := st.ListGroupsForMember(ctx, "alice@example.com", "tag:ci-runner")
-	if err != nil {
-		t.Fatalf("ListGroupsForMember: %v", err)
-	}
-	if len(groups) != 2 || groups[0] != "ci" || groups[1] != "engineering" {
-		t.Fatalf("groups = %#v, want [ci engineering]", groups)
-	}
-
-	if err := st.UpsertPolicy(ctx, Policy{
-		ID:          "p-low",
-		Name:        "default",
-		Subject:     "*",
-		Role:        "user",
-		AllowModels: []string{"openai/gpt-4.1-mini"},
-		Priority:    10,
-		Enabled:     true,
-	}); err != nil {
-		t.Fatalf("UpsertPolicy low: %v", err)
-	}
-	if err := st.UpsertPolicy(ctx, Policy{
-		ID:          "p-high",
-		Name:        "eng",
-		Subject:     "group:engineering",
-		Role:        "user",
-		AllowModels: []string{"anthropic/*"},
-		DenyModels:  []string{"anthropic/claude-opus*"},
-		Priority:    100,
-		Enabled:     true,
-	}); err != nil {
-		t.Fatalf("UpsertPolicy high: %v", err)
-	}
-
-	list, err := st.ListPolicies(ctx)
-	if err != nil {
-		t.Fatalf("ListPolicies: %v", err)
-	}
-	if len(list) != 2 || list[0].ID != "p-high" || list[1].ID != "p-low" {
-		t.Fatalf("unexpected priority ordering: %+v", list)
 	}
 }
 
@@ -217,8 +226,8 @@ func TestUsageLogsAuditPayloadsAndRetentionPurge(t *testing.T) {
 		AuthSource:       "tsnet",
 		ProviderName:     "anthropic",
 		ProviderType:     "anthropic",
-		RequestedModel:   "claude-sonnet-4-20250514",
-		UpstreamModel:    "claude-sonnet-4-20250514",
+		RequestedModel:   "claude-sonnet-4-6",
+		UpstreamModel:    "claude-sonnet-4-6",
 		Protocol:         "anthropic",
 		Endpoint:         "/anthropic/v1/messages",
 		Stream:           true,
@@ -305,80 +314,121 @@ func TestUsageLogsAuditPayloadsAndRetentionPurge(t *testing.T) {
 	}
 }
 
-func TestSyncConfigIdempotentAndPreservesKeysAndLocalRecords(t *testing.T) {
+func TestSyncConfigReconcilesRemovedEntriesAndPreservesKeysAndLocalRecords(t *testing.T) {
 	st, _ := newTestStore(t, ":memory:")
 	ctx := context.Background()
 
-	// Seed a local UI-created policy to make sure SyncConfig never clobbers it.
-	if err := st.UpsertPolicy(ctx, Policy{
-		ID:          "ui-policy-1",
-		Name:        "local-ui-rule",
-		Subject:     "carol@example.com",
-		AllowModels: []string{"gemini/*"},
-		Enabled:     true,
-		Source:      SourceLocal,
+	// Seed a local UI-created provider and route to ensure SyncConfig never deletes source='local'.
+	if err := st.UpsertProvider(ctx, Provider{
+		Name:    "local-ollama",
+		Type:    config.ProviderTypeOllama,
+		BaseURL: "http://127.0.0.1:11434",
+		Models:  []string{"llama3"},
+		Enabled: true,
+		Source:  SourceLocal,
 	}); err != nil {
-		t.Fatalf("seed local policy: %v", err)
+		t.Fatalf("seed local provider: %v", err)
+	}
+	if err := st.UpsertModelRoute(ctx, ModelRoute{
+		Alias:         "local/llama",
+		ProviderName:  "local-ollama",
+		UpstreamModel: "llama3",
+		Enabled:       true,
+		Source:        SourceLocal,
+	}); err != nil {
+		t.Fatalf("seed local route: %v", err)
 	}
 
-	cfg, err := config.LoadFromBytes([]byte(`
-policy:
-  mode: hybrid
-  bootstrap_admins: ["alice@example.com"]
-  groups:
-    - name: engineering
-      members: ["alice@example.com", "bob@example.com"]
-  rules:
-    - name: eng-models
-      subject: "group:engineering"
-      role: user
-      allow_models: ["anthropic/*"]
-      priority: 50
+	cfg1, err := config.LoadFromBytes([]byte(`
 providers:
   - name: anthropic
     type: anthropic
     api_key: "sk-ant-initial-key"
-    models: ["claude-sonnet-4-20250514"]
+    models: ["claude-sonnet-4-6"]
+  - name: openai
+    type: openai
+    api_key: "sk-openai-key"
+    models: ["gpt-5"]
 routes:
   - alias: "team/coding"
     provider: anthropic
-    model: "claude-sonnet-4-20250514"
+    model: "claude-sonnet-4-6"
+  - alias: "team/openai"
+    provider: openai
+    model: "gpt-5"
 `))
 	if err != nil {
-		t.Fatalf("LoadFromBytes: %v", err)
+		t.Fatalf("LoadFromBytes cfg1: %v", err)
 	}
 
-	if err := st.SyncConfig(ctx, cfg); err != nil {
+	if err := st.SyncConfig(ctx, cfg1); err != nil {
 		t.Fatalf("first SyncConfig: %v", err)
 	}
 
-	// Second sync omits api_key in YAML; existing encrypted DB key must be preserved.
-	cfg.Providers[0].APIKey = ""
-	if err := st.SyncConfig(ctx, cfg); err != nil {
+	// Second sync:
+	// - omits api_key on anthropic (must preserve stored encrypted key)
+	// - removes provider "openai" and route "team/openai" (P0-1: stale source='config' MUST be deleted!)
+	cfg2, err := config.LoadFromBytes([]byte(`
+providers:
+  - name: anthropic
+    type: anthropic
+    models: ["claude-sonnet-4-6"]
+routes:
+  - alias: "team/coding"
+    provider: anthropic
+    model: "claude-sonnet-4-6"
+`))
+	if err != nil {
+		t.Fatalf("LoadFromBytes cfg2: %v", err)
+	}
+
+	if err := st.SyncConfig(ctx, cfg2); err != nil {
 		t.Fatalf("second SyncConfig: %v", err)
 	}
 
 	p, err := st.GetProvider(ctx, "anthropic")
 	if err != nil {
-		t.Fatalf("GetProvider: %v", err)
+		t.Fatalf("GetProvider(anthropic): %v", err)
 	}
 	if p.APIKey != "sk-ant-initial-key" {
 		t.Fatalf("expected preserved api_key, got %q", p.APIKey)
 	}
 
-	// Local policy must still exist alongside synced bootstrap admin and config rule.
-	if _, err := st.GetPolicy(ctx, "ui-policy-1"); err != nil {
-		t.Fatalf("local policy lost after SyncConfig: %v", err)
+	// Removed config-managed provider & route MUST be gone (P0-1).
+	if _, err := st.GetProvider(ctx, "openai"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("removed config provider openai should return ErrNotFound, got %v", err)
 	}
-	if _, err := st.GetPolicy(ctx, "bootstrap-admin:alice@example.com"); err != nil {
-		t.Fatalf("bootstrap admin policy missing: %v", err)
-	}
-	if _, err := st.GetPolicy(ctx, "cfg-rule:eng-models"); err != nil {
-		t.Fatalf("config rule policy missing: %v", err)
+	if _, err := st.GetModelRoute(ctx, "team/openai"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("removed config route team/openai should return ErrNotFound, got %v", err)
 	}
 
-	groups, err := st.ListGroupsForMember(ctx, "bob@example.com")
-	if err != nil || len(groups) != 1 || groups[0] != "engineering" {
-		t.Fatalf("expected bob in engineering, got (%#v, %v)", groups, err)
+	// Local UI records MUST be preserved untouched.
+	if _, err := st.GetProvider(ctx, "local-ollama"); err != nil {
+		t.Fatalf("local provider lost after SyncConfig: %v", err)
+	}
+	if _, err := st.GetModelRoute(ctx, "local/llama"); err != nil {
+		t.Fatalf("local route lost after SyncConfig: %v", err)
+	}
+
+	// Syncing an empty providers/routes config deletes all remaining source='config' entries
+	// while still keeping source='local' entries.
+	cfgEmpty, err := config.LoadFromBytes([]byte(``))
+	if err != nil {
+		t.Fatalf("LoadFromBytes empty: %v", err)
+	}
+	if err := st.SyncConfig(ctx, cfgEmpty); err != nil {
+		t.Fatalf("third SyncConfig empty: %v", err)
+	}
+	if _, err := st.GetProvider(ctx, "anthropic"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected anthropic deleted on empty config sync, got %v", err)
+	}
+	if _, err := st.GetModelRoute(ctx, "team/coding"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected team/coding deleted on empty config sync, got %v", err)
+	}
+	if _, err := st.GetProvider(ctx, "local-ollama"); err != nil {
+		t.Fatalf("local provider lost on empty config sync: %v", err)
+	}
+	if _, err := st.GetModelRoute(ctx, "local/llama"); err != nil {
+		t.Fatalf("local route lost on empty config sync: %v", err)
 	}
 }

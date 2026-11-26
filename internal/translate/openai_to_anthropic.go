@@ -54,6 +54,10 @@ func OpenAIRequestToAnthropic(body []byte, upstreamModel string) ([]byte, error)
 		}
 	}
 
+	if len(req.Messages) == 0 {
+		return nil, errors.New("translate: openai chat request must contain at least one message")
+	}
+
 	var systemParts []string
 	type pendingMsg struct {
 		role   string
@@ -118,6 +122,17 @@ func OpenAIRequestToAnthropic(body []byte, upstreamModel string) ([]byte, error)
 			return nil, fmt.Errorf("translate: encode anthropic system: %w", err)
 		}
 		out.System = sysJSON
+	}
+
+	// Anthropic requires messages to be non-empty and start with role="user".
+	syntheticUser := pendingMsg{
+		role:   "user",
+		blocks: []anthropicContentBlock{{Type: "text", Text: "(continue)"}},
+	}
+	if len(merged) == 0 {
+		merged = []pendingMsg{syntheticUser}
+	} else if merged[0].role != "user" {
+		merged = append([]pendingMsg{syntheticUser}, merged...)
 	}
 
 	out.Messages = make([]anthropicMessage, 0, len(merged))
@@ -320,7 +335,11 @@ func StreamAnthropicToOpenAI(upstream io.Reader, downstream io.Writer, flusher h
 				continue
 			}
 			if msgStart.Message.ID != "" {
-				chatID = "chatcmpl-" + msgStart.Message.ID
+				if strings.HasPrefix(msgStart.Message.ID, "chatcmpl-") {
+					chatID = msgStart.Message.ID
+				} else {
+					chatID = "chatcmpl-" + msgStart.Message.ID
+				}
 			}
 			if model == "" {
 				model = msgStart.Message.Model
@@ -545,14 +564,20 @@ func StreamAnthropicToOpenAI(upstream io.Reader, downstream io.Writer, flusher h
 		}
 	}
 
-	// Stream ended via EOF without message_stop; still terminate cleanly.
-	if err := WriteSSEEvent(downstream, "", []byte("[DONE]")); err != nil {
-		return err
-	}
+	// Stream ended via EOF without receiving Anthropic's message_stop terminator.
+	errPayload, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": "unexpected upstream stream EOF",
+			"type":    "server_error",
+			"param":   nil,
+			"code":    "unexpected_eof",
+		},
+	})
+	_ = WriteSSEEvent(downstream, "", errPayload)
 	if flusher != nil {
 		flusher.Flush()
 	}
-	return nil
+	return fmt.Errorf("translate: unexpected upstream stream EOF: %w", io.ErrUnexpectedEOF)
 }
 
 func extractOpenAIText(raw json.RawMessage) string {

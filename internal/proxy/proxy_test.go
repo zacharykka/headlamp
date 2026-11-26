@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/zacharykka/headlamp/internal/auth"
 	"github.com/zacharykka/headlamp/internal/config"
@@ -26,6 +28,7 @@ import (
 
 type mockAuthorizer struct {
 	allowFn  func(p *auth.Principal, model string) (bool, string)
+	denyFn   func(p *auth.Principal, model string) (bool, string)
 	filterFn func(p *auth.Principal, models []string) []string
 }
 
@@ -35,6 +38,14 @@ func (m *mockAuthorizer) AuthorizeModel(_ context.Context, p *auth.Principal, mo
 		return allowed, reason, nil
 	}
 	return true, "", nil
+}
+
+func (m *mockAuthorizer) IsModelDenied(_ context.Context, p *auth.Principal, model string) (bool, string, error) {
+	if m.denyFn != nil {
+		denied, reason := m.denyFn(p, model)
+		return denied, reason, nil
+	}
+	return false, "", nil
 }
 
 func (m *mockAuthorizer) FilterModels(_ context.Context, p *auth.Principal, models []string) ([]string, error) {
@@ -50,11 +61,18 @@ type recordedEvent struct {
 }
 
 type recordedTelemetry struct {
-	mu       sync.Mutex
-	start    TelemetryStart
-	events   []recordedEvent
-	jsonBody []byte
-	finish   *TelemetryFinish
+	mu          sync.Mutex
+	start       TelemetryStart
+	respHeaders map[string]string
+	events      []recordedEvent
+	jsonBody    []byte
+	finish      *TelemetryFinish
+}
+
+func (r *recordedTelemetry) SetResponseHeaders(headers map[string]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.respHeaders = headers
 }
 
 func (r *recordedTelemetry) OnSSEEvent(eventName string, data []byte) {
@@ -961,13 +979,400 @@ func TestGeminiPassthroughNetworkErrorSanitizesQueryKey(t *testing.T) {
 	}
 }
 
-func TestPatchJSONRequestInjectsStreamOptionsWhenNull(t *testing.T) {
-	in := []byte(`{"model":"gpt-4.1","stream":true,"stream_options":null,"messages":[{"role":"user","content":"hi"}]}`)
-	out, err := patchJSONRequest(in, "", true)
-	if err != nil {
-		t.Fatalf("patchJSONRequest failed: %v", err)
+func TestPatchJSONRequestStreamOptionsMerge(t *testing.T) {
+	cases := []struct {
+		name         string
+		in           string
+		wantInjected bool
+		wantContains []string
+	}{
+		{
+			name:         "absent",
+			in:           `{"model":"gpt-4.1","stream":true,"messages":[]}`,
+			wantInjected: true,
+			wantContains: []string{`"include_usage":true`},
+		},
+		{
+			name:         "null",
+			in:           `{"model":"gpt-4.1","stream":true,"stream_options":null,"messages":[]}`,
+			wantInjected: true,
+			wantContains: []string{`"include_usage":true`},
+		},
+		{
+			name:         "empty_object",
+			in:           `{"model":"gpt-4.1","stream":true,"stream_options":{},"messages":[]}`,
+			wantInjected: true,
+			wantContains: []string{`"include_usage":true`},
+		},
+		{
+			name:         "false_with_sibling_keys",
+			in:           `{"model":"gpt-4.1","stream":true,"stream_options":{"include_usage":false,"other":1},"messages":[]}`,
+			wantInjected: true,
+			wantContains: []string{`"include_usage":true`, `"other":1`},
+		},
+		{
+			name:         "already_true_preserves_bytes",
+			in:           `{"model":"gpt-4.1","stream":true,"stream_options":{"include_usage":true,"other":1},"messages":[]}`,
+			wantInjected: false,
+			wantContains: []string{`"include_usage":true`, `"other":1`},
+		},
 	}
-	if !strings.Contains(string(out), `"include_usage":true`) {
-		t.Fatalf("expected stream_options.include_usage injected when input was null, got: %s", string(out))
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, injected, err := patchJSONRequest([]byte(tc.in), "", true)
+			if err != nil {
+				t.Fatalf("patchJSONRequest failed: %v", err)
+			}
+			if injected != tc.wantInjected {
+				t.Fatalf("injected=%v, want %v (out=%s)", injected, tc.wantInjected, string(out))
+			}
+			for _, sub := range tc.wantContains {
+				if !strings.Contains(string(out), sub) {
+					t.Fatalf("output missing %q: %s", sub, string(out))
+				}
+			}
+		})
+	}
+}
+
+func TestNativeSSEFiltersSyntheticUsageOnlyWhenInjected(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), `"include_usage":true`) {
+			t.Errorf("upstream expected merged include_usage:true, got %s", string(body))
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		frames := []string{
+			"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+			"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+			"data: {\"id\":\"chatcmpl-1\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120}}\n\n",
+			"data: [DONE]\n\n",
+		}
+		for _, f := range frames {
+			_, _ = w.Write([]byte(f))
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "openai", Type: config.ProviderTypeOpenAI, BaseURL: upstream.URL, APIKey: "k", Models: []string{"gpt-4.1"}, Enabled: true,
+	})
+	tel := &mockTelemetryFactory{}
+	gw, _ := NewGateway(GatewayConfig{Store: st, Telemetry: tel})
+
+	// 1. Client sends stream_options: {"include_usage": false, "other": 1}:
+	//    gateway injects include_usage:true, meters usage, and suppresses the synthetic choices:[] chunk from client.
+	rec1 := httptest.NewRecorder()
+	gw.ServeHTTP(rec1, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-4.1","stream":true,"stream_options":{"include_usage":false,"other":1},"messages":[{"role":"user","content":"hi"}]}`))
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+	if strings.Contains(rec1.Body.String(), `"prompt_tokens":100`) {
+		t.Fatalf("synthetic usage-only chunk should have been suppressed from client: %s", rec1.Body.String())
+	}
+	if !strings.Contains(rec1.Body.String(), `"content":"hi"`) || !strings.Contains(rec1.Body.String(), "data: [DONE]") {
+		t.Fatalf("missing content or [DONE] in filtered stream: %s", rec1.Body.String())
+	}
+	if last1 := tel.last(); len(last1.events) != 3 || !strings.Contains(string(last1.events[2].Data), `"prompt_tokens":100`) {
+		t.Fatalf("metering observer must still receive usage chunk: %+v", last1.events)
+	}
+
+	// 2. Client explicitly sets stream_options: {"include_usage": true}:
+	//    gateway forwards the usage chunk verbatim to the client.
+	rec2 := httptest.NewRecorder()
+	gw.ServeHTTP(rec2, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-4.1","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}`))
+	if rec2.Code != http.StatusOK || !strings.Contains(rec2.Body.String(), `"prompt_tokens":100`) {
+		t.Fatalf("explicit include_usage:true must forward usage chunk to client: %d %s", rec2.Code, rec2.Body.String())
+	}
+}
+
+func TestVirtualRouteEnforcesDenyModelsOnCandidates(t *testing.T) {
+	var o3Hits atomic.Int32
+	o3Srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		o3Hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"o3","choices":[{"index":0,"message":{"role":"assistant","content":"o3"},"finish_reason":"stop"}]}`))
+	}))
+	defer o3Srv.Close()
+
+	fbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"fb","object":"chat.completion","model":"gpt-4.1","choices":[{"index":0,"message":{"role":"assistant","content":"allowed fallback"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`))
+	}))
+	defer fbSrv.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "openai-o3", Type: config.ProviderTypeOpenAI, BaseURL: o3Srv.URL, APIKey: "k", Enabled: true,
+	})
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "openai-fb", Type: config.ProviderTypeOpenAI, BaseURL: fbSrv.URL, APIKey: "k", Enabled: true,
+	})
+	_ = st.UpsertModelRoute(context.Background(), store.ModelRoute{
+		Alias:         "team/coding",
+		ProviderName:  "openai-o3",
+		UpstreamModel: "o3",
+		Fallbacks:     []store.RouteTarget{{Provider: "openai-fb", Model: "gpt-4.1"}},
+		Enabled:       true,
+	})
+	_ = st.UpsertModelRoute(context.Background(), store.ModelRoute{
+		Alias:         "team/o3-only",
+		ProviderName:  "openai-o3",
+		UpstreamModel: "o3",
+		Enabled:       true,
+	})
+
+	authz := &mockAuthorizer{
+		allowFn: func(_ *auth.Principal, model string) (bool, string) {
+			return strings.HasPrefix(model, "team/"), ""
+		},
+		denyFn: func(_ *auth.Principal, model string) (bool, string) {
+			if model == "openai-o3/o3" {
+				return true, "explicitly denied by rule openai-o3/o3"
+			}
+			return false, ""
+		},
+	}
+
+	gw, _ := NewGateway(GatewayConfig{Store: st, Authorizer: authz})
+
+	// 1. Primary openai-o3/o3 is denied -> skips it and uses allowed fallback openai-fb/gpt-4.1.
+	rec1 := httptest.NewRecorder()
+	gw.ServeHTTP(rec1, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"team/coding","messages":[{"role":"user","content":"hi"}]}`))
+	if rec1.Code != http.StatusOK || !strings.Contains(rec1.Body.String(), "allowed fallback") {
+		t.Fatalf("expected fallback to allowed candidate, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+	if o3Hits.Load() != 0 {
+		t.Fatalf("denied primary candidate must never be called, hits=%d", o3Hits.Load())
+	}
+
+	// 2. All candidates denied -> returns HTTP 403 permission_error with deny reason.
+	rec2 := httptest.NewRecorder()
+	gw.ServeHTTP(rec2, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"team/o3-only","messages":[{"role":"user","content":"hi"}]}`))
+	if rec2.Code != http.StatusForbidden || !strings.Contains(rec2.Body.String(), "explicitly denied by rule openai-o3/o3") {
+		t.Fatalf("expected 403 with deny reason when all candidates denied, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+}
+
+func TestAuditResponseHeadersAndNon2xxBodyCaptured(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Request-Id", "req-up-429")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limit hit","type":"requests","code":"rate_limit_exceeded"}}`))
+	}))
+	defer upstream.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "openai", Type: config.ProviderTypeOpenAI, BaseURL: upstream.URL, APIKey: "k", Models: []string{"gpt-4.1"}, Enabled: true,
+	})
+	tel := &mockTelemetryFactory{}
+	gw, _ := NewGateway(GatewayConfig{Store: st, Telemetry: tel})
+
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}]}`))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", rec.Code)
+	}
+	last := tel.last()
+	if last == nil || last.respHeaders["X-Request-Id"] != "req-up-429" {
+		t.Fatalf("expected SetResponseHeaders called with X-Request-Id, got %+v", last.respHeaders)
+	}
+	if !strings.Contains(string(last.jsonBody), "rate limit hit") {
+		t.Fatalf("expected non-2xx body captured via OnJSONResponse, got %q", string(last.jsonBody))
+	}
+}
+
+func TestPerAttemptTTFTAndFallbackWarningLog(t *testing.T) {
+	slowPrimary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(80 * time.Millisecond)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"message":"overloaded"}}`))
+	}))
+	defer slowPrimary.Close()
+
+	fastFallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"ok","object":"chat.completion","model":"gpt-4.1","choices":[{"index":0,"message":{"role":"assistant","content":"fast"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer fastFallback.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "primary", Type: config.ProviderTypeOpenAI, BaseURL: slowPrimary.URL, APIKey: "k", Enabled: true,
+	})
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "fallback", Type: config.ProviderTypeOpenAI, BaseURL: fastFallback.URL, APIKey: "k", Enabled: true,
+	})
+	_ = st.UpsertModelRoute(context.Background(), store.ModelRoute{
+		Alias:         "team/resilient",
+		ProviderName:  "primary",
+		UpstreamModel: "gpt-5",
+		Fallbacks:     []store.RouteTarget{{Provider: "fallback", Model: "gpt-4.1"}},
+		Enabled:       true,
+	})
+
+	var (
+		logMu   sync.Mutex
+		logMsgs []string
+	)
+	tel := &mockTelemetryFactory{}
+	gw, _ := NewGateway(GatewayConfig{
+		Store:     st,
+		Telemetry: tel,
+		Logf: func(format string, args ...any) {
+			logMu.Lock()
+			logMsgs = append(logMsgs, fmt.Sprintf(format, args...))
+			logMu.Unlock()
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"team/resilient","messages":[{"role":"user","content":"hi"}]}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from fallback, got %d", rec.Code)
+	}
+
+	last := tel.last()
+	if last.finish.LatencyMS < 75 {
+		t.Fatalf("expected total LatencyMS >= 75ms (including failed primary), got %dms", last.finish.LatencyMS)
+	}
+	if last.finish.TTFTMS >= last.finish.LatencyMS {
+		t.Fatalf("expected per-attempt TTFTMS (%dms) < total LatencyMS (%dms)", last.finish.TTFTMS, last.finish.LatencyMS)
+	}
+	logMu.Lock()
+	joinedLogs := strings.Join(logMsgs, "\n")
+	logMu.Unlock()
+	if !strings.Contains(joinedLogs, "primary/gpt-5") || !strings.Contains(joinedLogs, "HTTP 503") || !strings.Contains(joinedLogs, "fallback/gpt-4.1") {
+		t.Fatalf("expected fallback warning log, got: %q", joinedLogs)
+	}
+}
+
+func TestGeminiModelsExcludesNonGeminiAliases(t *testing.T) {
+	st := newTestStore(t)
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "anthropic", Type: config.ProviderTypeAnthropic, BaseURL: "http://127.0.0.1:1", Models: []string{"claude-sonnet-4-6"}, Enabled: true,
+	})
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "openai", Type: config.ProviderTypeOpenAI, BaseURL: "http://127.0.0.1:1", Models: []string{"gpt-4.1"}, Enabled: true,
+	})
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "gemini", Type: config.ProviderTypeGemini, BaseURL: "http://127.0.0.1:1", Models: []string{"gemini-2.5-flash"}, Enabled: true,
+	})
+	_ = st.UpsertModelRoute(context.Background(), store.ModelRoute{
+		Alias: "team/coding", ProviderName: "anthropic", UpstreamModel: "claude-sonnet-4-6",
+		Fallbacks: []store.RouteTarget{{Provider: "openai", Model: "gpt-4.1"}}, Enabled: true,
+	})
+	_ = st.UpsertModelRoute(context.Background(), store.ModelRoute{
+		Alias: "team/fast", ProviderName: "gemini", UpstreamModel: "gemini-2.5-flash",
+		Fallbacks: []store.RouteTarget{{Provider: "openai", Model: "gpt-4.1"}}, Enabled: true,
+	})
+
+	gw, _ := NewGateway(GatewayConfig{Store: st})
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, authedReq(http.MethodGet, "/gemini/v1beta/models", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /gemini/v1beta/models failed: %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "team/coding") {
+		t.Fatalf("Gemini model list must exclude non-Gemini alias team/coding: %s", body)
+	}
+	if !strings.Contains(body, "team/fast") || !strings.Contains(body, "gemini-2.5-flash") {
+		t.Fatalf("Gemini model list should include team/fast and gemini-2.5-flash: %s", body)
+	}
+}
+
+func TestAnthropicCountTokensFallbackAndDenyModels(t *testing.T) {
+	ant503 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"overloaded_error","message":"busy"}}`))
+	}))
+	defer ant503.Close()
+
+	antOK := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"input_tokens":77}`))
+	}))
+	defer antOK.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "openai", Type: config.ProviderTypeOpenAI, BaseURL: "http://127.0.0.1:1", APIKey: "k", Enabled: true,
+	})
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "ant1", Type: config.ProviderTypeAnthropic, BaseURL: ant503.URL, APIKey: "k1", Enabled: true,
+	})
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "ant2", Type: config.ProviderTypeAnthropic, BaseURL: antOK.URL, APIKey: "k2", Enabled: true,
+	})
+	// Primary is non-Anthropic (skipped), first Anthropic 503s (falls back), second Anthropic succeeds.
+	_ = st.UpsertModelRoute(context.Background(), store.ModelRoute{
+		Alias: "team/count", ProviderName: "openai", UpstreamModel: "gpt-4.1",
+		Fallbacks: []store.RouteTarget{
+			{Provider: "ant1", Model: "claude-sonnet-4-6"},
+			{Provider: "ant2", Model: "claude-sonnet-4-6"},
+		},
+		Enabled: true,
+	})
+
+	var logged string
+	gw, _ := NewGateway(GatewayConfig{
+		Store: st,
+		Logf:  func(f string, a ...any) { logged += fmt.Sprintf(f, a...) },
+	})
+
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, authedReq(http.MethodPost, "/anthropic/v1/messages/count_tokens", `{"model":"team/count","messages":[{"role":"user","content":"hi"}]}`))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"input_tokens":77`) {
+		t.Fatalf("count_tokens fallback failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(logged, "ant1/claude-sonnet-4-6") {
+		t.Fatalf("expected fallback log on count_tokens, got %q", logged)
+	}
+
+	// Now deny both Anthropic candidates via IsModelDenied -> expect 403.
+	gwDenied, _ := NewGateway(GatewayConfig{
+		Store: st,
+		Authorizer: &mockAuthorizer{
+			denyFn: func(_ *auth.Principal, model string) (bool, string) {
+				return strings.HasPrefix(model, "ant"), "anthropic denied"
+			},
+		},
+	})
+	recDenied := httptest.NewRecorder()
+	gwDenied.ServeHTTP(recDenied, authedReq(http.MethodPost, "/anthropic/v1/messages/count_tokens", `{"model":"team/count","messages":[{"role":"user","content":"hi"}]}`))
+	if recDenied.Code != http.StatusForbidden || !strings.Contains(recDenied.Body.String(), "anthropic denied") {
+		t.Fatalf("expected 403 when count_tokens candidates denied, got %d %s", recDenied.Code, recDenied.Body.String())
+	}
+}
+
+func TestAnthropicToOpenAICrossProtocolUsesMaxCompletionTokens(t *testing.T) {
+	var seenBody []byte
+	oaiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-o3","object":"chat.completion","model":"o3","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`))
+	}))
+	defer oaiSrv.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "openai", Type: config.ProviderTypeOpenAI, BaseURL: oaiSrv.URL, APIKey: "sk-oai", Models: []string{"o3"}, Enabled: true,
+	})
+	gw, _ := NewGateway(GatewayConfig{Store: st})
+
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, authedReq(http.MethodPost, "/anthropic/v1/messages", `{"model":"openai/o3","max_tokens":2048,"messages":[{"role":"user","content":"hi"}]}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(string(seenBody), `"max_completion_tokens":2048`) || strings.Contains(string(seenBody), `"max_tokens"`) {
+		t.Fatalf("expected max_completion_tokens=2048 (without max_tokens) for OpenAI upstream, got: %s", string(seenBody))
 	}
 }

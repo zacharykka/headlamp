@@ -53,33 +53,6 @@ type ModelRoute struct {
 	UpdatedAt                time.Time     `json:"updated_at"`
 }
 
-// Group represents a local gateway group and its members (user subjects or node tags).
-type Group struct {
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	Members     []string  `json:"members"`
-	Source      string    `json:"source"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
-}
-
-// Policy defines an authorization rule evaluated by the policy engine.
-type Policy struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	Subject       string    `json:"subject"`
-	Role          string    `json:"role"`
-	AllowModels   []string  `json:"allow_models"`
-	DenyModels    []string  `json:"deny_models"`
-	AllowMCPTools []string  `json:"allow_mcp_tools"`
-	DenyMCPTools  []string  `json:"deny_mcp_tools"`
-	Priority      int       `json:"priority"`
-	Enabled       bool      `json:"enabled"`
-	Source        string    `json:"source"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
-}
-
 // UsageLog records a single proxied LLM request for billing and telemetry.
 type UsageLog struct {
 	ID               string    `json:"id"`
@@ -147,7 +120,7 @@ type AuditPayload struct {
 	Redacted        bool              `json:"redacted"`
 }
 
-// Store defines Headlamp's M1 persistence interface.
+// Store defines Headlamp's persistence interface.
 type Store interface {
 	Close() error
 	Migrate(ctx context.Context) error
@@ -164,20 +137,6 @@ type Store interface {
 	GetModelRoute(ctx context.Context, alias string) (*ModelRoute, error)
 	ListModelRoutes(ctx context.Context) ([]ModelRoute, error)
 	DeleteModelRoute(ctx context.Context, alias string) error
-
-	// Groups & members
-	UpsertGroup(ctx context.Context, g Group) error
-	GetGroup(ctx context.Context, name string) (*Group, error)
-	ListGroups(ctx context.Context) ([]Group, error)
-	DeleteGroup(ctx context.Context, name string) error
-	SetGroupMembers(ctx context.Context, groupName string, members []string) error
-	ListGroupsForMember(ctx context.Context, members ...string) ([]string, error)
-
-	// Policies
-	UpsertPolicy(ctx context.Context, p Policy) error
-	GetPolicy(ctx context.Context, id string) (*Policy, error)
-	ListPolicies(ctx context.Context) ([]Policy, error)
-	DeletePolicy(ctx context.Context, id string) error
 
 	// Usage logs
 	InsertUsageLog(ctx context.Context, log UsageLog) error

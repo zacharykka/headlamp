@@ -28,41 +28,6 @@ CREATE TABLE IF NOT EXISTS model_routes (
 
 CREATE INDEX IF NOT EXISTS idx_model_routes_provider ON model_routes(provider_name);
 
-CREATE TABLE IF NOT EXISTS groups (
-    name TEXT PRIMARY KEY,
-    description TEXT NOT NULL DEFAULT '',
-    source TEXT NOT NULL DEFAULT 'local',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS group_members (
-    group_name TEXT NOT NULL REFERENCES groups(name) ON DELETE CASCADE,
-    member TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (group_name, member)
-);
-
-CREATE INDEX IF NOT EXISTS idx_group_members_member ON group_members(member);
-
-CREATE TABLE IF NOT EXISTS policies (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL DEFAULT '',
-    subject TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT '',
-    allow_models_json TEXT NOT NULL DEFAULT '[]',
-    deny_models_json TEXT NOT NULL DEFAULT '[]',
-    allow_mcp_tools_json TEXT NOT NULL DEFAULT '[]',
-    deny_mcp_tools_json TEXT NOT NULL DEFAULT '[]',
-    priority INTEGER NOT NULL DEFAULT 0,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    source TEXT NOT NULL DEFAULT 'local',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_policies_subject ON policies(subject);
-
 CREATE TABLE IF NOT EXISTS usage_logs (
     id TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,

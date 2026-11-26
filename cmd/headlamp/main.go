@@ -139,7 +139,7 @@ func runServe(args []string, _, stderr io.Writer) error {
 		}
 	}()
 
-	eval := policy.NewEvaluator(cfg.Policy, st)
+	eval := policy.NewEvaluator()
 
 	srv, err := netts.NewServer(cfg.Server, netts.WithUserLogf(logger.Printf))
 	if err != nil {
@@ -153,20 +153,27 @@ func runServe(args []string, _, stderr io.Writer) error {
 		return fmt.Errorf("start listeners: %w", err)
 	}
 
-	// Build auth chain AFTER srv.Start so srv.Authenticator() has an active WhoIs client.
-	authChain := buildAuthChain(cfg.Server, srv.Authenticator())
-
 	gw, err := proxy.NewGateway(proxy.GatewayConfig{
 		Store:      st,
 		Authorizer: eval,
 		Telemetry:  &telemetryAdapter{recorder: recorder},
+		Logf:       logger.Printf,
 	})
 	if err != nil {
 		_ = srv.Close(context.Background())
 		return fmt.Errorf("init proxy gateway: %w", err)
 	}
 
-	handler := buildHandler(gw, eval, authChain)
+	// P0-2 listener isolation:
+	// - Tailnet listener ONLY accepts Tailnet WhoIs identity (never static tokens or dev_mock).
+	// - Local listener ONLY uses static API tokens and/or loopback-restricted dev_mock.
+	var tailnetHandler, localHandler http.Handler
+	if cfg.Server.TSNet.Enabled {
+		tailnetHandler = buildHandler(gw, eval, srv.Authenticator())
+	}
+	if strings.TrimSpace(cfg.Server.LocalListen) != "" {
+		localHandler = buildHandler(gw, eval, buildLocalAuthChain(cfg.Server))
+	}
 
 	if addr := srv.TailnetAddr(); addr != "" {
 		logger.Printf("listening on tailnet %s (hostname=%s, tls=%s)", addr, cfg.Server.TSNet.Hostname, cfg.Server.TLS.Mode)
@@ -177,7 +184,7 @@ func runServe(args []string, _, stderr io.Writer) error {
 
 	serveErrCh := make(chan error, 1)
 	go func() {
-		serveErrCh <- srv.Serve(handler)
+		serveErrCh <- srv.ServeHandlers(tailnetHandler, localHandler)
 	}()
 
 	select {
@@ -335,34 +342,36 @@ func openStore(ctx context.Context, cfg *config.Config) (store.Store, bool, stri
 	return st, generated, keyPath, nil
 }
 
-func buildAuthChain(cfg config.ServerConfig, tsnetAuth auth.Authenticator) auth.Authenticator {
+// buildLocalAuthChain builds the authenticator chain for the optional local HTTP listener.
+// It NEVER runs on the Tailnet listener.
+func buildLocalAuthChain(cfg config.ServerConfig) auth.Authenticator {
 	var chain []auth.Authenticator
-	if tsnetAuth != nil {
-		chain = append(chain, tsnetAuth)
-	}
 	if len(cfg.APITokens) > 0 {
 		tokens := make([]auth.StaticToken, len(cfg.APITokens))
 		for i, t := range cfg.APITokens {
 			tokens[i] = auth.StaticToken{
-				Name:        t.Name,
-				Token:       t.Token,
-				Subject:     t.Subject,
-				DisplayName: t.DisplayName,
-				Groups:      t.Groups,
-				Roles:       t.Roles,
-				Tags:        t.Tags,
+				Name:          t.Name,
+				Token:         t.Token,
+				Subject:       t.Subject,
+				DisplayName:   t.DisplayName,
+				Roles:         t.Roles,
+				Tags:          t.Tags,
+				AllowModels:   t.AllowModels,
+				DenyModels:    t.DenyModels,
+				AllowMCPTools: t.AllowMCPTools,
+				DenyMCPTools:  t.DenyMCPTools,
 			}
 		}
 		// In dev_mode, allow placeholder vendor keys (e.g. "headlamp") to fall through to dev_mock.
 		chain = append(chain, auth.NewTokenAuthenticator(tokens, cfg.DevMode))
 	}
 	if cfg.DevMode {
-		chain = append(chain, auth.NewDevAuthenticator(cfg.DevUser, cfg.DevRoles))
+		chain = append(chain, auth.NewDevAuthenticator(cfg.DevUser, cfg.DevRoles, cfg.DevAllowHeaderOverride))
 	}
 	return auth.NewChainAuthenticator(chain...)
 }
 
-func buildHandler(gw http.Handler, eval *policy.Evaluator, authChain auth.Authenticator) http.Handler {
+func buildHandler(gw http.Handler, eval *policy.Evaluator, authenticator auth.Authenticator) http.Handler {
 	whoami := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -399,7 +408,7 @@ func buildHandler(gw http.Handler, eval *policy.Evaluator, authChain auth.Authen
 	authedMux.Handle("/whoami", whoami)
 	authedMux.Handle("/", gw)
 
-	protected := auth.Middleware(authChain, proxy.AuthErrorHandler)(authedMux)
+	protected := auth.Middleware(authenticator, proxy.AuthErrorHandler)(authedMux)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
@@ -459,6 +468,10 @@ func (o *observerAdapter) OnJSONResponse(body []byte) {
 	o.obs.OnJSONResponse(body)
 }
 
+func (o *observerAdapter) SetResponseHeaders(headers map[string]string) {
+	o.obs.SetResponseHeaders(headers)
+}
+
 func (o *observerAdapter) Finish(fin proxy.TelemetryFinish) {
 	o.obs.Finish(fin.StatusCode, fin.LatencyMS, fin.TTFTMS, fin.ErrorMessage)
 }
@@ -474,10 +487,11 @@ func flattenHeaders(h http.Header) map[string]string {
 	return out
 }
 
-const starterConfigTemplate = `# Headlamp starter configuration
-# Run locally in dev mode:
+const starterConfigTemplate = `# Headlamp starter configuration (grants-only authorization)
+# Run locally in loopback dev mode:
 #   headlamp serve -config headlamp.yaml
-# To join Headscale/Tailscale, set server.tsnet.enabled: true and provide control_url + HEADLAMP_AUTH_KEY.
+# To join Headscale v0.29+ / Tailscale, set server.tsnet.enabled: true, configure
+# control_url + HEADLAMP_AUTH_KEY, and define headlamp.dev/cap/gateway grants in Headscale.
 
 server:
   tsnet:
@@ -494,18 +508,15 @@ server:
   dev_roles:
     - admin
     - user
-
-policy:
-  mode: hybrid
-  bootstrap_admins:
-    - "dev@local"
-  rules:
-    - name: default-allow-all
-      subject: "*"
-      role: user
-      allow_models:
-        - "*"
-      priority: 10
+  dev_allow_header_override: false
+  # Optional fallback static API tokens for non-tailnet callers (e.g. CI):
+  # api_tokens:
+  #   - name: ci-runner
+  #     token: "${HEADLAMP_CI_TOKEN}"
+  #     subject: "tag:ci-runner"
+  #     roles: ["user"]
+  #     allow_models: ["openai/gpt-4.1*", "ollama/*"]
+  #     deny_models: ["openai/o3*"]
 
 storage:
   driver: sqlite
@@ -524,6 +535,7 @@ providers:
     base_url: "https://api.openai.com"
     api_key: "${OPENAI_API_KEY}"
     models:
+      - "gpt-5"
       - "gpt-4.1"
 
   - name: gemini
