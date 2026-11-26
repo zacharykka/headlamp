@@ -1253,38 +1253,147 @@ func TestPerAttemptTTFTAndFallbackWarningLog(t *testing.T) {
 	}
 }
 
-func TestGeminiModelsExcludesNonGeminiAliases(t *testing.T) {
+func TestModelListProtocolCompatibilityAndDenyFiltering(t *testing.T) {
 	st := newTestStore(t)
 	_ = st.UpsertProvider(context.Background(), store.Provider{
 		Name: "anthropic", Type: config.ProviderTypeAnthropic, BaseURL: "http://127.0.0.1:1", Models: []string{"claude-sonnet-4-6"}, Enabled: true,
 	})
 	_ = st.UpsertProvider(context.Background(), store.Provider{
-		Name: "openai", Type: config.ProviderTypeOpenAI, BaseURL: "http://127.0.0.1:1", Models: []string{"gpt-4.1"}, Enabled: true,
+		Name: "openai", Type: config.ProviderTypeOpenAI, BaseURL: "http://127.0.0.1:1", Models: []string{"gpt-4.1", "o3"}, Enabled: true,
+	})
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "ollama", Type: config.ProviderTypeOllama, BaseURL: "http://127.0.0.1:1", Models: []string{"qwen2.5-coder:32b"}, Enabled: true,
 	})
 	_ = st.UpsertProvider(context.Background(), store.Provider{
 		Name: "gemini", Type: config.ProviderTypeGemini, BaseURL: "http://127.0.0.1:1", Models: []string{"gemini-2.5-flash"}, Enabled: true,
 	})
+	// Anthropic + OpenAI fallback (compatible with OpenAI & Anthropic, incompatible with Gemini).
 	_ = st.UpsertModelRoute(context.Background(), store.ModelRoute{
 		Alias: "team/coding", ProviderName: "anthropic", UpstreamModel: "claude-sonnet-4-6",
 		Fallbacks: []store.RouteTarget{{Provider: "openai", Model: "gpt-4.1"}}, Enabled: true,
 	})
+	// Gemini primary + OpenAI fallback (compatible with Gemini, OpenAI, and Anthropic).
 	_ = st.UpsertModelRoute(context.Background(), store.ModelRoute{
 		Alias: "team/fast", ProviderName: "gemini", UpstreamModel: "gemini-2.5-flash",
 		Fallbacks: []store.RouteTarget{{Provider: "openai", Model: "gpt-4.1"}}, Enabled: true,
 	})
+	// Gemini-only alias (compatible ONLY with Gemini).
+	_ = st.UpsertModelRoute(context.Background(), store.ModelRoute{
+		Alias: "team/gemini-only", ProviderName: "gemini", UpstreamModel: "gemini-2.5-flash", Enabled: true,
+	})
+	// Alias whose only compatible OpenAI/Anthropic candidate is explicitly denied.
+	_ = st.UpsertModelRoute(context.Background(), store.ModelRoute{
+		Alias: "team/denied-o3", ProviderName: "openai", UpstreamModel: "o3", Enabled: true,
+	})
+	// Alias with Gemini primary (allowed) + denied OpenAI fallback -> visible on Gemini, hidden on OpenAI/Anthropic.
+	_ = st.UpsertModelRoute(context.Background(), store.ModelRoute{
+		Alias: "team/gem-plus-denied-o3", ProviderName: "gemini", UpstreamModel: "gemini-2.5-flash",
+		Fallbacks: []store.RouteTarget{{Provider: "openai", Model: "o3"}}, Enabled: true,
+	})
 
-	gw, _ := NewGateway(GatewayConfig{Store: st})
-	rec := httptest.NewRecorder()
-	gw.ServeHTTP(rec, authedReq(http.MethodGet, "/gemini/v1beta/models", ""))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /gemini/v1beta/models failed: %d", rec.Code)
+	authz := &mockAuthorizer{
+		filterFn: func(_ *auth.Principal, models []string) []string {
+			var out []string
+			for _, m := range models {
+				if m != "openai/o3" {
+					out = append(out, m)
+				}
+			}
+			return out
+		},
+		denyFn: func(_ *auth.Principal, model string) (bool, string) {
+			if model == "openai/o3" {
+				return true, "o3 denied"
+			}
+			return false, ""
+		},
 	}
-	body := rec.Body.String()
-	if strings.Contains(body, "team/coding") {
-		t.Fatalf("Gemini model list must exclude non-Gemini alias team/coding: %s", body)
+
+	gw, _ := NewGateway(GatewayConfig{Store: st, Authorizer: authz})
+
+	wantOpenAIAnthropic := []string{
+		"anthropic/claude-sonnet-4-6",
+		"ollama/qwen2.5-coder:32b",
+		"openai/gpt-4.1",
+		"team/coding",
+		"team/fast",
 	}
-	if !strings.Contains(body, "team/fast") || !strings.Contains(body, "gemini-2.5-flash") {
-		t.Fatalf("Gemini model list should include team/fast and gemini-2.5-flash: %s", body)
+
+	// 1. OpenAI endpoints (/v1/models and /openai/v1/models) exclude pure Gemini models,
+	// Gemini-only aliases, and aliases whose compatible candidates are all denied.
+	for _, path := range []string{"/v1/models", "/openai/v1/models"} {
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, authedReq(http.MethodGet, path, ""))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s failed: %d %s", path, rec.Code, rec.Body.String())
+		}
+		var resp struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		var got []string
+		for _, item := range resp.Data {
+			got = append(got, item.ID)
+		}
+		if !slices.Equal(got, wantOpenAIAnthropic) {
+			t.Fatalf("GET %s returned %v, want %v", path, got, wantOpenAIAnthropic)
+		}
+	}
+
+	// 2. Anthropic endpoint (/anthropic/v1/models) applies the exact same protocol & deny rules.
+	recAnth := httptest.NewRecorder()
+	gw.ServeHTTP(recAnth, authedReq(http.MethodGet, "/anthropic/v1/models", ""))
+	if recAnth.Code != http.StatusOK {
+		t.Fatalf("GET /anthropic/v1/models failed: %d", recAnth.Code)
+	}
+	var anthResp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recAnth.Body.Bytes(), &anthResp); err != nil {
+		t.Fatal(err)
+	}
+	var gotAnth []string
+	for _, item := range anthResp.Data {
+		gotAnth = append(gotAnth, item.ID)
+	}
+	if !slices.Equal(gotAnth, wantOpenAIAnthropic) {
+		t.Fatalf("GET /anthropic/v1/models returned %v, want %v", gotAnth, wantOpenAIAnthropic)
+	}
+
+	// 3. Gemini endpoint (/gemini/v1beta/models) includes Gemini models and aliases with >=1
+	// non-denied Gemini candidate, and excludes OpenAI/Anthropic/Ollama-only models & aliases.
+	recGem := httptest.NewRecorder()
+	gw.ServeHTTP(recGem, authedReq(http.MethodGet, "/gemini/v1beta/models", ""))
+	if recGem.Code != http.StatusOK {
+		t.Fatalf("GET /gemini/v1beta/models failed: %d", recGem.Code)
+	}
+	var gemResp struct {
+		Models []struct {
+			Name        string `json:"name"`
+			DisplayName string `json:"displayName"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(recGem.Body.Bytes(), &gemResp); err != nil {
+		t.Fatal(err)
+	}
+	var gotGem []string
+	for _, item := range gemResp.Models {
+		gotGem = append(gotGem, item.DisplayName)
+	}
+	wantGem := []string{
+		"gemini/gemini-2.5-flash",
+		"team/fast",
+		"team/gem-plus-denied-o3",
+		"team/gemini-only",
+	}
+	if !slices.Equal(gotGem, wantGem) {
+		t.Fatalf("GET /gemini/v1beta/models returned %v, want %v", gotGem, wantGem)
 	}
 }
 

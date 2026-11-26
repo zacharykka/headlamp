@@ -30,11 +30,11 @@ type resolvedRoute struct {
 }
 
 type catalogModel struct {
-	ID                 string
-	ProviderName       string
-	ProviderType       string
-	IsAlias            bool
-	HasGeminiCandidate bool
+	ID           string
+	ProviderName string
+	ProviderType string
+	IsAlias      bool
+	Candidates   []routeCandidate
 }
 
 // resolveRoute resolves requestedModel against enabled store routes and providers.
@@ -238,30 +238,16 @@ func listCatalogModels(ctx context.Context, st store.Store) ([]catalogModel, err
 		if !r.Enabled || r.Alias == "" {
 			continue
 		}
-		var (
-			p                  store.Provider
-			ok                 bool
-			hasGeminiCandidate bool
-		)
+		var cands []routeCandidate
 		if primary, exists := byName[r.ProviderName]; exists {
-			p = primary
-			ok = true
-			if primary.Type == config.ProviderTypeGemini {
-				hasGeminiCandidate = true
-			}
+			cands = append(cands, routeCandidate{provider: primary, upstreamModel: r.UpstreamModel})
 		}
 		for _, fb := range r.Fallbacks {
 			if fp, exists := byName[fb.Provider]; exists {
-				if !ok {
-					p = fp
-					ok = true
-				}
-				if fp.Type == config.ProviderTypeGemini {
-					hasGeminiCandidate = true
-				}
+				cands = append(cands, routeCandidate{provider: fp, upstreamModel: fb.Model})
 			}
 		}
-		if !ok {
+		if len(cands) == 0 {
 			continue
 		}
 		if _, dup := seen[r.Alias]; dup {
@@ -269,11 +255,11 @@ func listCatalogModels(ctx context.Context, st store.Store) ([]catalogModel, err
 		}
 		seen[r.Alias] = struct{}{}
 		catalog = append(catalog, catalogModel{
-			ID:                 r.Alias,
-			ProviderName:       p.Name,
-			ProviderType:       p.Type,
-			IsAlias:            true,
-			HasGeminiCandidate: hasGeminiCandidate,
+			ID:           r.Alias,
+			ProviderName: cands[0].provider.Name,
+			ProviderType: cands[0].provider.Type,
+			IsAlias:      true,
+			Candidates:   cands,
 		})
 	}
 
@@ -292,10 +278,10 @@ func listCatalogModels(ctx context.Context, st store.Store) ([]catalogModel, err
 			}
 			seen[id] = struct{}{}
 			catalog = append(catalog, catalogModel{
-				ID:                 id,
-				ProviderName:       p.Name,
-				ProviderType:       p.Type,
-				HasGeminiCandidate: p.Type == config.ProviderTypeGemini,
+				ID:           id,
+				ProviderName: p.Name,
+				ProviderType: p.Type,
+				Candidates:   []routeCandidate{{provider: p, upstreamModel: m}},
 			})
 		}
 	}

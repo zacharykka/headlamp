@@ -184,6 +184,38 @@ func (g *Gateway) makeModelsHandler(protocol string) http.HandlerFunc {
 			}
 		}
 
+		// Advertise only models with at least one protocol-compatible, non-denied candidate.
+		eligible := make([]string, 0, len(ids))
+		for _, id := range ids {
+			m, exists := byID[id]
+			if !exists {
+				continue
+			}
+			hasUsableCandidate := false
+			for _, cand := range m.Candidates {
+				if !isNativeProtocolMatch(protocol, cand.provider.Type) && !canTranslateProtocol(protocol, cand.provider.Type) {
+					continue
+				}
+				if m.IsAlias && g.authorizer != nil {
+					candModel := cand.provider.Name + "/" + cand.upstreamModel
+					denied, _, denyErr := g.authorizer.IsModelDenied(r.Context(), principal, candModel)
+					if denyErr != nil {
+						WriteError(w, protocol, http.StatusInternalServerError, "server_error", "failed to authorize model list")
+						return
+					}
+					if denied {
+						continue
+					}
+				}
+				hasUsableCandidate = true
+				break
+			}
+			if hasUsableCandidate {
+				eligible = append(eligible, id)
+			}
+		}
+		ids = eligible
+
 		w.Header().Set("Content-Type", "application/json")
 		switch protocol {
 		case ProtocolAnthropicMessages:
@@ -220,9 +252,6 @@ func (g *Gateway) makeModelsHandler(protocol string) http.HandlerFunc {
 			items := make([]geminiModelItem, 0, len(ids))
 			for _, id := range ids {
 				m := byID[id]
-				if !m.HasGeminiCandidate {
-					continue
-				}
 				name := id
 				if _, after, ok := strings.Cut(id, "/"); ok && !m.IsAlias {
 					name = after
