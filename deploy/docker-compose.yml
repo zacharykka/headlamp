@@ -1,0 +1,36 @@
+services:
+  headlamp:
+    image: ghcr.io/zacharykka/headlamp:latest
+    # To build from local source instead of pulling GHCR:
+    # build:
+    #   context: ..
+    #   dockerfile: deploy/Dockerfile
+    container_name: headlamp
+    restart: unless-stopped
+    env_file:
+      - ./headlamp.env
+    environment:
+      HEADLAMP_CONFIG: /etc/headlamp/headlamp.yaml
+      HEADLAMP_STATE_DIR: /data
+      HEADLAMP_STORAGE_DRIVER: sqlite
+      HEADLAMP_STORAGE_DSN: /data/headlamp.db
+      # Optional local HTTP listener (bind only to 127.0.0.1 below; NEVER set HEADLAMP_DEV_MODE=true in Docker):
+      # HEADLAMP_LOCAL_LISTEN: 0.0.0.0:8080
+    # ports:
+    #   - "127.0.0.1:8080:8080"
+    volumes:
+      # Copy ../headlamp.example.yaml to ./headlamp.yaml before starting.
+      - ./headlamp.yaml:/etc/headlamp/headlamp.yaml:ro
+      # Named volume is initialized with UID/GID 65532:65532 from the distroless image.
+      # If you switch to a host bind mount (e.g. ./data:/data), run: chown -R 65532:65532 ./data
+      - headlamp_data:/data
+    tmpfs:
+      - /tmp
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  headlamp_data:

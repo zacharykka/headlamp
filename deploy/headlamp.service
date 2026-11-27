@@ -1,0 +1,37 @@
+[Unit]
+Description=Headlamp Private AI Gateway
+Documentation=https://github.com/zacharykka/headlamp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=headlamp
+Group=headlamp
+WorkingDirectory=/var/lib/headlamp
+StateDirectory=headlamp
+StateDirectoryMode=0700
+EnvironmentFile=/etc/headlamp/headlamp.env
+ExecStart=/usr/local/bin/headlamp serve -config /etc/headlamp/headlamp.yaml
+Restart=on-failure
+RestartSec=5s
+# Raise to 360s (and/or set HEADLAMP_STARTUP_TIMEOUT=5m) when using acme_dns01 TLS.
+TimeoutStartSec=120s
+LimitNOFILE=65536
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/headlamp
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target

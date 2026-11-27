@@ -51,6 +51,16 @@ Common environment overrides:
 | `HEADLAMP_TLS_DNS_WEBHOOK_URL` | Custom DNS-01 webhook endpoint URL |
 | `HEADLAMP_STARTUP_TIMEOUT` | Listener/tsnet/ACME startup timeout override (e.g. `3m`; defaults to `5m` for `acme_dns01`, `60s` otherwise) |
 
+## Deployment (Docker Compose & systemd)
+
+Ready-to-use production deployment templates are provided in `deploy/`:
+
+- **Docker Compose (SQLite)**: [`deploy/docker-compose.yml`](deploy/docker-compose.yml) + [`deploy/headlamp.env.example`](deploy/headlamp.env.example) using `ghcr.io/zacharykka/headlamp:latest` (`nonroot`, `read_only`, no `/dev/net/tun` required).
+- **Docker Compose (PostgreSQL 17)**: [`deploy/docker-compose.postgres.yml`](deploy/docker-compose.postgres.yml) with healthchecked PostgreSQL 17.
+- **Linux Binary + `systemd`**: Download static `linux_amd64` / `linux_arm64` binaries from GitHub Releases and manage them with [`deploy/headlamp.service`](deploy/headlamp.service).
+
+See [`docs/deployment.md`](docs/deployment.md) for the step-by-step deployment, upgrade, and backup guide.
+
 ## Client Quickstart
 
 Once Headlamp is running on your tailnet (e.g. hostname `headlamp`):
@@ -140,6 +150,6 @@ headlamp/
 │   ├── store/          # Store interface, pure-Go SQLite & PostgreSQL (pgx/v5) drivers + migrations
 │   └── translate/      # On-demand cross-protocol request & SSE translation
 ├── web/                # Embedded React + TypeScript + Vite dashboard & Team Web Chat SPA
-├── deploy/             # Multi-stage static Dockerfile (Node web build + Go binary)
-└── docs/               # Client recipes (docs/clients.md), Headscale v0.29.7 guide & specs
+├── deploy/             # Dockerfile, Docker Compose (SQLite & PostgreSQL), env template & systemd unit
+└── docs/               # Deployment guide, client recipes, Headscale v0.29.7 guide & specs (EN / zh-CN)
 ```

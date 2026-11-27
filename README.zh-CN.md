@@ -51,6 +51,16 @@ export OPENAI_API_KEY="sk-..."
 | `HEADLAMP_TLS_DNS_WEBHOOK_URL` | 自定义 DNS-01 Webhook 接口地址 |
 | `HEADLAMP_STARTUP_TIMEOUT` | 监听器 / `tsnet` / ACME 启动超时覆盖值（例如 `3m`；`acme_dns01` 默认 `5m`，其余模式默认 `60s`） |
 
+## 生产部署（Docker Compose 与 systemd 二进制）
+
+`deploy/` 目录下提供了开箱即用的生产部署模板：
+
+- **Docker Compose（SQLite）**：[`deploy/docker-compose.yml`](deploy/docker-compose.yml) 与 [`deploy/headlamp.env.example`](deploy/headlamp.env.example)，基于 GHCR `nonroot` 只读容器镜像，无需 `/dev/net/tun`。
+- **Docker Compose（PostgreSQL 17）**：[`deploy/docker-compose.postgres.yml`](deploy/docker-compose.postgres.yml)，内置带健康检查的 PostgreSQL 17 服务。
+- **Linux 静态二进制 + `systemd`**：从 GitHub Releases 下载 `linux_amd64` / `linux_arm64` 静态二进制文件，并通过 [`deploy/headlamp.service`](deploy/headlamp.service) 托管运行。
+
+完整部署、升级与备份恢复步骤请参阅 [`docs/deployment.zh-CN.md`](docs/deployment.zh-CN.md)。
+
 ## 客户端快速开始
 
 Headlamp 在 tailnet 上启动并运行后（例如主机名为 `headlamp`）：
@@ -140,6 +150,6 @@ headlamp/
 │   ├── store/          # 存储接口、纯 Go SQLite 与 PostgreSQL（pgx/v5）驱动及迁移
 │   └── translate/      # 按需跨协议请求与 SSE 流式响应转换
 ├── web/                # 内嵌的 React + TypeScript + Vite 管理控制台与团队 Web 对话 SPA
-├── deploy/             # 多阶段静态 Dockerfile（Node 前端构建 + Go 二进制）
-└── docs/               # 客户端配置示例（docs/clients.zh-CN.md）、Headscale v0.29.7 指南与规范文档
+├── deploy/             # Dockerfile、Docker Compose（SQLite 与 PostgreSQL）、环境变量模板与 systemd 单元文件
+└── docs/               # 生产部署指南、客户端配置示例、Headscale v0.29.7 指南与规范文档（EN / zh-CN）
 ```
