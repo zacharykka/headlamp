@@ -20,6 +20,7 @@ import (
 	"github.com/zacharykka/headlamp/internal/auth"
 	"github.com/zacharykka/headlamp/internal/config"
 	"github.com/zacharykka/headlamp/internal/crypto"
+	"github.com/zacharykka/headlamp/internal/guardrail"
 	"github.com/zacharykka/headlamp/internal/metering"
 	"github.com/zacharykka/headlamp/internal/policy"
 	"github.com/zacharykka/headlamp/internal/proxy"
@@ -934,13 +935,15 @@ func TestService_GuardrailPreCheckBlockRedactAndRound0Rollback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 1. Blocked message must NOT hit gateway, must NOT persist to chat_messages, and must NOT pollute session title.
+	// 1. Blocked message must NOT persist to chat_messages, must NOT pollute session title,
+	// and even if a custom test gateway returns 200 without guardrails, defense-in-depth still
+	// discards the stream and emits guardrail_blocked SSE error.
 	rec1 := httptest.NewRecorder()
 	if err := svc.StreamMessage(ctx, rec1, alice, sess.ID, SendMessageRequest{Content: "My key is BLOCK_SECRET"}); err != nil {
 		t.Fatalf("StreamMessage(block) returned error: %v", err)
 	}
-	if gatewayCalls.Load() != 0 {
-		t.Fatalf("blocked message must not invoke gateway, got %d calls", gatewayCalls.Load())
+	if gatewayCalls.Load() != 1 {
+		t.Fatalf("expected Round-0 gateway dispatch for guardrail telemetry/webhook, got %d calls", gatewayCalls.Load())
 	}
 	events1 := parseSSEFrames(t, rec1.Body.Bytes())
 	if len(events1) != 1 || events1[0].Event != "error" || !strings.Contains(string(events1[0].Data), "detected prohibited API key") {
@@ -976,7 +979,8 @@ func TestService_GuardrailPreCheckBlockRedactAndRound0Rollback(t *testing.T) {
 		t.Fatalf("expected SSE error from sync_review block, got %+v", events2)
 	}
 
-	// 3. Redacted message persists redacted text and forwards redacted text to gateway (and session is NOT poisoned!).
+	// 3. Redacted message persists redacted text in chat_messages and session.Title, while
+	// Round 0 dispatches raw text to proxy.Gateway so guardrail.Engine logs & fires webhooks once.
 	forceStatus.Store(0)
 	// Reset title to verify auto-title uses redacted text.
 	sess.Title = "New Chat"
@@ -993,12 +997,493 @@ func TestService_GuardrailPreCheckBlockRedactAndRound0Rollback(t *testing.T) {
 	if msgs[0].Content != "Help with [REDACTED] please" {
 		t.Errorf("persisted user content = %q, want redacted content", msgs[0].Content)
 	}
-	if strings.Contains(lastGatewayBody.Load().(string), "REDACT_PII") {
-		t.Errorf("gateway received raw secret instead of redacted text: %s", lastGatewayBody.Load().(string))
+	if !strings.Contains(lastGatewayBody.Load().(string), "REDACT_PII") {
+		t.Errorf("expected Round 0 to pass raw user text into proxy.Gateway for guardrail telemetry/webhook, got: %s", lastGatewayBody.Load().(string))
 	}
 	sessAfterRedact, _ := st.GetChatSession(ctx, alice.Subject, sess.ID)
 	if strings.Contains(sessAfterRedact.Title, "REDACT_PII") {
 		t.Errorf("session title leaked unredacted secret: %q", sessAfterRedact.Title)
+	}
+}
+
+type realTelemetryAdapter struct {
+	recorder *metering.Recorder
+}
+
+func (a realTelemetryAdapter) Start(ctx context.Context, info proxy.TelemetryStart) proxy.StreamObserver {
+	obs := a.recorder.Start(ctx, metering.RequestInfo{
+		RequestID:       info.RequestID,
+		Timestamp:       info.Timestamp,
+		Principal:       info.Principal,
+		Protocol:        info.Protocol,
+		Endpoint:        info.Endpoint,
+		Provider:        info.Provider,
+		ProviderType:    info.ProviderType,
+		RequestedModel:  info.RequestedModel,
+		UpstreamModel:   info.UpstreamModel,
+		Stream:          info.Stream,
+		Translated:      info.Translated,
+		RequestBody:     info.RequestBody,
+		GuardrailAction: info.GuardrailAction,
+		GuardrailHits:   info.GuardrailHits,
+	})
+	return realObserverAdapter{obs: obs, protocol: info.Protocol}
+}
+
+type realObserverAdapter struct {
+	obs      *metering.RequestObserver
+	protocol string
+}
+
+func (o realObserverAdapter) OnSSEEvent(eventName string, data []byte) {
+	o.obs.OnSSEEvent(eventName, data)
+}
+func (o realObserverAdapter) OnJSONResponse(body []byte) { o.obs.OnJSONResponse(body) }
+func (o realObserverAdapter) SetResponseHeaders(h map[string]string) {
+	o.obs.SetResponseHeaders(h)
+}
+func (o realObserverAdapter) TotalTokens() int64 { return o.obs.Usage().NormalizedTotal(o.protocol) }
+func (o realObserverAdapter) Finish(fin proxy.TelemetryFinish) {
+	o.obs.Finish(fin.StatusCode, fin.LatencyMS, fin.TTFTMS, fin.ErrorMessage)
+}
+
+type realProxyGuardrailAdapter struct {
+	engine *guardrail.Engine
+}
+
+func (a realProxyGuardrailAdapter) Inspect(ctx context.Context, req proxy.GuardrailRequest) (*proxy.GuardrailDecision, error) {
+	in := guardrail.InspectInput{
+		RequestID: req.RequestID,
+		Protocol:  req.Protocol,
+		Model:     req.Model,
+		Body:      req.Body,
+	}
+	if req.Principal != nil {
+		in.Subject = req.Principal.Subject
+		in.NodeName = req.Principal.NodeName
+	}
+	dec, err := a.engine.InspectRequest(ctx, in)
+	if err != nil || dec == nil {
+		return nil, err
+	}
+	return &proxy.GuardrailDecision{
+		Action:       dec.Action,
+		ModifiedBody: dec.ModifiedBody,
+		Hits:         dec.Hits,
+		Reason:       dec.Reason,
+		StatusCode:   dec.StatusCode,
+	}, nil
+}
+
+type realChatGuardrailAdapter struct {
+	engine *guardrail.Engine
+}
+
+func (a realChatGuardrailAdapter) InspectText(ctx context.Context, text string) (action, redacted, reason string, err error) {
+	res, err := a.engine.TestText(ctx, text)
+	if err != nil || res == nil {
+		return "", text, "", err
+	}
+	if res.Action == guardrail.ActionBlock {
+		var blocked []string
+		for _, m := range res.Matches {
+			if m.Action == guardrail.ActionBlock && m.RuleName != "" {
+				blocked = append(blocked, m.RuleName)
+			}
+		}
+		if len(blocked) > 0 {
+			reason = "blocked by guardrail rule: " + strings.Join(blocked, ", ")
+		} else {
+			reason = "blocked by guardrail policy"
+		}
+	}
+	return res.Action, res.RedactedText, reason, nil
+}
+
+func TestService_GuardrailRealEngineBlockAndRedactTelemetryAndWebhook(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	if err := st.SetAuditSettings(ctx, store.AuditSettings{
+		StorePayloads: true,
+		RetentionDays: 7,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Capture guardrail.triggered async webhook deliveries.
+	type webhookEvent struct {
+		Event string         `json:"event"`
+		Data  map[string]any `json:"data"`
+	}
+	var (
+		whMu     sync.Mutex
+		whEvents []webhookEvent
+		whSignal = make(chan struct{}, 16)
+	)
+	webhookSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var env webhookEvent
+		if err := json.NewDecoder(r.Body).Decode(&env); err == nil {
+			whMu.Lock()
+			whEvents = append(whEvents, env)
+			whMu.Unlock()
+			select {
+			case whSignal <- struct{}{}:
+			default:
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhookSrv.Close()
+
+	if err := st.UpsertWebhook(ctx, store.Webhook{
+		ID:        "wh-guardrail",
+		Name:      "Guardrail Alert",
+		URL:       webhookSrv.URL,
+		Type:      config.WebhookTypeAsyncEvent,
+		Events:    []string{config.WebhookEventGuardrailTriggered},
+		TimeoutMS: 2000,
+		Enabled:   true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Configure explicit block and redact rules.
+	for _, rule := range []store.GuardrailRule{
+		{
+			ID:       "rule-block-token",
+			Name:     "Block Secret Token",
+			Category: "secret",
+			Pattern:  `SUPERSECRET_[A-Z0-9]{8}`,
+			Action:   guardrail.ActionBlock,
+			Enabled:  true,
+		},
+		{
+			ID:       "rule-redact-pii",
+			Name:     "Redact Internal ID",
+			Category: "pii",
+			Pattern:  `EMP-[0-9]{6}`,
+			Action:   guardrail.ActionRedact,
+			Enabled:  true,
+		},
+	} {
+		if err := st.UpsertGuardrailRule(ctx, rule); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Fake upstream OpenAI (supports 2-round tool call to verify Round 1+ doesn't double-fire webhooks)
+	// and fake upstream Gemini.
+	var (
+		upstreamMu         sync.Mutex
+		openAIBodies       []string
+		geminiBodies       []string
+		openAIRoundCounter atomic.Int32
+	)
+	fakeOpenAI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		upstreamMu.Lock()
+		openAIBodies = append(openAIBodies, string(raw))
+		upstreamMu.Unlock()
+
+		var req struct {
+			Tools []map[string]any `json:"tools"`
+		}
+		_ = json.Unmarshal(raw, &req)
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		round := openAIRoundCounter.Add(1)
+		if round == 1 && len(req.Tools) > 0 {
+			fnName := req.Tools[0]["function"].(map[string]any)["name"].(string)
+			_, _ = fmt.Fprintf(w, "data: {\"id\":\"cmpl-r1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_gr1\",\"type\":\"function\",\"function\":{\"name\":%q,\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":10,\"total_tokens\":30}}\n\n", fnName)
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"id\":\"cmpl-r2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Redacted turn succeeded.\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":10,\"total_tokens\":40}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer fakeOpenAI.Close()
+
+	fakeGemini := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		upstreamMu.Lock()
+		geminiBodies = append(geminiBodies, string(raw))
+		upstreamMu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Gemini redacted reply.\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":25,\"candidatesTokenCount\":8,\"totalTokenCount\":33}}\n\n")
+	}))
+	defer fakeGemini.Close()
+
+	for _, prov := range []store.Provider{
+		{Name: "openai", Type: config.ProviderTypeOpenAI, BaseURL: fakeOpenAI.URL, APIKey: "sk-test", Models: []string{"gpt-4.1"}, Enabled: true},
+		{Name: "gemini", Type: config.ProviderTypeGemini, BaseURL: fakeGemini.URL, APIKey: "gem-test", Models: []string{"gemini-2.5-flash"}, Enabled: true},
+	} {
+		if err := st.UpsertProvider(ctx, prov); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	grEngine, err := guardrail.NewEngine(guardrail.EngineConfig{
+		Store:         st,
+		BlockLoopback: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = grEngine.Close(context.Background()) }()
+
+	pricing, err := metering.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := metering.NewRecorder(st, config.AuditConfig{
+		StorePayloads: true,
+		RetentionDays: 7,
+	}, pricing)
+	defer func() { _ = recorder.Close(context.Background()) }()
+
+	ev := policy.NewEvaluator()
+	gw, err := proxy.NewGateway(proxy.GatewayConfig{
+		Store:      st,
+		Authorizer: ev,
+		Telemetry:  realTelemetryAdapter{recorder: recorder},
+		Guardrails: realProxyGuardrailAdapter{engine: grEngine},
+		Events:     grEngine,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mcpMock := &mockMCPBridge{
+		servers: []ServerTools{{
+			Name:    "hr",
+			Enabled: true,
+			Tools: []ToolSpec{{
+				Server:      "hr",
+				Name:        "lookup",
+				Description: "Lookup directory",
+				InputSchema: json.RawMessage(`{"type":"object","properties":{}}`),
+			}},
+		}},
+	}
+
+	svc, err := NewService(Config{
+		Store:      st,
+		Authorizer: ev,
+		Gateway:    gw,
+		MCP:        mcpMock,
+		Guardrails: realChatGuardrailAdapter{engine: grEngine},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitForWebhooks := func(wantCount int) []webhookEvent {
+		t.Helper()
+		deadline := time.After(3 * time.Second)
+		for {
+			whMu.Lock()
+			got := len(whEvents)
+			snap := slices.Clone(whEvents)
+			whMu.Unlock()
+			if got >= wantCount {
+				return snap
+			}
+			select {
+			case <-whSignal:
+			case <-deadline:
+				t.Fatalf("timed out waiting for %d webhook events, got %d: %+v", wantCount, got, snap)
+			}
+		}
+	}
+
+	alice := makePrincipal("alice@example.com", []string{"*"}, nil)
+
+	// --- Case 1: BLOCK on OpenAI path ---
+	blockSess, err := st.CreateChatSession(ctx, store.ChatSession{
+		ID:      "sess-gr-block",
+		Subject: alice.Subject,
+		Title:   "New Chat",
+		Model:   "openai/gpt-4.1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recBlock := httptest.NewRecorder()
+	if err := svc.StreamMessage(ctx, recBlock, alice, blockSess.ID, SendMessageRequest{
+		Content: "Leak SUPERSECRET_ABCD1234 please",
+	}); err != nil {
+		t.Fatalf("StreamMessage(block) failed: %v", err)
+	}
+
+	// Verify SSE error event has type guardrail_blocked and no message_start.
+	blockEvents := parseSSEFrames(t, recBlock.Body.Bytes())
+	if len(blockEvents) != 1 || blockEvents[0].Event != "error" || !strings.Contains(string(blockEvents[0].Data), `"type":"guardrail_blocked"`) {
+		t.Fatalf("expected single guardrail_blocked SSE error, got %+v", blockEvents)
+	}
+
+	// Zero rows in chat_messages, session title untouched, zero calls to upstream OpenAI.
+	if msgs, _ := st.ListChatMessages(ctx, alice.Subject, blockSess.ID); len(msgs) != 0 {
+		t.Fatalf("expected 0 chat_messages on block, got %d", len(msgs))
+	}
+	if sAfter, _ := st.GetChatSession(ctx, alice.Subject, blockSess.ID); sAfter.Title != "New Chat" {
+		t.Fatalf("session title mutated on block: %q", sAfter.Title)
+	}
+	upstreamMu.Lock()
+	if len(openAIBodies) != 0 {
+		t.Fatalf("blocked prompt reached upstream LLM! calls=%d", len(openAIBodies))
+	}
+	upstreamMu.Unlock()
+
+	waitForUsageLogs := func(wantCount int) []store.UsageLog {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			logs, err := st.QueryUsageLogs(ctx, store.UsageFilter{Subject: alice.Subject, GuardrailOnly: true})
+			if err == nil && len(logs) >= wantCount {
+				return logs
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %d guardrail usage_logs, got %d (err=%v)", wantCount, len(logs), err)
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+	}
+
+	// Webhook fired ONCE with action=block, usage_logs recorded block + hits, audit_payloads stored scrubbed stub.
+	whAfterBlock := waitForWebhooks(1)
+	if len(whAfterBlock) != 1 || whAfterBlock[0].Event != config.WebhookEventGuardrailTriggered || whAfterBlock[0].Data["action"] != guardrail.ActionBlock {
+		t.Fatalf("unexpected webhook after block: %+v", whAfterBlock)
+	}
+	usageLogs := waitForUsageLogs(1)
+	if len(usageLogs) != 1 {
+		t.Fatalf("expected 1 guardrail usage_log after block, got %d", len(usageLogs))
+	}
+	if usageLogs[0].GuardrailAction != guardrail.ActionBlock || !slices.Contains(usageLogs[0].GuardrailHits, "rule-block-token") {
+		t.Errorf("unexpected block usage_log: action=%q hits=%v", usageLogs[0].GuardrailAction, usageLogs[0].GuardrailHits)
+	}
+	auditPayload, err := st.GetAuditPayloadByUsageLogID(ctx, usageLogs[0].ID)
+	if err != nil || auditPayload == nil || auditPayload.RequestBody != "[BLOCKED BY GUARDRAIL]" {
+		t.Fatalf("expected [BLOCKED BY GUARDRAIL] audit payload stub, got %+v (err=%v)", auditPayload, err)
+	}
+
+	// --- Case 2: REDACT on OpenAI path with 2-round MCP tool call ---
+	redactSess, err := st.CreateChatSession(ctx, store.ChatSession{
+		ID:         "sess-gr-redact",
+		Subject:    alice.Subject,
+		Title:      "New Chat",
+		Model:      "openai/gpt-4.1",
+		MCPServers: []string{"hr"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recRedact := httptest.NewRecorder()
+	if err := svc.StreamMessage(ctx, recRedact, alice, redactSess.ID, SendMessageRequest{
+		Content: "Check employee EMP-123456 status",
+	}); err != nil {
+		t.Fatalf("StreamMessage(redact) failed: %v", err)
+	}
+
+	// Persisted user message & session title must be redacted (no raw EMP-123456).
+	redactMsgs, err := st.ListChatMessages(ctx, alice.Subject, redactSess.ID)
+	if err != nil || len(redactMsgs) != 2 {
+		t.Fatalf("expected 2 chat_messages on redact turn, got %d (err=%v)", len(redactMsgs), err)
+	}
+	if strings.Contains(redactMsgs[0].Content, "EMP-123456") || !strings.Contains(redactMsgs[0].Content, "[REDACTED:") {
+		t.Errorf("persisted user message not redacted: %q", redactMsgs[0].Content)
+	}
+	if sAfter, _ := st.GetChatSession(ctx, alice.Subject, redactSess.ID); strings.Contains(sAfter.Title, "EMP-123456") {
+		t.Errorf("session title leaked raw secret: %q", sAfter.Title)
+	}
+
+	// Upstream OpenAI saw 2 rounds (tool call + final synthesis) and NEVER saw raw EMP-123456.
+	upstreamMu.Lock()
+	if len(openAIBodies) != 2 {
+		t.Fatalf("expected 2 upstream OpenAI rounds, got %d", len(openAIBodies))
+	}
+	for i, body := range openAIBodies {
+		if strings.Contains(body, "EMP-123456") {
+			t.Fatalf("upstream OpenAI round %d leaked raw secret: %s", i, body)
+		}
+		if !strings.Contains(body, "[REDACTED:") {
+			t.Fatalf("upstream OpenAI round %d missing redacted marker: %s", i, body)
+		}
+	}
+	upstreamMu.Unlock()
+
+	// Webhook fired ONLY ONCE for the 2-round redacted turn (total webhooks == 2: 1 block + 1 redact).
+	whAfterRedact := waitForWebhooks(2)
+	// Brief wait to ensure Round 1 did not emit a duplicate webhook.
+	time.Sleep(50 * time.Millisecond)
+	whMu.Lock()
+	totalWH := len(whEvents)
+	whMu.Unlock()
+	if totalWH != 2 || whAfterRedact[1].Data["action"] != guardrail.ActionRedact {
+		t.Fatalf("expected exactly 2 total webhooks (1 block, 1 redact), got %d: %+v", totalWH, whAfterRedact)
+	}
+
+	usageLogs = waitForUsageLogs(2)
+	if len(usageLogs) != 2 {
+		t.Fatalf("expected 2 guardrail usage_logs (1 block + 1 redact), got %d", len(usageLogs))
+	}
+	foundRedactUsage := false
+	for _, u := range usageLogs {
+		if u.GuardrailAction == guardrail.ActionRedact && slices.Contains(u.GuardrailHits, "rule-redact-pii") {
+			foundRedactUsage = true
+		}
+	}
+	if !foundRedactUsage {
+		t.Fatalf("missing redact usage_log with hit rule-redact-pii: %+v", usageLogs)
+	}
+
+	// --- Case 3: BLOCK + REDACT on pure Gemini path ---
+	gemSess, err := st.CreateChatSession(ctx, store.ChatSession{
+		ID:      "sess-gr-gemini",
+		Subject: alice.Subject,
+		Title:   "New Chat",
+		Model:   "gemini/gemini-2.5-flash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recGemBlock := httptest.NewRecorder()
+	if err := svc.StreamMessage(ctx, recGemBlock, alice, gemSess.ID, SendMessageRequest{
+		Content: "Gemini SUPERSECRET_WXYZ9876",
+	}); err != nil {
+		t.Fatalf("StreamMessage(gemini block) failed: %v", err)
+	}
+	gemBlockEvents := parseSSEFrames(t, recGemBlock.Body.Bytes())
+	if len(gemBlockEvents) != 1 || gemBlockEvents[0].Event != "error" || !strings.Contains(string(gemBlockEvents[0].Data), `"type":"guardrail_blocked"`) {
+		t.Fatalf("expected single guardrail_blocked SSE error on Gemini block, got %+v", gemBlockEvents)
+	}
+	upstreamMu.Lock()
+	if len(geminiBodies) != 0 {
+		t.Fatalf("blocked Gemini prompt reached upstream! calls=%d", len(geminiBodies))
+	}
+	upstreamMu.Unlock()
+	if msgs, _ := st.ListChatMessages(ctx, alice.Subject, gemSess.ID); len(msgs) != 0 {
+		t.Fatalf("expected 0 chat_messages after Gemini block, got %d", len(msgs))
+	}
+
+	recGemRedact := httptest.NewRecorder()
+	if err := svc.StreamMessage(ctx, recGemRedact, alice, gemSess.ID, SendMessageRequest{
+		Content: "Gemini lookup EMP-654321",
+	}); err != nil {
+		t.Fatalf("StreamMessage(gemini redact) failed: %v", err)
+	}
+	upstreamMu.Lock()
+	if len(geminiBodies) != 1 || strings.Contains(geminiBodies[0], "EMP-654321") || !strings.Contains(geminiBodies[0], "[REDACTED:") {
+		t.Fatalf("unexpected upstream Gemini body on redact: %+v", geminiBodies)
+	}
+	upstreamMu.Unlock()
+
+	waitForWebhooks(4) // 1 OpenAI block + 1 OpenAI redact + 1 Gemini block + 1 Gemini redact
+	usageLogs = waitForUsageLogs(4)
+	if len(usageLogs) != 4 {
+		t.Fatalf("expected 4 guardrail usage_logs total across OpenAI + Gemini, got %d", len(usageLogs))
 	}
 }
 

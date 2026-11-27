@@ -962,13 +962,25 @@ func TestMCPSSRFAndRedirectBlocking(t *testing.T) {
 		t.Fatalf("redirect should not be followed: code=%d attackerHits=%d", recRedir.Code, attackerHits.Load())
 	}
 
-	// IMDS IPv4 & IPv6 fail immediately with 502 containing ErrBlockedAddress.
+	// IMDS IPv4 & IPv6 fail immediately with 502:
+	// - non-admin caller gets redacted "upstream MCP server unavailable" (no internal IP/URL leaked),
+	// - admin caller gets sanitized ErrBlockedAddress detail,
+	// - DiscoverTools returns ErrBlockedAddress directly.
+	admin := makePrincipalWithRole("admin@example.com", "admin", []string{"*"}, nil)
 	for _, name := range []string{"imds-v4", "imds-v6"} {
-		rec := httptest.NewRecorder()
-		gw.ServeHTTP(rec, authedReq(alice, http.MethodPost, "/mcp/"+name, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
-		if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), ErrBlockedAddress.Error()) {
-			t.Fatalf("expected 502 blocked IP for %s, got %d: %s", name, rec.Code, rec.Body.String())
+		recUser := httptest.NewRecorder()
+		gw.ServeHTTP(recUser, authedReq(alice, http.MethodPost, "/mcp/"+name, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+		if recUser.Code != http.StatusBadGateway || !strings.Contains(recUser.Body.String(), "upstream MCP server unavailable") ||
+			strings.Contains(recUser.Body.String(), "169.254.169.254") || strings.Contains(recUser.Body.String(), "fd00:ec2::254") {
+			t.Fatalf("expected redacted 502 for non-admin on %s, got %d: %s", name, recUser.Code, recUser.Body.String())
 		}
+
+		recAdmin := httptest.NewRecorder()
+		gw.ServeHTTP(recAdmin, authedReq(admin, http.MethodPost, "/mcp/"+name, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+		if recAdmin.Code != http.StatusBadGateway || !strings.Contains(recAdmin.Body.String(), ErrBlockedAddress.Error()) {
+			t.Fatalf("expected 502 blocked IP detail for admin on %s, got %d: %s", name, recAdmin.Code, recAdmin.Body.String())
+		}
+
 		srv, _ := st.GetMCPServer(context.Background(), name)
 		if _, _, err := gw.DiscoverTools(context.Background(), *srv); !errors.Is(err, ErrBlockedAddress) {
 			t.Fatalf("DiscoverTools(%s) expected ErrBlockedAddress, got %v", name, err)
@@ -1024,6 +1036,21 @@ func TestMCPP01StrictJSONRPCAndSmugglingRejection(t *testing.T) {
 		{
 			name:     "duplicate exact key in params",
 			payload:  `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"delete_all","name":"search","arguments":{}}}`,
+			wantCode: CodeInvalidParams,
+		},
+		{
+			name:     "P2-1 nested depth>=2 duplicate key in arguments",
+			payload:  `{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"search","arguments":{"payload":{"key":"sk-proj-SECRET12345678901234567890","key":"safe"}}}}`,
+			wantCode: CodeInvalidParams,
+		},
+		{
+			name:     "P2-1 nested array-of-object case-colliding key in arguments",
+			payload:  `{"jsonrpc":"2.0","id":52,"method":"tools/call","params":{"name":"search","arguments":{"items":[{"Token":"sk-proj-SECRET12345678901234567890","token":"safe"}]}}}`,
+			wantCode: CodeInvalidParams,
+		},
+		{
+			name:     "P2-1 excessive nesting depth rejected",
+			payload:  `{"jsonrpc":"2.0","id":53,"method":"tools/call","params":{"name":"search","arguments":` + strings.Repeat(`{"a":`, 135) + `1` + strings.Repeat(`}`, 135) + `}}`,
 			wantCode: CodeInvalidParams,
 		},
 		{
@@ -1168,9 +1195,9 @@ func TestMCPP11ServerGateSubpathLockdownAndSessionIsolation(t *testing.T) {
 		}
 	}
 
-	// 2. User with narrow tool grant (docs/search only) cannot invoke resources/read or prompts/get (-32003).
+	// 2. User with narrow tool grant (docs/search only) cannot invoke resources/read, prompts/get, or completion/complete (-32003).
 	narrow := makePrincipal("narrow@example.com", []string{"docs/search"}, nil)
-	for _, method := range []string{"resources/read", "prompts/get"} {
+	for _, method := range []string{"resources/read", "prompts/get", "completion/complete"} {
 		rec := httptest.NewRecorder()
 		gw.ServeHTTP(rec, authedReq(narrow, http.MethodPost, "/mcp/docs", `{"jsonrpc":"2.0","id":1,"method":"`+method+`"}`))
 		var resp jsonRPCMessage

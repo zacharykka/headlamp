@@ -274,7 +274,7 @@ func (s *SQLiteStore) SyncConfig(ctx context.Context, cfg *config.Config) error 
 			}
 		} else {
 			var existingEnc string
-			err := tx.QueryRowContext(ctx, `SELECT api_key_enc FROM providers WHERE name = ?`, p.Name).Scan(&existingEnc)
+			err := tx.QueryRowContext(ctx, `SELECT api_key_enc FROM providers WHERE name = ? AND source = ?`, p.Name, SourceConfig).Scan(&existingEnc)
 			if err == nil {
 				apiKeyEnc = existingEnc
 			} else if !errors.Is(err, sql.ErrNoRows) {
@@ -426,7 +426,7 @@ ON CONFLICT(id) DO UPDATE SET
 			}
 		} else {
 			var existingEnc string
-			err := tx.QueryRowContext(ctx, `SELECT secret_enc FROM webhooks WHERE id = ?`, w.ID).Scan(&existingEnc)
+			err := tx.QueryRowContext(ctx, `SELECT secret_enc FROM webhooks WHERE id = ? AND source = ?`, w.ID, SourceConfig).Scan(&existingEnc)
 			if err == nil {
 				secretEnc = existingEnc
 			} else if !errors.Is(err, sql.ErrNoRows) {

@@ -2222,3 +2222,23 @@ func TestProxyResponseHeadersExposeWinningFallbackProviderAndModel(t *testing.T)
 			recStream.Header().Get("X-Headlamp-Provider-Type"), recStream.Header().Get("X-Headlamp-Upstream-Model"))
 	}
 }
+
+func TestStreamNativeSSEMultiLineDataLimit(t *testing.T) {
+	// 17 consecutive 1 MiB data: lines without a blank separator exceed MaxSSELineBytes (16 MiB).
+	chunk := "data: " + strings.Repeat("a", 1024*1024) + "\n"
+	var sb strings.Builder
+	for range 17 {
+		sb.WriteString(chunk)
+	}
+	sb.WriteByte('\n')
+	payload := sb.String()
+
+	// Test both suppressSyntheticUsage=false (dataBuf guard) and suppressSyntheticUsage=true (frameBuf + dataBuf guard).
+	for _, suppress := range []bool{false, true} {
+		var dst bytes.Buffer
+		err := streamNativeSSE(strings.NewReader(payload), &dst, nil, noopObserver{}, suppress, nil)
+		if !errors.Is(err, translate.ErrSSELineTooLong) {
+			t.Fatalf("suppress=%v: expected translate.ErrSSELineTooLong for >16 MiB multi-line SSE data, got %v", suppress, err)
+		}
+	}
+}

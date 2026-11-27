@@ -98,6 +98,7 @@ func (s *Service) runOpenAIChatLoop(
 	systemPrompt string,
 	history []store.ChatMessage,
 	userPrompt string,
+	round0UserPrompt string,
 	tools []toolBinding,
 	toolLookup map[string]toolBinding,
 	emitter *sseEmitter,
@@ -115,9 +116,17 @@ func (s *Service) runOpenAIChatLoop(
 			return outcome, ctx.Err()
 		}
 
+		// Round 0 dispatches round0UserPrompt (raw user input when pre-redacted) so proxy.Gateway
+		// runs guardrail.Engine once for webhook alerts and usage_logs; Round 1+ uses the
+		// already-redacted messages history so subsequent tool rounds do not re-trigger webhooks.
+		roundMessages := messages
+		if round == 0 && round0UserPrompt != "" && round0UserPrompt != userPrompt {
+			roundMessages = buildOpenAIMessages(systemPrompt, history, round0UserPrompt)
+		}
+
 		reqPayload := map[string]any{
 			"model":    model,
-			"messages": messages,
+			"messages": roundMessages,
 			"stream":   true,
 			"stream_options": map[string]any{
 				"include_usage": true,
@@ -387,6 +396,7 @@ func (s *Service) runGeminiChatLoop(
 	systemPrompt string,
 	history []store.ChatMessage,
 	userPrompt string,
+	round0UserPrompt string,
 	tools []toolBinding,
 	toolLookup map[string]toolBinding,
 	emitter *sseEmitter,
@@ -415,8 +425,16 @@ func (s *Service) runGeminiChatLoop(
 			return outcome, ctx.Err()
 		}
 
+		// Round 0 dispatches round0UserPrompt (raw user input when pre-redacted) so proxy.Gateway
+		// runs guardrail.Engine once for webhook alerts and usage_logs; Round 1+ uses the
+		// already-redacted contents history so subsequent tool rounds do not re-trigger webhooks.
+		roundContents := contents
+		if round == 0 && round0UserPrompt != "" && round0UserPrompt != userPrompt {
+			roundContents = buildGeminiContents(history, round0UserPrompt)
+		}
+
 		reqPayload := map[string]any{
-			"contents": contents,
+			"contents": roundContents,
 		}
 		if sp := strings.TrimSpace(systemPrompt); sp != "" {
 			reqPayload["systemInstruction"] = map[string]any{

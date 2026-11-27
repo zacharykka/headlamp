@@ -1371,6 +1371,10 @@ pre,
   display: none;
 }
 
+.ap-chat-rail-close {
+  display: none;
+}
+
 .ap-chat-rail {
   width: 232px;
   flex-shrink: 0;
@@ -1809,6 +1813,11 @@ pre,
 
   .ap-form-grid-4 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .ap-chat-rail-close {
+    display: inline-flex;
+    flex-shrink: 0;
   }
 }
 

@@ -9,6 +9,85 @@ import (
 	"strings"
 )
 
+const maxStrictJSONDepth = 128
+
+// validateStrictJSONValue recursively walks every nested JSON object and array
+// in raw (bounded by maxStrictJSONDepth), rejecting duplicate keys, case-folded
+// colliding keys (e.g. "key"+"Key"), and trailing tokens at any nesting depth.
+func validateStrictJSONValue(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := validateStrictJSONNextToken(dec, 0); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("unexpected trailing tokens after JSON value")
+	}
+	return nil
+}
+
+func validateStrictJSONNextToken(dec *json.Decoder, depth int) error {
+	if depth > maxStrictJSONDepth {
+		return fmt.Errorf("JSON nesting depth exceeds maximum %d", maxStrictJSONDepth)
+	}
+	tok, err := dec.Token()
+	if err != nil {
+		return fmt.Errorf("invalid JSON token: %w", err)
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seenLower := make(map[string]string)
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return fmt.Errorf("invalid JSON object key: %w", err)
+			}
+			key, ok := keyTok.(string)
+			if !ok {
+				return errors.New("JSON object key must be a string")
+			}
+			lower := strings.ToLower(key)
+			if prev, exists := seenLower[lower]; exists {
+				return fmt.Errorf("duplicate or case-colliding JSON key %q (conflicts with %q)", key, prev)
+			}
+			seenLower[lower] = key
+			if err := validateStrictJSONNextToken(dec, depth+1); err != nil {
+				return err
+			}
+		}
+		endTok, err := dec.Token()
+		if err != nil {
+			return fmt.Errorf("unterminated JSON object: %w", err)
+		}
+		if d, ok := endTok.(json.Delim); !ok || d != '}' {
+			return errors.New("expected closing brace for JSON object")
+		}
+		return nil
+
+	case '[':
+		for dec.More() {
+			if err := validateStrictJSONNextToken(dec, depth+1); err != nil {
+				return err
+			}
+		}
+		endTok, err := dec.Token()
+		if err != nil {
+			return fmt.Errorf("unterminated JSON array: %w", err)
+		}
+		if d, ok := endTok.(json.Delim); !ok || d != ']' {
+			return errors.New("expected closing bracket for JSON array")
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q", delim)
+	}
+}
+
 // parseStrictJSONObject decodes raw as a single JSON object with exact case-sensitive
 // keys while rejecting duplicate keys, case-folded colliding keys (e.g. "method"+"Method",
 // "name"+"Name", "arguments"+"Arguments"), and trailing tokens.
@@ -129,6 +208,11 @@ func parseStrictRPCRequest(raw []byte) (*strictRPCEnvelope, error) {
 				if trimmed[0] != '{' && trimmed[0] != '[' {
 					return nil, errors.New("\"params\" must be a JSON object or array")
 				}
+				if method != "tools/call" {
+					if err := validateStrictJSONValue(trimmed); err != nil {
+						return nil, fmt.Errorf("invalid \"params\": %w", err)
+					}
+				}
 				env.Params = trimmed
 				env.HasParams = true
 			}
@@ -230,6 +314,9 @@ func parseStrictToolCallParams(raw json.RawMessage) (*strictToolCallParams, erro
 	if len(trimmed) == 0 {
 		return nil, errors.New("tools/call requires a \"params\" object")
 	}
+	if err := validateStrictJSONValue(trimmed); err != nil {
+		return nil, fmt.Errorf("invalid tools/call params: %w", err)
+	}
 	fields, err := parseStrictJSONObject(trimmed)
 	if err != nil {
 		return nil, fmt.Errorf("invalid tools/call params: %w", err)
@@ -256,10 +343,6 @@ func parseStrictToolCallParams(raw json.RawMessage) (*strictToolCallParams, erro
 		if len(trimmedArgs) > 0 && !bytes.Equal(trimmedArgs, []byte("null")) {
 			if trimmedArgs[0] != '{' {
 				return nil, errors.New("tools/call params \"arguments\" must be a JSON object")
-			}
-			// Reject duplicate keys inside arguments as well to prevent guardrail smuggling.
-			if _, err := parseStrictJSONObject(trimmedArgs); err != nil {
-				return nil, fmt.Errorf("invalid tools/call arguments: %w", err)
 			}
 			args = trimmedArgs
 		}

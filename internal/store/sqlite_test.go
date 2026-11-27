@@ -83,13 +83,13 @@ func TestSQLitePragmasPermissionsAndIdempotentMigration(t *testing.T) {
 		t.Fatalf("foreign_keys = %d, want 1", foreignKeys)
 	}
 
-	// Verify migrations 1, 2, and 3 are recorded.
+	// Verify migrations 1, 2, 3, and 4 are recorded.
 	var migCount int
 	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&migCount); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if migCount != 3 {
-		t.Fatalf("schema_migrations count = %d, want 3", migCount)
+	if migCount != 4 {
+		t.Fatalf("schema_migrations count = %d, want 4", migCount)
 	}
 
 	// Re-running Migrate must be a clean no-op.
@@ -1292,5 +1292,196 @@ func TestPaginationTieBreakerAndExtendedSummaryTx(t *testing.T) {
 	ext, err := st.SummarizeUsageExtended(ctx, UsageFilter{Subject: "alice"})
 	if err != nil || ext.RequestCount != 3 || ext.P95LatencyMS != 100 || math.Abs(ext.CostUSD-0.03) > 1e-9 {
 		t.Fatalf("SummarizeUsageExtended = (%+v, %v)", ext, err)
+	}
+}
+
+func TestMigration0004NormalizesLegacyTimestamps(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "upgrade_0004.db")
+
+	// Simulate an existing pre-0004 SQLite database that applied 0001..0003 and contains
+	// legacy variable-width RFC3339 / RFC3339Nano timestamps across all 6 timestamp columns.
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := rawDB.ExecContext(ctx, `CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create schema_migrations: %v", err)
+	}
+	for _, mig := range []struct {
+		ver  int
+		name string
+	}{
+		{1, "0001_initial.sql"},
+		{2, "0002_m2_governance.sql"},
+		{3, "0003_m3_mcp_and_chat.sql"},
+	} {
+		sqlBytes, err := migrationsFS.ReadFile("migrations/" + mig.name)
+		if err != nil {
+			t.Fatalf("read %s: %v", mig.name, err)
+		}
+		if _, err := rawDB.ExecContext(ctx, string(sqlBytes)); err != nil {
+			t.Fatalf("exec %s: %v", mig.name, err)
+		}
+		if _, err := rawDB.ExecContext(ctx, `INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, '2026-11-27T00:00:00Z')`, mig.ver, mig.name); err != nil {
+			t.Fatalf("record %s: %v", mig.name, err)
+		}
+	}
+
+	// Seed legacy variable-width timestamps (20-char whole second, 22-char .5Z, 27-char micros, and already-30-char).
+	stmts := []string{
+		`INSERT INTO usage_logs (id, created_at, subject, provider_name, requested_model, total_tokens, cost_usd, status_code) VALUES ('u-zero', '2026-11-27T00:00:00Z', 'alice', 'openai', 'gpt-5', 100, 0.02, 200)`,
+		`INSERT INTO usage_logs (id, created_at, subject, provider_name, requested_model, total_tokens, cost_usd, status_code) VALUES ('u-half', '2026-11-27T00:00:00.5Z', 'alice', 'openai', 'gpt-5', 200, 0.03, 200)`,
+		`INSERT INTO usage_logs (id, created_at, subject, provider_name, requested_model, total_tokens, cost_usd, status_code) VALUES ('u-fixed', '2026-11-27T00:00:00.123456789Z', 'alice', 'openai', 'gpt-5', 50, 0.01, 200)`,
+		`INSERT INTO audit_payloads (id, usage_log_id, created_at, request_body, response_body) VALUES ('ap-1', 'u-half', '2026-11-27T00:00:00.5Z', '{}', '{}')`,
+		`INSERT INTO mcp_audit_logs (id, created_at, subject, server_name, method, status) VALUES ('ma-1', '2026-11-27T00:00:00.123456Z', 'alice', 'docs', 'tools/call', 'ok')`,
+		`INSERT INTO chat_sessions (id, subject, title, model, created_at, updated_at) VALUES ('s-1', 'alice', 'Legacy', 'gpt-5', '2026-11-27T00:00:00Z', '2026-11-27T00:00:00.5Z')`,
+		`INSERT INTO chat_messages (id, session_id, role, content, created_at) VALUES ('m-later', 's-1', 'assistant', 'second', '2026-11-27T00:00:00.5Z')`,
+		`INSERT INTO chat_messages (id, session_id, role, content, created_at) VALUES ('m-exact', 's-1', 'user', 'first', '2026-11-27T00:00:00Z')`,
+	}
+	for _, stmt := range stmts {
+		if _, err := rawDB.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("seed legacy stmt %q: %v", stmt, err)
+		}
+	}
+	_ = rawDB.Close()
+
+	// Opening with NewSQLiteStore applies 0004_m3_upgrade_compat.sql automatically.
+	st, _ := newTestStore(t, dbPath)
+
+	// Every normalized column must now hold exact 30-char fixed-width UTC strings.
+	checks := []struct {
+		query string
+		want  string
+	}{
+		{`SELECT created_at FROM usage_logs WHERE id = 'u-zero'`, "2026-11-27T00:00:00.000000000Z"},
+		{`SELECT created_at FROM usage_logs WHERE id = 'u-half'`, "2026-11-27T00:00:00.500000000Z"},
+		{`SELECT created_at FROM usage_logs WHERE id = 'u-fixed'`, "2026-11-27T00:00:00.123456789Z"},
+		{`SELECT created_at FROM audit_payloads WHERE id = 'ap-1'`, "2026-11-27T00:00:00.500000000Z"},
+		{`SELECT created_at FROM mcp_audit_logs WHERE id = 'ma-1'`, "2026-11-27T00:00:00.123456000Z"},
+		{`SELECT created_at FROM chat_sessions WHERE id = 's-1'`, "2026-11-27T00:00:00.000000000Z"},
+		{`SELECT updated_at FROM chat_sessions WHERE id = 's-1'`, "2026-11-27T00:00:00.500000000Z"},
+		{`SELECT created_at FROM chat_messages WHERE id = 'm-exact'`, "2026-11-27T00:00:00.000000000Z"},
+		{`SELECT created_at FROM chat_messages WHERE id = 'm-later'`, "2026-11-27T00:00:00.500000000Z"},
+	}
+	for _, tc := range checks {
+		var got string
+		if err := st.DB().QueryRowContext(ctx, tc.query).Scan(&got); err != nil {
+			t.Fatalf("query %q: %v", tc.query, err)
+		}
+		if got != tc.want || len(got) != 30 {
+			t.Fatalf("%s = %q (len=%d), want %q (len=30)", tc.query, got, len(got), tc.want)
+		}
+	}
+
+	// Midnight-second SummarizeUsage and same-second ListChatMessages must now compare & sort accurately.
+	dayStart := time.Date(2026, 11, 27, 0, 0, 0, 0, time.UTC)
+	sum, err := st.SummarizeUsage(ctx, UsageFilter{Subject: "alice", Since: dayStart})
+	if err != nil {
+		t.Fatalf("SummarizeUsage(Since=dayStart): %v", err)
+	}
+	if sum.RequestCount != 3 || sum.TotalTokens != 350 || math.Abs(sum.CostUSD-0.06) > 1e-9 {
+		t.Fatalf("SummarizeUsage after 0004 = %+v, want 3 requests / 350 tokens / $0.06", sum)
+	}
+
+	msgs, err := st.ListChatMessages(ctx, "alice", "s-1")
+	if err != nil || len(msgs) != 2 || msgs[0].ID != "m-exact" || msgs[1].ID != "m-later" {
+		t.Fatalf("ListChatMessages after 0004 = (%+v, %v), want [m-exact, m-later]", msgs, err)
+	}
+}
+
+func TestSyncConfigProviderAndWebhookIsolateLocalSecrets(t *testing.T) {
+	st, _ := newTestStore(t, ":memory:")
+	ctx := context.Background()
+
+	// Seed source='local' provider and webhook with local secrets.
+	if err := st.UpsertProvider(ctx, Provider{
+		Name:    "shared-prov",
+		Type:    config.ProviderTypeOpenAI,
+		BaseURL: "https://local-openai.internal/v1",
+		APIKey:  "sk-local-only-provider-key",
+		Models:  []string{"gpt-5"},
+		Enabled: true,
+		Source:  SourceLocal,
+	}); err != nil {
+		t.Fatalf("UpsertProvider(local): %v", err)
+	}
+	if err := st.UpsertWebhook(ctx, Webhook{
+		ID:      "shared-wh",
+		Name:    "Local Webhook",
+		URL:     "https://local-hooks.internal/events",
+		Type:    config.WebhookTypeAsyncEvent,
+		Secret:  "whsec_local_only_secret",
+		Events:  []string{config.WebhookEventBudgetExceeded},
+		Enabled: true,
+		Source:  SourceLocal,
+	}); err != nil {
+		t.Fatalf("UpsertWebhook(local): %v", err)
+	}
+
+	// YAML SyncConfig takes over both names WITHOUT specifying api_key / secret ->
+	// MUST NOT silently inherit source='local' secrets!
+	cfgTakeover, err := config.LoadFromBytes([]byte(`
+providers:
+  - name: shared-prov
+    type: openai
+    base_url: "https://config-openai.internal/v1"
+    models: ["gpt-5"]
+webhooks:
+  - id: shared-wh
+    name: Config Webhook
+    url: "https://config-hooks.internal/events"
+    type: async_event
+    events: ["budget.exceeded"]
+`))
+	if err != nil {
+		t.Fatalf("LoadFromBytes(takeover): %v", err)
+	}
+	if err := st.SyncConfig(ctx, cfgTakeover); err != nil {
+		t.Fatalf("SyncConfig(takeover): %v", err)
+	}
+
+	p, err := st.GetProvider(ctx, "shared-prov")
+	if err != nil || p.Source != SourceConfig || p.APIKey != "" {
+		t.Fatalf("expected source=config provider takeover not to inherit local api_key, got (%+v, %v)", p, err)
+	}
+	wh, err := st.GetWebhook(ctx, "shared-wh")
+	if err != nil || wh.Source != SourceConfig || wh.Secret != "" {
+		t.Fatalf("expected source=config webhook takeover not to inherit local secret, got (%+v, %v)", wh, err)
+	}
+
+	// Setting config secrets and re-syncing without secrets MUST still preserve source='config' secrets.
+	cfgWithSecrets, err := config.LoadFromBytes([]byte(`
+providers:
+  - name: shared-prov
+    type: openai
+    base_url: "https://config-openai.internal/v1"
+    api_key: "sk-config-secret"
+    models: ["gpt-5"]
+webhooks:
+  - id: shared-wh
+    name: Config Webhook
+    url: "https://config-hooks.internal/events"
+    type: async_event
+    secret: "whsec_config_secret"
+    events: ["budget.exceeded"]
+`))
+	if err != nil {
+		t.Fatalf("LoadFromBytes(withSecrets): %v", err)
+	}
+	if err := st.SyncConfig(ctx, cfgWithSecrets); err != nil {
+		t.Fatalf("SyncConfig(withSecrets): %v", err)
+	}
+	if err := st.SyncConfig(ctx, cfgTakeover); err != nil {
+		t.Fatalf("SyncConfig(preserveConfigSecrets): %v", err)
+	}
+
+	p2, err := st.GetProvider(ctx, "shared-prov")
+	if err != nil || p2.APIKey != "sk-config-secret" {
+		t.Fatalf("expected source=config provider secret preserved across reload, got (%+v, %v)", p2, err)
+	}
+	wh2, err := st.GetWebhook(ctx, "shared-wh")
+	if err != nil || wh2.Secret != "whsec_config_secret" {
+		t.Fatalf("expected source=config webhook secret preserved across reload, got (%+v, %v)", wh2, err)
 	}
 }

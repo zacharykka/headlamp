@@ -43,6 +43,14 @@ import type {
   ChatToolEvent,
 } from '../types/api';
 
+interface ActiveStreamMeta {
+  tempUserId: string;
+  persistedUserId: string | null;
+  tempAssistantId: string;
+  assistantProgressed: boolean;
+  originalDraft: string;
+}
+
 function formatToolArgs(args: unknown): string {
   if (args === undefined || args === null) return '{}';
   if (typeof args === 'string') {
@@ -207,7 +215,8 @@ export function ChatView() {
 
   // Streaming & auto-scroll refs
   const streamAbortRef = useRef<AbortController | null>(null);
-  const activeTempAssistantIdRef = useRef<string | null>(null);
+  const activeStreamMetaRef = useRef<ActiveStreamMeta | null>(null);
+  const [activeAssistantId, setActiveAssistantId] = useState<string | null>(null);
   const threadAbortRef = useRef<AbortController | null>(null);
   const threadScrollRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
@@ -258,6 +267,24 @@ export function ChatView() {
     };
   }, [toolsPopoverOpen]);
 
+  useEffect(() => {
+    if (!railOpen) return;
+    const onKeyDown = (e: globalThis.KeyboardEvent) => {
+      if (
+        e.key === 'Escape' &&
+        typeof window !== 'undefined' &&
+        window.innerWidth < 960 &&
+        !toolsPopoverOpen &&
+        !sysModalOpen &&
+        !renamingId
+      ) {
+        setRailOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [railOpen, toolsPopoverOpen, sysModalOpen, renamingId]);
+
   const scrollToBottomIfPinned = () => {
     const el = threadScrollRef.current;
     if (!el || !stickToBottomRef.current) return;
@@ -273,23 +300,44 @@ export function ChatView() {
     [sessions, activeSessionId],
   );
 
-  const abortActiveStream = () => {
+  const abortActiveStream = (opts?: { restoreDraft?: boolean }) => {
+    const restoreDraft = opts?.restoreDraft ?? true;
     if (streamAbortRef.current) {
       streamAbortRef.current.abort();
       streamAbortRef.current = null;
     }
-    if (activeTempAssistantIdRef.current) {
-      const pendingId = activeTempAssistantIdRef.current;
-      activeTempAssistantIdRef.current = null;
-      setMessages((prev) =>
-        finalizeIncompleteAssistantMessage(prev, pendingId, 'aborted'),
-      );
+    const meta = activeStreamMetaRef.current;
+    activeStreamMetaRef.current = null;
+    setActiveAssistantId(null);
+    if (meta) {
+      if (!meta.assistantProgressed) {
+        const userIdToRemove = meta.persistedUserId ?? meta.tempUserId;
+        setMessages((prev) =>
+          prev.filter(
+            (m) =>
+              m.id !== meta.tempUserId &&
+              m.id !== userIdToRemove &&
+              m.id !== meta.tempAssistantId,
+          ),
+        );
+        if (restoreDraft) {
+          setDraft((prev) => prev || meta.originalDraft);
+        }
+      } else {
+        setMessages((prev) =>
+          finalizeIncompleteAssistantMessage(
+            prev,
+            meta.tempAssistantId,
+            'aborted',
+          ),
+        );
+      }
     }
     setStreaming(false);
   };
 
   const selectSession = async (session: ChatSession) => {
-    abortActiveStream();
+    abortActiveStream({ restoreDraft: false });
     threadAbortRef.current?.abort();
     const controller = new AbortController();
     threadAbortRef.current = controller;
@@ -299,6 +347,7 @@ export function ChatView() {
     }
 
     setActiveSessionId(session.id);
+    setMessages([]);
     setSelectedModel(session.model || models[0]?.id || '');
     setSelectedMcpNames(session.mcp_servers ?? []);
     setSystemPrompt(session.system_prompt || '');
@@ -326,7 +375,7 @@ export function ChatView() {
   };
 
   const startNewChat = () => {
-    abortActiveStream();
+    abortActiveStream({ restoreDraft: false });
     threadAbortRef.current?.abort();
     if (typeof window !== 'undefined' && window.innerWidth < 768) {
       setRailOpen(false);
@@ -444,7 +493,7 @@ export function ChatView() {
   };
 
   const handleStopStreaming = () => {
-    abortActiveStream();
+    abortActiveStream({ restoreDraft: true });
   };
 
   const handleSend = async () => {
@@ -468,11 +517,17 @@ export function ChatView() {
 
     let sessionId = activeSessionId;
     let sseStarted = false;
-    let persistedUserId: string | null = null;
-    let assistantProgressed = false;
     const tempUserId = `temp-user-${Date.now()}`;
     const tempAssistantId = `temp-asst-${Date.now()}`;
-    activeTempAssistantIdRef.current = tempAssistantId;
+    const streamMeta: ActiveStreamMeta = {
+      tempUserId,
+      persistedUserId: null,
+      tempAssistantId,
+      assistantProgressed: false,
+      originalDraft: content,
+    };
+    activeStreamMetaRef.current = streamMeta;
+    setActiveAssistantId(tempAssistantId);
 
     const isStaleOrAborted = () =>
       controller.signal.aborted || streamAbortRef.current !== controller;
@@ -528,7 +583,7 @@ export function ChatView() {
           onMessageStart: ({ user_message, session }) => {
             if (isStaleOrAborted()) return;
             sseStarted = true;
-            persistedUserId = user_message.id;
+            streamMeta.persistedUserId = user_message.id;
             setSessions((prev) => [
               session,
               ...prev.filter((s) => s.id !== session.id),
@@ -540,7 +595,7 @@ export function ChatView() {
           onDelta: ({ text }) => {
             if (isStaleOrAborted()) return;
             sseStarted = true;
-            assistantProgressed = true;
+            streamMeta.assistantProgressed = true;
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === tempAssistantId
@@ -552,7 +607,7 @@ export function ChatView() {
           onToolStart: (ev) => {
             if (isStaleOrAborted()) return;
             sseStarted = true;
-            assistantProgressed = true;
+            streamMeta.assistantProgressed = true;
             setMessages((prev) =>
               prev.map((m) => {
                 if (m.id !== tempAssistantId) return m;
@@ -575,7 +630,7 @@ export function ChatView() {
           onToolResult: (ev) => {
             if (isStaleOrAborted()) return;
             sseStarted = true;
-            assistantProgressed = true;
+            streamMeta.assistantProgressed = true;
             setMessages((prev) =>
               prev.map((m) => {
                 if (m.id !== tempAssistantId) return m;
@@ -609,10 +664,13 @@ export function ChatView() {
           onMessageDone: ({ assistant_message }) => {
             if (isStaleOrAborted()) return;
             sseStarted = true;
-            assistantProgressed = true;
-            if (activeTempAssistantIdRef.current === tempAssistantId) {
-              activeTempAssistantIdRef.current = null;
+            streamMeta.assistantProgressed = true;
+            if (activeStreamMetaRef.current === streamMeta) {
+              activeStreamMetaRef.current = null;
             }
+            setActiveAssistantId((prev) =>
+              prev === tempAssistantId ? null : prev,
+            );
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === tempAssistantId
@@ -632,8 +690,8 @@ export function ChatView() {
             if (isStaleOrAborted()) return;
             sseStarted = true;
             setError(errEvt.message || 'Stream error');
-            if (!assistantProgressed) {
-              const userIdToRemove = persistedUserId ?? tempUserId;
+            if (!streamMeta.assistantProgressed) {
+              const userIdToRemove = streamMeta.persistedUserId ?? tempUserId;
               setMessages((prev) =>
                 prev.filter(
                   (m) =>
@@ -642,9 +700,7 @@ export function ChatView() {
                     m.id !== tempAssistantId,
                 ),
               );
-              if (!persistedUserId) {
-                setDraft((prev) => prev || content);
-              }
+              setDraft((prev) => prev || content);
             } else {
               setMessages((prev) =>
                 finalizeIncompleteAssistantMessage(prev, tempAssistantId, 'error'),
@@ -656,8 +712,9 @@ export function ChatView() {
       );
 
       // Ensure any dangling empty placeholder or unfinished tool card is cleaned up if stream ended without message_done
-      if (!isStaleOrAborted() && activeTempAssistantIdRef.current === tempAssistantId) {
-        activeTempAssistantIdRef.current = null;
+      if (!isStaleOrAborted() && activeStreamMetaRef.current === streamMeta) {
+        activeStreamMetaRef.current = null;
+        setActiveAssistantId((prev) => (prev === tempAssistantId ? null : prev));
         setMessages((prev) =>
           finalizeIncompleteAssistantMessage(prev, tempAssistantId, 'error'),
         );
@@ -667,18 +724,35 @@ export function ChatView() {
         controller.signal.aborted || (err as { name?: string })?.name === 'AbortError';
       if (isAbort) {
         if (streamAbortRef.current === controller) {
-          setMessages((prev) =>
-            sseStarted
-              ? finalizeIncompleteAssistantMessage(prev, tempAssistantId, 'aborted')
-              : prev.filter((m) => m.id !== tempUserId && m.id !== tempAssistantId),
-          );
+          if (!streamMeta.assistantProgressed) {
+            const userIdToRemove = streamMeta.persistedUserId ?? tempUserId;
+            setMessages((prev) =>
+              prev.filter(
+                (m) =>
+                  m.id !== tempUserId &&
+                  m.id !== userIdToRemove &&
+                  m.id !== tempAssistantId,
+              ),
+            );
+            setDraft((prev) => prev || content);
+          } else {
+            setMessages((prev) =>
+              finalizeIncompleteAssistantMessage(prev, tempAssistantId, 'aborted'),
+            );
+          }
         }
       } else if (streamAbortRef.current === controller) {
         setError(err instanceof Error ? err.message : 'Failed to send message');
-        if (!sseStarted) {
+        if (!sseStarted || !streamMeta.assistantProgressed) {
+          const userIdToRemove = streamMeta.persistedUserId ?? tempUserId;
           setDraft((prev) => prev || content);
           setMessages((prev) =>
-            prev.filter((m) => m.id !== tempUserId && m.id !== tempAssistantId),
+            prev.filter(
+              (m) =>
+                m.id !== tempUserId &&
+                m.id !== userIdToRemove &&
+                m.id !== tempAssistantId,
+            ),
           );
         } else {
           setMessages((prev) =>
@@ -687,11 +761,12 @@ export function ChatView() {
         }
       }
     } finally {
-      if (activeTempAssistantIdRef.current === tempAssistantId) {
-        activeTempAssistantIdRef.current = null;
+      if (activeStreamMetaRef.current === streamMeta) {
+        activeStreamMetaRef.current = null;
       }
       if (streamAbortRef.current === controller) {
         streamAbortRef.current = null;
+        setActiveAssistantId(null);
         setStreaming(false);
       }
     }
@@ -745,11 +820,20 @@ export function ChatView() {
               <button
                 type="button"
                 className="ap-btn ap-btn-sm"
-                style={{ width: '100%', justifyContent: 'flex-start' }}
+                style={{ flex: 1, justifyContent: 'flex-start', minWidth: 0 }}
                 onClick={startNewChat}
               >
                 <PlusIcon size={14} />
                 <span>New chat</span>
+              </button>
+              <button
+                type="button"
+                className="ap-btn ap-btn-ghost ap-btn-sm ap-btn-icon-compact ap-chat-rail-close"
+                onClick={() => setRailOpen(false)}
+                aria-label="Close chat history"
+                title="Close chat history"
+              >
+                <CloseIcon size={14} />
               </button>
             </div>
 
@@ -1186,7 +1270,7 @@ export function ChatView() {
 
                       {msg.content ? (
                         <MarkdownBody content={msg.content} />
-                      ) : streaming ? (
+                      ) : streaming && msg.id === activeAssistantId ? (
                         <span
                           style={{
                             display: 'inline-flex',

@@ -158,6 +158,7 @@ export function MCPView({
         .then((rows) => {
           if (seq !== auditSeqRef.current || controller.signal.aborted) return;
           setAuditLogs(rows);
+          setPageError(null);
           setLoadingAudit(false);
         })
         .catch((err: unknown) => {

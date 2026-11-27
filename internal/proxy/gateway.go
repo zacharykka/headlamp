@@ -1609,6 +1609,11 @@ func streamNativeSSE(
 		line, readErr := translate.ReadLineLimited(reader, translate.MaxSSELineBytes)
 		if len(line) > 0 {
 			if suppressSyntheticUsage {
+				if frameBuf.Len()+len(line) > translate.MaxSSELineBytes {
+					frameBuf.Reset()
+					dataBuf.Reset()
+					return fmt.Errorf("%w (%d bytes)", translate.ErrSSELineTooLong, translate.MaxSSELineBytes)
+				}
 				frameBuf.Write(line)
 			} else {
 				if onFirstFrame != nil {
@@ -1648,6 +1653,15 @@ func streamNativeSSE(
 					eventName = value
 					hasEvent = true
 				case "data":
+					extra := len(value)
+					if hasData {
+						extra++
+					}
+					if dataBuf.Len()+extra > translate.MaxSSELineBytes {
+						dataBuf.Reset()
+						frameBuf.Reset()
+						return fmt.Errorf("%w (%d bytes)", translate.ErrSSELineTooLong, translate.MaxSSELineBytes)
+					}
 					if hasData {
 						dataBuf.WriteByte('\n')
 					}

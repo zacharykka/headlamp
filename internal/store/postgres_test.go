@@ -56,13 +56,14 @@ func TestPostgresEmbeddedMigrationsAndQueryBuilders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readPGMigrations: %v", err)
 	}
-	if len(migs) != 3 {
-		t.Fatalf("expected 3 embedded postgres migrations, got %d: %+v", len(migs), migs)
+	if len(migs) != 4 {
+		t.Fatalf("expected 4 embedded postgres migrations, got %d: %+v", len(migs), migs)
 	}
 	wantNames := []string{
 		"0001_initial.sql",
 		"0002_m2_governance.sql",
 		"0003_m3_mcp_and_chat.sql",
+		"0004_m3_upgrade_compat.sql",
 	}
 	allSQL := strings.Builder{}
 	for i, m := range migs {
@@ -92,6 +93,8 @@ func TestPostgresEmbeddedMigrationsAndQueryBuilders(t *testing.T) {
 		"CREATE TABLE IF NOT EXISTS chat_sessions",
 		"CREATE TABLE IF NOT EXISTS chat_messages",
 		"seq BIGSERIAL NOT NULL",
+		"ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS seq BIGSERIAL NOT NULL",
+		"idx_chat_messages_session_seq",
 		"TIMESTAMPTZ",
 		"JSONB",
 		"DOUBLE PRECISION",

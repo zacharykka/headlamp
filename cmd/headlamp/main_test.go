@@ -1553,13 +1553,26 @@ audit:
 		t.Fatalf("unexpected persisted chat messages: %+v", detail.Messages)
 	}
 
-	// Flush metering and confirm zero-bypass LLM usage logging (2 turns) + MCP audit logging (3 calls: 1 denied + 2 ok).
+	// Flush metering and confirm zero-bypass LLM usage logging (1 guardrail-blocked turn + 2 normal turns = 3)
+	// + MCP audit logging (3 calls: 1 denied + 2 ok).
 	if err := recorder.Close(ctx); err != nil {
 		t.Fatalf("recorder.Close: %v", err)
 	}
 	usageLogs, err := st.QueryUsageLogs(ctx, store.UsageFilter{Subject: "alice@example.com"})
-	if err != nil || len(usageLogs) != 2 {
-		t.Fatalf("expected 2 usage_logs from zero-bypass Web Chat turns, got (%d, %v)", len(usageLogs), err)
+	if err != nil || len(usageLogs) != 3 {
+		t.Fatalf("expected 3 usage_logs from zero-bypass Web Chat turns (1 guardrail block + 2 ok), got (%d, %v)", len(usageLogs), err)
+	}
+	var blockedUsageCount, okUsageCount int
+	for _, ul := range usageLogs {
+		switch {
+		case ul.GuardrailAction == config.GuardrailActionBlock && len(ul.GuardrailHits) > 0 && ul.StatusCode == http.StatusBadRequest:
+			blockedUsageCount++
+		case ul.StatusCode == http.StatusOK && ul.GuardrailAction == "":
+			okUsageCount++
+		}
+	}
+	if blockedUsageCount != 1 || okUsageCount != 2 {
+		t.Fatalf("unexpected usage_logs breakdown (blocked=%d ok=%d, want 1/2): %+v", blockedUsageCount, okUsageCount, usageLogs)
 	}
 	mcpAudit, err := st.QueryMCPAuditLogs(ctx, store.MCPAuditFilter{ServerName: "docs"})
 	if err != nil || len(mcpAudit) != 3 {

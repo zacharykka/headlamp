@@ -433,8 +433,8 @@ func (g *Gateway) handleJSONRPC(w http.ResponseWriter, r *http.Request, p *auth.
 			}
 			forwardItems = append(forwardItems, canonicalReq)
 
-		case strings.HasPrefix(env.Method, "resources/") || strings.HasPrefix(env.Method, "prompts/"):
-			// P1-1: Require server-wide tool grant (<server>/*) for resources/* and prompts/* data methods.
+		case strings.HasPrefix(env.Method, "resources/") || strings.HasPrefix(env.Method, "prompts/") || strings.HasPrefix(env.Method, "completion/"):
+			// P1-1 & P3-2: Require server-wide tool grant (<server>/*) for resources/*, prompts/*, and completion/* methods.
 			if g.authorizer != nil {
 				allowed, reason, authErr := g.authorizer.AuthorizeMCPTool(r.Context(), p, srv.Name+"/*")
 				if authErr != nil {
@@ -524,8 +524,9 @@ func (g *Gateway) handleJSONRPC(w http.ResponseWriter, r *http.Request, p *auth.
 	resp, err := g.httpClient.Do(upReq)
 	if err != nil {
 		safeErr := sanitizeURLError(err)
+		g.logf("headlamp mcp: upstream POST %s failed: %s", srv.Name, safeErr)
 		g.finalizePendingCalls(p, srv.Name, trackedCalls, unkeyedCalls, AuditStatusError, safeErr)
-		writeJSONRPCStatus(w, http.StatusBadGateway, nil, CodeInternalError, "upstream MCP request failed: "+safeErr)
+		writeJSONRPCStatus(w, http.StatusBadGateway, nil, CodeInternalError, g.clientUpstreamErrorMessage(r.Context(), p, "upstream MCP request failed", safeErr))
 		return
 	}
 	defer resp.Body.Close()
@@ -731,7 +732,9 @@ func (g *Gateway) handleSSEGet(w http.ResponseWriter, r *http.Request, p *auth.P
 
 	resp, err := g.httpClient.Do(upReq)
 	if err != nil {
-		writeJSONRPCStatus(w, http.StatusBadGateway, nil, CodeInternalError, "upstream MCP SSE failed: "+sanitizeURLError(err))
+		safeErr := sanitizeURLError(err)
+		g.logf("headlamp mcp: upstream SSE %s failed: %s", srv.Name, safeErr)
+		writeJSONRPCStatus(w, http.StatusBadGateway, nil, CodeInternalError, g.clientUpstreamErrorMessage(r.Context(), p, "upstream MCP SSE failed", safeErr))
 		return
 	}
 	defer resp.Body.Close()
@@ -852,7 +855,9 @@ func (g *Gateway) handleSessionDelete(w http.ResponseWriter, r *http.Request, p 
 
 	resp, err := g.httpClient.Do(upReq)
 	if err != nil {
-		writeJSONRPCStatus(w, http.StatusBadGateway, nil, CodeInternalError, "upstream MCP DELETE failed: "+sanitizeURLError(err))
+		safeErr := sanitizeURLError(err)
+		g.logf("headlamp mcp: upstream DELETE %s failed: %s", srv.Name, safeErr)
+		writeJSONRPCStatus(w, http.StatusBadGateway, nil, CodeInternalError, g.clientUpstreamErrorMessage(r.Context(), p, "upstream MCP DELETE failed", safeErr))
 		return
 	}
 	defer resp.Body.Close()
@@ -863,6 +868,15 @@ func (g *Gateway) handleSessionDelete(w http.ResponseWriter, r *http.Request, p 
 	if len(respBody) > 0 {
 		_, _ = w.Write(respBody)
 	}
+}
+
+// clientUpstreamErrorMessage returns a sanitized diagnostic error for admins while
+// hiding internal upstream URLs/IPs from non-admin callers (matching /api/v1/chat/mcp-servers).
+func (g *Gateway) clientUpstreamErrorMessage(ctx context.Context, p *auth.Principal, prefix, safeErr string) string {
+	if g.isAdminPrincipal(ctx, p) {
+		return prefix + ": " + safeErr
+	}
+	return "upstream MCP server unavailable"
 }
 
 func (g *Gateway) processJSONRPCResponseBytes(

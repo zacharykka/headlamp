@@ -729,7 +729,7 @@ describe('Milestone 3: Team Web Chat, Admin MCP Gateway, and API helpers', () =>
     expect(container.querySelector('.ap-chat-msg-assistant')).toBeNull();
     expect(input.value).toBe(pemSecret);
 
-    // 3. Round-0 rolled-back message_start + error also removes the rolled-back user bubble
+    // 3. Round-0 rolled-back message_start + error also removes the rolled-back user bubble AND restores draft (P2-3)
     fireEvent.change(input, { target: { value: 'Retry normal question' } });
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
 
@@ -738,5 +738,158 @@ describe('Milestone 3: Team Web Chat, Admin MCP Gateway, and API helpers', () =>
     });
     expect(container.querySelector('.ap-chat-msg-user')).toBeNull();
     expect(container.querySelector('.ap-chat-msg-assistant')).toBeNull();
+    expect(input.value).toBe('Retry normal question');
+  });
+
+  it('syncs Stop-while-thinking rollback + draft recovery, clears stale messages on failed selectSession, and closes mobile rail on Escape (#156 P2-3, P3-4)', async () => {
+    const origWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', {
+      writable: true,
+      configurable: true,
+      value: 390,
+    });
+
+    try {
+      vi.spyOn(api, 'listChatModels').mockResolvedValue([
+        {
+          id: 'anthropic/claude-sonnet-4-6',
+          provider: 'anthropic',
+          provider_type: 'anthropic',
+          is_alias: false,
+        },
+      ]);
+      vi.spyOn(api, 'listChatMCPServers').mockResolvedValue([]);
+      vi.spyOn(api, 'listChatSessions').mockResolvedValue([
+        {
+          id: 'sess-a',
+          title: 'Session Alpha',
+          model: 'anthropic/claude-sonnet-4-6',
+          created_at: '2026-11-27T09:00:00Z',
+          updated_at: '2026-11-27T09:00:00Z',
+        },
+        {
+          id: 'sess-b',
+          title: 'Session Beta',
+          model: 'anthropic/claude-sonnet-4-6',
+          created_at: '2026-11-27T09:01:00Z',
+          updated_at: '2026-11-27T09:01:00Z',
+        },
+      ]);
+
+      vi.spyOn(api, 'getChatSession').mockImplementation(async (id) => {
+        if (id === 'sess-a') {
+          return {
+            session: {
+              id: 'sess-a',
+              title: 'Session Alpha',
+              model: 'anthropic/claude-sonnet-4-6',
+              created_at: '2026-11-27T09:00:00Z',
+              updated_at: '2026-11-27T09:00:00Z',
+            },
+            messages: [
+              {
+                id: 'alpha-m1',
+                session_id: 'sess-a',
+                role: 'user',
+                content: 'Alpha confidential message',
+                created_at: '2026-11-27T09:00:01Z',
+              },
+              {
+                id: 'alpha-empty-asst',
+                session_id: 'sess-a',
+                role: 'assistant',
+                content: '',
+                created_at: '2026-11-27T09:00:02Z',
+              },
+            ],
+          };
+        }
+        throw new ApiError(500, 'Database connection lost');
+      });
+
+      // Stream emits message_start (Round 0) then stays in "Thinking..." until Stop is clicked
+      vi.spyOn(api, 'streamChatMessage').mockImplementation(
+        async (_sessionId, _payload, callbacks, opts) => {
+          callbacks.onMessageStart?.({
+            user_message: {
+              id: 'persisted-thinking-u1',
+              session_id: 'sess-a',
+              role: 'user',
+              content: 'Draft while thinking',
+              created_at: '2026-11-27T09:05:00Z',
+            },
+            session: {
+              id: 'sess-a',
+              title: 'Session Alpha',
+              model: 'anthropic/claude-sonnet-4-6',
+              created_at: '2026-11-27T09:00:00Z',
+              updated_at: '2026-11-27T09:05:00Z',
+            },
+          });
+          await new Promise<void>((_resolve, reject) => {
+            opts?.signal?.addEventListener('abort', () => {
+              const err = new Error('Aborted');
+              err.name = 'AbortError';
+              reject(err);
+            });
+          });
+        },
+      );
+
+      const { container } = render(<ChatView />);
+
+      await waitFor(() => {
+        expect(screen.getByDisplayValue(/anthropic\/claude-sonnet-4-6/)).toBeTruthy();
+      });
+
+      // Mobile (<960px) starts with rail closed; open rail and close via Escape (P3-4)
+      expect(screen.queryByLabelText('Chat history')).toBeNull();
+      fireEvent.click(screen.getByRole('button', { name: 'Show chat history' }));
+      expect(screen.getByLabelText('Chat history')).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Close chat history' })).toBeTruthy();
+      fireEvent.keyDown(window, { key: 'Escape' });
+      expect(screen.queryByLabelText('Chat history')).toBeNull();
+
+      // Open rail, select Session Alpha -> loads 'Alpha confidential message'
+      fireEvent.click(screen.getByRole('button', { name: 'Show chat history' }));
+      fireEvent.click(screen.getByText('Session Alpha'));
+      await waitFor(() => {
+        expect(screen.getByText('Alpha confidential message')).toBeTruthy();
+      });
+
+      const thread = container.querySelector('.ap-chat-thread') as HTMLElement;
+
+      // Send message -> enters "Thinking..." (only 1 Thinking... spinner even with historical empty assistant message!)
+      const input = screen.getByLabelText('Message input') as HTMLTextAreaElement;
+      fireEvent.change(input, { target: { value: 'Draft while thinking' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+
+      await waitFor(() => {
+        expect(within(thread).getAllByText('Thinking...').length).toBe(1);
+        expect(within(thread).getByText('Draft while thinking')).toBeTruthy();
+      });
+
+      // Click Stop while still "Thinking..." (!assistantProgressed) -> removes rolled-back user bubble from thread AND restores draft!
+      fireEvent.click(screen.getByRole('button', { name: 'Stop generation' }));
+      await waitFor(() => {
+        expect(within(thread).queryByText('Draft while thinking')).toBeNull();
+        expect(within(thread).queryByText('Thinking...')).toBeNull();
+        expect(input.value).toBe('Draft while thinking');
+      });
+
+      // Switch to Session Beta whose fetch fails -> Session Alpha's messages are cleared immediately (zero cross-session leak!)
+      fireEvent.click(screen.getByRole('button', { name: 'Show chat history' }));
+      fireEvent.click(screen.getByText('Session Beta'));
+      await waitFor(() => {
+        expect(screen.getByRole('alert').textContent).toContain('Database connection lost');
+      });
+      expect(screen.queryByText('Alpha confidential message')).toBeNull();
+    } finally {
+      Object.defineProperty(window, 'innerWidth', {
+        writable: true,
+        configurable: true,
+        value: origWidth,
+      });
+    }
   });
 });

@@ -409,29 +409,42 @@ func (s *Service) StreamMessage(ctx context.Context, w http.ResponseWriter, p *a
 
 	// Pre-persist guardrail inspection: prevent raw secrets from being stored in chat_messages
 	// (or session titles) and ensure redacted prompts are stored in redacted form.
-	userContent := req.Content
+	// Round 0 still forwards rawUserContent to proxy.Gateway so guardrail.Engine fires
+	// guardrail.triggered webhooks and records usage_logs guardrail telemetry once.
+	rawUserContent := req.Content
+	persistedContent := req.Content
+	var (
+		preBlocked  bool
+		blockReason string
+	)
 	if s.guardrails != nil {
-		action, redacted, reason, gErr := s.guardrails.InspectText(ctx, userContent)
+		action, redacted, reason, gErr := s.guardrails.InspectText(ctx, rawUserContent)
 		if gErr != nil {
 			return fmt.Errorf("chat: inspect message guardrails: %w", gErr)
 		}
 		switch strings.ToLower(strings.TrimSpace(action)) {
 		case "block":
-			emitter := startSSE(w)
-			errMsg := strings.TrimSpace(reason)
-			if errMsg == "" {
-				errMsg = "message blocked by guardrail policy"
-			}
-			_ = emitter.Emit("error", map[string]string{
-				"type":    "guardrail_blocked",
-				"message": errMsg,
-			})
-			return nil
+			preBlocked = true
+			blockReason = strings.TrimSpace(reason)
 		case "redact", "modify":
 			if redacted != "" {
-				userContent = redacted
+				persistedContent = redacted
 			}
 		}
+	}
+
+	if preBlocked {
+		// Never persist blocked raw secrets to chat_messages or session.Title, and skip
+		// message_start. Still dispatch Round 0 through proxy.Gateway so guardrail.Engine
+		// emits the guardrail.triggered webhook and writes the blocked usage_logs entry +
+		// [BLOCKED BY GUARDRAIL] audit payload stub before returning the SSE error.
+		errType, errMsg := s.dispatchBlockedRound0(ctx, p, model, session.SystemPrompt, rawUserContent, blockReason)
+		emitter := startSSE(w)
+		_ = emitter.Emit("error", map[string]string{
+			"type":    errType,
+			"message": errMsg,
+		})
+		return nil
 	}
 
 	mcpServers := session.MCPServers
@@ -451,7 +464,7 @@ func (s *Service) StreamMessage(ctx context.Context, w http.ResponseWriter, p *a
 
 	trimmedTitle := strings.TrimSpace(session.Title)
 	if trimmedTitle == "" || strings.EqualFold(trimmedTitle, "New Chat") {
-		session.Title = deriveSessionTitle(strings.TrimSpace(userContent))
+		session.Title = deriveSessionTitle(strings.TrimSpace(persistedContent))
 		sessionChanged = true
 	}
 
@@ -475,7 +488,7 @@ func (s *Service) StreamMessage(ctx context.Context, w http.ResponseWriter, p *a
 		ID:        uuid.NewString(),
 		SessionID: session.ID,
 		Role:      "user",
-		Content:   userContent,
+		Content:   persistedContent,
 		Model:     model,
 	})
 	if err != nil {
@@ -500,9 +513,9 @@ func (s *Service) StreamMessage(ctx context.Context, w http.ResponseWriter, p *a
 		runErr  error
 	)
 	if dispatch.useGemini {
-		outcome, runErr = s.runGeminiChatLoop(ctx, p, model, session.SystemPrompt, history, userContent, tools, toolLookup, emitter)
+		outcome, runErr = s.runGeminiChatLoop(ctx, p, model, session.SystemPrompt, history, persistedContent, rawUserContent, tools, toolLookup, emitter)
 	} else {
-		outcome, runErr = s.runOpenAIChatLoop(ctx, p, model, session.SystemPrompt, history, userContent, tools, toolLookup, emitter)
+		outcome, runErr = s.runOpenAIChatLoop(ctx, p, model, session.SystemPrompt, history, persistedContent, rawUserContent, tools, toolLookup, emitter)
 	}
 
 	if runErr != nil {
@@ -561,6 +574,80 @@ func startSSE(w http.ResponseWriter) *sseEmitter {
 	h.Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	return newSSEEmitter(w)
+}
+
+// dispatchBlockedRound0 forwards a pre-blocked prompt through proxy.Gateway on Round 0
+// so guardrail.Engine emits the guardrail.triggered async webhook and logs the blocked
+// usage_logs + [BLOCKED BY GUARDRAIL] audit payload stub. As defense-in-depth, if a
+// custom/test Gateway without guardrails returns 2xx, the response stream is discarded
+// immediately and guardrail_blocked is still returned.
+func (s *Service) dispatchBlockedRound0(
+	ctx context.Context,
+	p *auth.Principal,
+	model string,
+	systemPrompt string,
+	rawUserContent string,
+	preBlockReason string,
+) (errType, errMsg string) {
+	fallbackMsg := strings.TrimSpace(preBlockReason)
+	if fallbackMsg == "" {
+		fallbackMsg = "message blocked by guardrail policy"
+	}
+
+	dispatch := s.resolveDispatchInfo(ctx, model)
+	var (
+		path     string
+		reqBytes []byte
+		err      error
+	)
+	if dispatch.useGemini {
+		path = "/gemini/v1beta/models/" + strings.TrimPrefix(model, "/") + ":streamGenerateContent?alt=sse"
+		reqPayload := map[string]any{
+			"contents": buildGeminiContents(nil, rawUserContent),
+		}
+		if sp := strings.TrimSpace(systemPrompt); sp != "" {
+			reqPayload["systemInstruction"] = map[string]any{
+				"parts": []map[string]string{{"text": sp}},
+			}
+		}
+		reqBytes, err = json.Marshal(reqPayload)
+	} else {
+		path = "/v1/chat/completions"
+		reqPayload := map[string]any{
+			"model":    model,
+			"messages": buildOpenAIMessages(systemPrompt, nil, rawUserContent),
+			"stream":   true,
+			"stream_options": map[string]any{
+				"include_usage": true,
+			},
+		}
+		reqBytes, err = json.Marshal(reqPayload)
+	}
+	if err != nil {
+		return "guardrail_blocked", fallbackMsg
+	}
+
+	_, _, closeStream, gwErr := s.invokeGatewayStream(ctx, p, path, reqBytes)
+	if gwErr == nil {
+		closeStream()
+		return "guardrail_blocked", fallbackMsg
+	}
+
+	var httpErr *gatewayHTTPError
+	if errors.As(gwErr, &httpErr) {
+		msg := strings.TrimSpace(httpErr.Message)
+		if msg == "" {
+			msg = fallbackMsg
+		}
+		if httpErr.Type == "guardrail_blocked" || httpErr.StatusCode == http.StatusBadRequest {
+			return "guardrail_blocked", msg
+		}
+		if httpErr.Type != "" {
+			return httpErr.Type, msg
+		}
+		return "guardrail_blocked", msg
+	}
+	return "guardrail_blocked", fallbackMsg
 }
 
 func (s *Service) rollbackOrphanUserMessage(subject, sessionID, messageID string) {
