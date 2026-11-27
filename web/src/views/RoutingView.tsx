@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { api } from '../api/client';
 import {
   AlertIcon,
@@ -10,7 +10,6 @@ import {
 import { PricingDrawer } from '../components/PricingDrawer';
 import {
   ConfirmDeleteButton,
-  Modal,
   ProviderTypeBadge,
   SegmentedControl,
   SourceBadge,
@@ -21,22 +20,14 @@ import {
   formatCostTier,
   formatLatency,
   hasRouteCostOverride,
-  parseRouteFallbacks,
 } from '../lib/format';
 import type {
   ModelRouteItem,
-  ModelRouteUpsertPayload,
   ProviderItem,
   ProviderTestResult,
-  ProviderUpsertPayload,
 } from '../types/api';
-
-const DEFAULT_BASE_URLS: Record<string, string> = {
-  openai: 'https://api.openai.com',
-  anthropic: 'https://api.anthropic.com',
-  gemini: 'https://generativelanguage.googleapis.com',
-  ollama: 'http://127.0.0.1:11434',
-};
+import { ProviderModal } from './routing/ProviderModal';
+import { RouteModal } from './routing/RouteModal';
 
 export interface RoutingFocusState {
   section?: 'all' | 'providers' | 'routes';
@@ -51,19 +42,6 @@ interface RoutingViewProps {
   onSectionChange?: (section: 'all' | 'providers' | 'routes') => void;
   onOpenPricing?: () => void;
   onCountsChange?: (counts: { providers: number; routes: number }) => void;
-}
-
-function parseOptionalNonNegativeNumber(
-  raw: string,
-  fieldLabel: string,
-): { value: number | null; error: string | null } {
-  const trimmed = raw.trim();
-  if (!trimmed) return { value: null, error: null };
-  const parsed = Number(trimmed);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return { value: null, error: `${fieldLabel} must be a non-negative number.` };
-  }
-  return { value: parsed, error: null };
 }
 
 export function RoutingView({
@@ -91,32 +69,11 @@ export function RoutingView({
 
   // Provider Modal State
   const [providerModalOpen, setProviderModalOpen] = useState(false);
-  const [providerModalError, setProviderModalError] = useState<string | null>(null);
   const [editingProvider, setEditingProvider] = useState<ProviderItem | null>(null);
-  const [provName, setProvName] = useState('');
-  const [provType, setProvType] = useState('openai');
-  const [provBaseURL, setProvBaseURL] = useState(DEFAULT_BASE_URLS.openai);
-  const [provAPIKey, setProvAPIKey] = useState('');
-  const [provClearKey, setProvClearKey] = useState(false);
-  const [provModels, setProvModels] = useState('');
-  const [provPassthrough, setProvPassthrough] = useState(false);
-  const [provEnabled, setProvEnabled] = useState(true);
-  const [savingProvider, setSavingProvider] = useState(false);
 
   // Route Modal State
   const [routeModalOpen, setRouteModalOpen] = useState(false);
-  const [routeModalError, setRouteModalError] = useState<string | null>(null);
   const [editingRoute, setEditingRoute] = useState<ModelRouteItem | null>(null);
-  const [routeAlias, setRouteAlias] = useState('');
-  const [routeProvider, setRouteProvider] = useState('');
-  const [routeUpstreamModel, setRouteUpstreamModel] = useState('');
-  const [routeFallbacksText, setRouteFallbacksText] = useState('');
-  const [routeInputCost, setRouteInputCost] = useState('');
-  const [routeOutputCost, setRouteOutputCost] = useState('');
-  const [routeCacheReadCost, setRouteCacheReadCost] = useState('');
-  const [routeCacheWriteCost, setRouteCacheWriteCost] = useState('');
-  const [routeEnabled, setRouteEnabled] = useState(true);
-  const [savingRoute, setSavingRoute] = useState(false);
 
   // Fallback local Pricing Drawer when RoutingView is rendered standalone
   const [pricingOpen, setPricingOpen] = useState(false);
@@ -131,7 +88,6 @@ export function RoutingView({
       setProviders(provList);
       setRoutes(routeList);
       onCountsChange?.({ providers: provList.length, routes: routeList.length });
-      setRouteProvider((prev) => prev || provList[0]?.name || '');
     } catch (err: unknown) {
       setPageError(err instanceof Error ? err.message : 'Failed to load providers and routes');
     }
@@ -161,81 +117,13 @@ export function RoutingView({
 
   const openCreateProvider = () => {
     setEditingProvider(null);
-    setProviderModalError(null);
-    setProvName('');
-    setProvType('openai');
-    setProvBaseURL(DEFAULT_BASE_URLS.openai);
-    setProvAPIKey('');
-    setProvClearKey(false);
-    setProvModels('');
-    setProvPassthrough(false);
-    setProvEnabled(true);
     setProviderModalOpen(true);
   };
 
   const openEditProvider = (item: ProviderItem) => {
     if (item.source === 'config') return;
     setEditingProvider(item);
-    setProviderModalError(null);
-    setProvName(item.name);
-    setProvType(item.type);
-    setProvBaseURL(item.base_url);
-    setProvAPIKey('');
-    setProvClearKey(false);
-    setProvModels((item.models ?? []).join(', '));
-    setProvPassthrough(item.passthrough);
-    setProvEnabled(item.enabled);
     setProviderModalOpen(true);
-  };
-
-  const handleSaveProvider = async (event: FormEvent) => {
-    event.preventDefault();
-    setProviderModalError(null);
-
-    const trimmedName = provName.trim();
-    if (!trimmedName) {
-      setProviderModalError('Provider name is required.');
-      return;
-    }
-    if (trimmedName.includes('/')) {
-      setProviderModalError('Provider name must not contain "/".');
-      return;
-    }
-
-    setSavingProvider(true);
-    const payload: ProviderUpsertPayload = {
-      name: trimmedName,
-      type: provType,
-      base_url: provBaseURL.trim(),
-      passthrough: provPassthrough,
-      models: provModels
-        .split(/[,\n]/)
-        .map((m) => m.trim())
-        .filter(Boolean),
-      enabled: provEnabled,
-    };
-    if (provAPIKey.trim()) {
-      payload.api_key = provAPIKey.trim();
-    }
-    if (editingProvider && provClearKey) {
-      payload.clear_api_key = true;
-    }
-
-    try {
-      if (editingProvider) {
-        await api.updateProvider(editingProvider.name, payload);
-      } else {
-        await api.createProvider(payload);
-      }
-      setProviderModalOpen(false);
-      await loadAll();
-    } catch (err: unknown) {
-      setProviderModalError(
-        err instanceof Error ? err.message : 'Failed to save provider',
-      );
-    } finally {
-      setSavingProvider(false);
-    }
   };
 
   const handleToggleProvider = async (item: ProviderItem, enabled: boolean) => {
@@ -293,128 +181,13 @@ export function RoutingView({
 
   const openCreateRoute = () => {
     setEditingRoute(null);
-    setRouteModalError(null);
-    setRouteAlias('');
-    setRouteProvider(providers[0]?.name ?? '');
-    setRouteUpstreamModel('');
-    setRouteFallbacksText('');
-    setRouteInputCost('');
-    setRouteOutputCost('');
-    setRouteCacheReadCost('');
-    setRouteCacheWriteCost('');
-    setRouteEnabled(true);
     setRouteModalOpen(true);
   };
 
   const openEditRoute = (item: ModelRouteItem) => {
     if (item.source === 'config') return;
     setEditingRoute(item);
-    setRouteModalError(null);
-    setRouteAlias(item.alias);
-    setRouteProvider(item.provider_name);
-    setRouteUpstreamModel(item.upstream_model);
-    setRouteFallbacksText(
-      (item.fallbacks ?? []).map((fb) => `${fb.provider}/${fb.model}`).join('\n'),
-    );
-    setRouteInputCost(
-      item.input_cost_per_million != null ? String(item.input_cost_per_million) : '',
-    );
-    setRouteOutputCost(
-      item.output_cost_per_million != null ? String(item.output_cost_per_million) : '',
-    );
-    setRouteCacheReadCost(
-      item.cache_read_cost_per_million != null
-        ? String(item.cache_read_cost_per_million)
-        : '',
-    );
-    setRouteCacheWriteCost(
-      item.cache_write_cost_per_million != null
-        ? String(item.cache_write_cost_per_million)
-        : '',
-    );
-    setRouteEnabled(item.enabled);
     setRouteModalOpen(true);
-  };
-
-  const handleSaveRoute = async (event: FormEvent) => {
-    event.preventDefault();
-    setRouteModalError(null);
-
-    const alias = routeAlias.trim();
-    if (!alias) {
-      setRouteModalError('Route alias is required.');
-      return;
-    }
-
-    const effectiveProvider =
-      routeProvider.trim() || (!editingRoute ? providers[0]?.name ?? '' : '');
-    if (!effectiveProvider) {
-      setRouteModalError('Add an upstream provider first before creating a route.');
-      return;
-    }
-
-    const upstreamModel = routeUpstreamModel.trim();
-    if (!upstreamModel) {
-      setRouteModalError('Primary upstream model ID is required.');
-      return;
-    }
-
-    const knownProviderNames = providers.map((p) => p.name);
-    const parsedFallbacks = parseRouteFallbacks(routeFallbacksText, knownProviderNames);
-    if (parsedFallbacks.error) {
-      setRouteModalError(parsedFallbacks.error);
-      return;
-    }
-
-    const inTier = parseOptionalNonNegativeNumber(routeInputCost, 'Input cost');
-    if (inTier.error) {
-      setRouteModalError(inTier.error);
-      return;
-    }
-    const outTier = parseOptionalNonNegativeNumber(routeOutputCost, 'Output cost');
-    if (outTier.error) {
-      setRouteModalError(outTier.error);
-      return;
-    }
-    const crTier = parseOptionalNonNegativeNumber(routeCacheReadCost, 'Cache read cost');
-    if (crTier.error) {
-      setRouteModalError(crTier.error);
-      return;
-    }
-    const cwTier = parseOptionalNonNegativeNumber(routeCacheWriteCost, 'Cache write cost');
-    if (cwTier.error) {
-      setRouteModalError(cwTier.error);
-      return;
-    }
-
-    setSavingRoute(true);
-    const payload: ModelRouteUpsertPayload = {
-      alias,
-      provider_name: effectiveProvider,
-      upstream_model: upstreamModel,
-      fallbacks: parsedFallbacks.fallbacks,
-      input_cost_per_million: inTier.value,
-      output_cost_per_million: outTier.value,
-      cache_read_cost_per_million: crTier.value,
-      cache_write_cost_per_million: cwTier.value,
-      enabled: routeEnabled,
-    };
-
-    try {
-      if (editingRoute) {
-        await api.updateRoute(editingRoute.alias, payload);
-      } else {
-        await api.createRoute(payload);
-      }
-      setRouteModalOpen(false);
-      await loadAll();
-    } catch (err: unknown) {
-      setRouteModalError(
-        err instanceof Error ? err.message : 'Failed to save model route',
-      );
-    } finally {
-      setSavingRoute(false);
-    }
   };
 
   const handleToggleRoute = async (item: ModelRouteItem, enabled: boolean) => {
@@ -880,292 +653,20 @@ export function RoutingView({
         </section>
       )}
 
-      {/* Provider Modal */}
-      <Modal
+      <ProviderModal
         open={providerModalOpen}
-        title={editingProvider ? `Edit Provider (${editingProvider.name})` : 'Add Provider'}
+        editingProvider={editingProvider}
         onClose={() => setProviderModalOpen(false)}
-        error={providerModalError}
-      >
-        <form
-          onSubmit={handleSaveProvider}
-          style={{ display: 'flex', flexDirection: 'column', gap: 14 }}
-        >
-          <div className="ap-form-grid">
-            <label className="ap-field">
-              <span className="ap-label">Provider Name</span>
-              <input
-                className="ap-input ap-mono"
-                required
-                disabled={Boolean(editingProvider)}
-                value={provName}
-                onChange={(e) => setProvName(e.target.value)}
-                placeholder="anthropic-prod"
-              />
-            </label>
+        onSaved={loadAll}
+      />
 
-            <label className="ap-field">
-              <span className="ap-label">Protocol</span>
-              <select
-                className="ap-select"
-                value={provType}
-                onChange={(e) => {
-                  const next = e.target.value;
-                  setProvType(next);
-                  if (!editingProvider && DEFAULT_BASE_URLS[next]) {
-                    setProvBaseURL(DEFAULT_BASE_URLS[next]);
-                  }
-                }}
-              >
-                <option value="openai">OpenAI (/v1)</option>
-                <option value="anthropic">Anthropic (/v1/messages)</option>
-                <option value="gemini">Gemini (/v1beta)</option>
-                <option value="ollama">Ollama (Local / HTTP)</option>
-              </select>
-            </label>
-          </div>
-
-          <label className="ap-field">
-            <span className="ap-label">Upstream Base URL</span>
-            <input
-              className="ap-input ap-mono"
-              required
-              value={provBaseURL}
-              onChange={(e) => setProvBaseURL(e.target.value)}
-              placeholder="https://api.anthropic.com"
-            />
-          </label>
-
-          <label className="ap-field">
-            <span className="ap-label">Upstream API Key (encrypted at rest)</span>
-            <input
-              type="password"
-              className="ap-input ap-mono"
-              value={provAPIKey}
-              onChange={(e) => {
-                setProvAPIKey(e.target.value);
-                if (e.target.value) setProvClearKey(false);
-              }}
-              placeholder={
-                editingProvider?.has_api_key
-                  ? `${editingProvider.api_key_preview || 'Stored'} — leave blank to keep`
-                  : 'sk-...'
-              }
-            />
-          </label>
-
-          {editingProvider?.has_api_key && (
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <span className="ap-label">Clear stored API key</span>
-              <Toggle
-                checked={provClearKey}
-                onChange={setProvClearKey}
-                label="Clear stored API key"
-              />
-            </div>
-          )}
-
-          <label className="ap-field">
-            <span className="ap-label">Advertised Models (optional, comma-separated)</span>
-            <input
-              className="ap-input ap-mono"
-              value={provModels}
-              onChange={(e) => setProvModels(e.target.value)}
-              placeholder="claude-sonnet-4-20250514, claude-opus-4-20250514"
-            />
-          </label>
-
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <div>
-              <div className="ap-label">Client Key Passthrough</div>
-              <div className="ap-hint">Forward caller Authorization / x-api-key header when gateway has no stored key.</div>
-            </div>
-            <Toggle
-              checked={provPassthrough}
-              onChange={setProvPassthrough}
-              label="Allow Client Key Passthrough"
-            />
-          </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <span className="ap-label">Enabled</span>
-            <Toggle
-              checked={provEnabled}
-              onChange={setProvEnabled}
-              label="Provider Enabled"
-            />
-          </div>
-
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, paddingTop: 6 }}>
-            <button
-              type="button"
-              className="ap-btn"
-              onClick={() => setProviderModalOpen(false)}
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              className="ap-btn ap-btn-primary"
-              disabled={savingProvider}
-            >
-              {savingProvider ? 'Saving...' : 'Save Provider'}
-            </button>
-          </div>
-        </form>
-      </Modal>
-
-      {/* Route Modal */}
-      <Modal
+      <RouteModal
         open={routeModalOpen}
-        title={editingRoute ? `Edit Route (${editingRoute.alias})` : 'Add Model Route'}
+        editingRoute={editingRoute}
+        providers={providers}
         onClose={() => setRouteModalOpen(false)}
-        maxWidth={620}
-        error={routeModalError}
-      >
-        <form
-          onSubmit={handleSaveRoute}
-          style={{ display: 'flex', flexDirection: 'column', gap: 14 }}
-        >
-          <div className="ap-form-grid">
-            <label className="ap-field">
-              <span className="ap-label">Virtual Alias</span>
-              <input
-                className="ap-input ap-mono"
-                required
-                disabled={Boolean(editingRoute)}
-                value={routeAlias}
-                onChange={(e) => setRouteAlias(e.target.value)}
-                placeholder="team/coding"
-              />
-            </label>
-
-            <label className="ap-field">
-              <span className="ap-label">Primary Provider</span>
-              <select
-                className="ap-select"
-                value={routeProvider}
-                onChange={(e) => setRouteProvider(e.target.value)}
-              >
-                {providers.length === 0 && (
-                  <option value="">No providers configured</option>
-                )}
-                {providers.map((p) => (
-                  <option key={p.name} value={p.name}>
-                    {p.name} ({p.type})
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
-
-          <label className="ap-field">
-            <span className="ap-label">Primary Upstream Model ID</span>
-            <input
-              className="ap-input ap-mono"
-              required
-              value={routeUpstreamModel}
-              onChange={(e) => setRouteUpstreamModel(e.target.value)}
-              placeholder="claude-sonnet-4-20250514"
-            />
-          </label>
-
-          <label className="ap-field">
-            <span className="ap-label">Fallback Targets (one provider/model per line)</span>
-            <textarea
-              className="ap-textarea ap-mono"
-              value={routeFallbacksText}
-              onChange={(e) => setRouteFallbacksText(e.target.value)}
-              placeholder={'openai/gpt-4.1\ngemini/gemini-2.5-pro'}
-            />
-            <span className="ap-hint">
-              Each line must include both provider name and model ID separated by "/".
-            </span>
-          </label>
-
-          <div className="ap-field">
-            <span className="ap-label">
-              Cost Overrides (USD per 1M tokens — leave blank for built-in default)
-            </span>
-            <div className="ap-form-grid-4">
-              <label className="ap-field">
-                <span className="ap-hint">Input</span>
-                <input
-                  type="number"
-                  min={0}
-                  step="any"
-                  className="ap-input ap-input--sm ap-tabular"
-                  value={routeInputCost}
-                  onChange={(e) => setRouteInputCost(e.target.value)}
-                  placeholder="Default"
-                />
-              </label>
-              <label className="ap-field">
-                <span className="ap-hint">Output</span>
-                <input
-                  type="number"
-                  min={0}
-                  step="any"
-                  className="ap-input ap-input--sm ap-tabular"
-                  value={routeOutputCost}
-                  onChange={(e) => setRouteOutputCost(e.target.value)}
-                  placeholder="Default"
-                />
-              </label>
-              <label className="ap-field">
-                <span className="ap-hint">Cache Read</span>
-                <input
-                  type="number"
-                  min={0}
-                  step="any"
-                  className="ap-input ap-input--sm ap-tabular"
-                  value={routeCacheReadCost}
-                  onChange={(e) => setRouteCacheReadCost(e.target.value)}
-                  placeholder="Default"
-                />
-              </label>
-              <label className="ap-field">
-                <span className="ap-hint">Cache Write</span>
-                <input
-                  type="number"
-                  min={0}
-                  step="any"
-                  className="ap-input ap-input--sm ap-tabular"
-                  value={routeCacheWriteCost}
-                  onChange={(e) => setRouteCacheWriteCost(e.target.value)}
-                  placeholder="Default"
-                />
-              </label>
-            </div>
-          </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <span className="ap-label">Enabled</span>
-            <Toggle
-              checked={routeEnabled}
-              onChange={setRouteEnabled}
-              label="Route Enabled"
-            />
-          </div>
-
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, paddingTop: 6 }}>
-            <button
-              type="button"
-              className="ap-btn"
-              onClick={() => setRouteModalOpen(false)}
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              className="ap-btn ap-btn-primary"
-              disabled={savingRoute}
-            >
-              {savingRoute ? 'Saving...' : 'Save Route'}
-            </button>
-          </div>
-        </form>
-      </Modal>
+        onSaved={loadAll}
+      />
 
       {!onOpenPricing && (
         <PricingDrawer

@@ -1,16 +1,13 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { api } from '../api/client';
 import {
   AlertIcon,
   EditIcon,
   PlayIcon,
   PlusIcon,
-  ShieldIcon,
 } from '../components/ApertureIcons';
 import {
-  CodeBlock,
   ConfirmDeleteButton,
-  Modal,
   SegmentedControl,
   SourceBadge,
   Toggle,
@@ -19,36 +16,12 @@ import {
 import { formatLatency } from '../lib/format';
 import type {
   GuardrailRule,
-  GuardrailTestResponse,
-  GuardrailUpsertPayload,
   WebhookItem,
   WebhookTestResult,
-  WebhookUpsertPayload,
 } from '../types/api';
-
-const WEBHOOK_EVENTS = [
-  '*',
-  'budget.threshold',
-  'budget.exceeded',
-  'guardrail.triggered',
-  'upstream.fallback',
-  'upstream.error',
-];
-
-const PLAYGROUND_PRESETS = [
-  {
-    label: 'Secret + Email PII',
-    text: 'Deploy with OPENAI_API_KEY=sk-proj-9f8e7d6c5b4a32109876543210abcdef and notify ops-lead@acme.internal.',
-  },
-  {
-    label: 'AWS Access Key',
-    text: 'aws_access_key_id = AKIAIOSFODNN7EXAMPLE\nssn = 123-45-6789',
-  },
-  {
-    label: 'Clean Prompt',
-    text: 'Summarize Kubernetes pod restart causes in three concise bullet points.',
-  },
-];
+import { GuardrailPlayground } from './security/GuardrailPlayground';
+import { GuardrailRuleModal } from './security/GuardrailRuleModal';
+import { WebhookModal } from './security/WebhookModal';
 
 export interface SecurityFocusState {
   section?: 'all' | 'guardrails' | 'webhooks';
@@ -81,39 +54,13 @@ export function SecurityView({
   const [togglingRules, setTogglingRules] = useState<Record<string, boolean>>({});
   const [togglingWebhooks, setTogglingWebhooks] = useState<Record<string, boolean>>({});
 
-  // Interactive Live Guardrail Playground
-  const [sampleText, setSampleText] = useState(PLAYGROUND_PRESETS[0].text);
-  const [testResult, setTestResult] = useState<GuardrailTestResponse | null>(null);
-  const [testingGuardrail, setTestingGuardrail] = useState(false);
-  const [playgroundError, setPlaygroundError] = useState<string | null>(null);
-
   // Guardrail Rule Modal
   const [ruleModalOpen, setRuleModalOpen] = useState(false);
-  const [ruleModalError, setRuleModalError] = useState<string | null>(null);
   const [editingRule, setEditingRule] = useState<GuardrailRule | null>(null);
-  const [ruleId, setRuleId] = useState('');
-  const [ruleName, setRuleName] = useState('');
-  const [ruleCategory, setRuleCategory] = useState('custom');
-  const [rulePattern, setRulePattern] = useState('');
-  const [ruleAction, setRuleAction] = useState('redact');
-  const [ruleEnabled, setRuleEnabled] = useState(true);
-  const [savingRule, setSavingRule] = useState(false);
 
   // Webhook Modal
   const [whModalOpen, setWhModalOpen] = useState(false);
-  const [whModalError, setWhModalError] = useState<string | null>(null);
   const [editingWebhook, setEditingWebhook] = useState<WebhookItem | null>(null);
-  const [whId, setWhId] = useState('');
-  const [whName, setWhName] = useState('');
-  const [whUrl, setWhUrl] = useState('');
-  const [whType, setWhType] = useState('async_event');
-  const [whSecret, setWhSecret] = useState('');
-  const [whClearSecret, setWhClearSecret] = useState(false);
-  const [whEvents, setWhEvents] = useState<string[]>(['guardrail.triggered', 'budget.exceeded']);
-  const [whTimeout, setWhTimeout] = useState('2000');
-  const [whFailOpen, setWhFailOpen] = useState(true);
-  const [whEnabled, setWhEnabled] = useState(true);
-  const [savingWebhook, setSavingWebhook] = useState(false);
 
   const [webhookTests, setWebhookTests] = useState<Record<string, WebhookTestResult>>({});
   const [testingWebhookId, setTestingWebhookId] = useState<string | null>(null);
@@ -163,89 +110,13 @@ export function SecurityView({
 
   const openCreateRule = () => {
     setEditingRule(null);
-    setRuleModalError(null);
-    setRuleId('');
-    setRuleName('');
-    setRuleCategory('custom');
-    setRulePattern('');
-    setRuleAction('redact');
-    setRuleEnabled(true);
     setRuleModalOpen(true);
   };
 
   const openEditRule = (item: GuardrailRule) => {
     if (item.source === 'config') return;
     setEditingRule(item);
-    setRuleModalError(null);
-    setRuleId(item.id);
-    setRuleName(item.name);
-    setRuleCategory(item.category);
-    setRulePattern(item.pattern);
-    setRuleAction(item.action);
-    setRuleEnabled(item.enabled);
     setRuleModalOpen(true);
-  };
-
-  const handleSaveRule = async (event: FormEvent) => {
-    event.preventDefault();
-    setRuleModalError(null);
-
-    const trimmedId = ruleId.trim();
-    if (trimmedId.includes('/')) {
-      setRuleModalError('Rule ID must not contain "/".');
-      return;
-    }
-    if (trimmedId.toLowerCase() === 'test') {
-      setRuleModalError('Rule ID "test" is reserved by the playground endpoint.');
-      return;
-    }
-
-    const isBuiltinPreset = Boolean(editingRule?.builtin);
-    if (!isBuiltinPreset) {
-      if (!ruleName.trim()) {
-        setRuleModalError('Display name is required.');
-        return;
-      }
-      if (!rulePattern.trim()) {
-        setRuleModalError('Regular expression pattern is required.');
-        return;
-      }
-    }
-
-    setSavingRule(true);
-    const payload: GuardrailUpsertPayload = isBuiltinPreset && editingRule
-      ? {
-          id: editingRule.id,
-          name: editingRule.name,
-          category: editingRule.category,
-          pattern: editingRule.pattern,
-          action: ruleAction,
-          enabled: ruleEnabled,
-        }
-      : {
-          id: trimmedId,
-          name: ruleName.trim(),
-          category: ruleCategory,
-          pattern: rulePattern,
-          action: ruleAction,
-          enabled: ruleEnabled,
-        };
-
-    try {
-      if (editingRule) {
-        await api.updateGuardrail(editingRule.id, payload);
-      } else {
-        await api.createGuardrail(payload);
-      }
-      setRuleModalOpen(false);
-      await loadAll();
-    } catch (err: unknown) {
-      setRuleModalError(
-        err instanceof Error ? err.message : 'Failed to save guardrail rule',
-      );
-    } finally {
-      setSavingRule(false);
-    }
   };
 
   const handleToggleRule = async (item: GuardrailRule, next: boolean) => {
@@ -280,112 +151,15 @@ export function SecurityView({
     }
   };
 
-  const runPlayground = async (textToTest: string) => {
-    setTestingGuardrail(true);
-    setPlaygroundError(null);
-    try {
-      const res = await api.testGuardrails(textToTest);
-      setTestResult(res);
-    } catch (err: unknown) {
-      setPlaygroundError(
-        err instanceof Error ? err.message : 'Guardrail evaluation failed',
-      );
-    } finally {
-      setTestingGuardrail(false);
-    }
-  };
-
-  const handleRunTest = (event: FormEvent) => {
-    event.preventDefault();
-    void runPlayground(sampleText);
-  };
-
   const openCreateWebhook = () => {
     setEditingWebhook(null);
-    setWhModalError(null);
-    setWhId('');
-    setWhName('');
-    setWhUrl('');
-    setWhType('async_event');
-    setWhSecret('');
-    setWhClearSecret(false);
-    setWhEvents(['guardrail.triggered', 'budget.exceeded']);
-    setWhTimeout('2000');
-    setWhFailOpen(true);
-    setWhEnabled(true);
     setWhModalOpen(true);
   };
 
   const openEditWebhook = (item: WebhookItem) => {
     if (item.source === 'config') return;
     setEditingWebhook(item);
-    setWhModalError(null);
-    setWhId(item.id);
-    setWhName(item.name);
-    setWhUrl(item.url);
-    setWhType(item.type);
-    setWhSecret('');
-    setWhClearSecret(false);
-    setWhEvents(item.events ?? []);
-    setWhTimeout(String(item.timeout_ms || 2000));
-    setWhFailOpen(item.fail_open);
-    setWhEnabled(item.enabled);
     setWhModalOpen(true);
-  };
-
-  const handleSaveWebhook = async (event: FormEvent) => {
-    event.preventDefault();
-    setWhModalError(null);
-
-    if (whId.trim().includes('/')) {
-      setWhModalError('Webhook ID must not contain "/".');
-      return;
-    }
-    if (!whName.trim()) {
-      setWhModalError('Webhook name is required.');
-      return;
-    }
-    if (!whUrl.trim()) {
-      setWhModalError('Target HTTP/HTTPS URL is required.');
-      return;
-    }
-    const parsedTimeout = Number(whTimeout);
-    if (!Number.isFinite(parsedTimeout) || parsedTimeout <= 0) {
-      setWhModalError('Timeout (ms) must be a positive number.');
-      return;
-    }
-
-    setSavingWebhook(true);
-    const payload: WebhookUpsertPayload = {
-      id: whId.trim(),
-      name: whName.trim(),
-      url: whUrl.trim(),
-      type: whType,
-      events: whType === 'async_event' ? whEvents : [],
-      timeout_ms: Math.floor(parsedTimeout),
-      fail_open: whFailOpen,
-      enabled: whEnabled,
-    };
-    if (whSecret.trim()) {
-      payload.secret = whSecret.trim();
-    }
-    if (editingWebhook && whClearSecret) {
-      payload.clear_secret = true;
-    }
-
-    try {
-      if (editingWebhook) {
-        await api.updateWebhook(editingWebhook.id, payload);
-      } else {
-        await api.createWebhook(payload);
-      }
-      setWhModalOpen(false);
-      await loadAll();
-    } catch (err: unknown) {
-      setWhModalError(err instanceof Error ? err.message : 'Failed to save webhook');
-    } finally {
-      setSavingWebhook(false);
-    }
   };
 
   const handleToggleWebhook = async (item: WebhookItem, next: boolean) => {
@@ -444,12 +218,6 @@ export function SecurityView({
     }
   };
 
-  const toggleWebhookEvent = (evt: string) => {
-    setWhEvents((prev) =>
-      prev.includes(evt) ? prev.filter((item) => item !== evt) : [...prev, evt],
-    );
-  };
-
   const filteredRules = useMemo(() => {
     if (categoryFilter === 'all') return rules;
     return rules.filter((r) => r.category === categoryFilter);
@@ -467,8 +235,6 @@ export function SecurityView({
     setSectionMode(next);
     onSectionChange?.(next);
   };
-
-  const verdictAction = (testResult?.action || 'allow').toLowerCase();
 
   return (
     <div className="ap-page">
@@ -528,129 +294,7 @@ export function SecurityView({
 
       {showGuardrails && (
         <>
-          {/* Live Guardrail Playground inside Aperture Double-Bezel Tray */}
-          <section className="ap-bezel-tray" aria-label="Live Guardrail Playground">
-            <div className="ap-card">
-              <div className="ap-card-header">
-                <div>
-                  <h2 className="ap-card-title">Live Guardrail Playground</h2>
-                  <p className="ap-card-subtitle">
-                    Paste a sample prompt or JSON body to simulate active detectors and preview `[REDACTED:...]` output.
-                  </p>
-                </div>
-                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                  {PLAYGROUND_PRESETS.map((preset) => (
-                    <button
-                      key={preset.label}
-                      type="button"
-                      className="ap-btn ap-btn-sm"
-                      onClick={() => {
-                        setSampleText(preset.text);
-                        void runPlayground(preset.text);
-                      }}
-                    >
-                      {preset.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <form onSubmit={handleRunTest} className="ap-card-body ap-split-2">
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                  <textarea
-                    className="ap-textarea ap-mono"
-                    style={{ minHeight: 118 }}
-                    value={sampleText}
-                    onChange={(e) => setSampleText(e.target.value)}
-                    placeholder="Paste sample prompt or JSON request..."
-                    aria-label="Sample prompt to evaluate against guardrails"
-                  />
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
-                    <span className="ap-hint">
-                      Evaluates against all currently enabled rules in SQLite & YAML.
-                    </span>
-                    <button
-                      type="submit"
-                      className="ap-btn ap-btn-primary"
-                      disabled={testingGuardrail || !sampleText.trim()}
-                    >
-                      <ShieldIcon size={15} />
-                      <span>{testingGuardrail ? 'Evaluating...' : 'Evaluate Sample'}</span>
-                    </button>
-                  </div>
-                </div>
-
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 10, minWidth: 0 }}>
-                  {playgroundError && (
-                    <div className="ap-alert ap-alert--danger">
-                      <AlertIcon style={{ flexShrink: 0, marginTop: 1 }} />
-                      <span>{playgroundError}</span>
-                    </div>
-                  )}
-
-                  {testResult ? (
-                    <>
-                      <div
-                        style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: 8,
-                          flexWrap: 'wrap',
-                        }}
-                      >
-                        <span
-                          className={`ap-badge ${
-                            verdictAction === 'block'
-                              ? 'ap-badge--red'
-                              : verdictAction === 'redact'
-                                ? 'ap-badge--amber'
-                                : 'ap-badge--green'
-                          }`}
-                        >
-                          Verdict: {verdictAction.toUpperCase()}
-                        </span>
-                        {(testResult.matches ?? []).length > 0 ? (
-                          (testResult.matches ?? []).map((m) => (
-                            <span key={m.rule_id} className="ap-badge ap-mono">
-                              {m.rule_name} ({m.action})
-                            </span>
-                          ))
-                        ) : (
-                          <span style={{ color: 'var(--ap-text-secondary)', fontSize: 12 }}>
-                            No rules matched — request allowed unchanged.
-                          </span>
-                        )}
-                      </div>
-                      <CodeBlock
-                        label="Evaluated / Redacted Output"
-                        code={testResult.redacted_text}
-                        highlightRedactions
-                      />
-                    </>
-                  ) : (
-                    <div
-                      style={{
-                        flex: 1,
-                        minHeight: 118,
-                        borderRadius: 'var(--ap-radius-md)',
-                        border: '1px dashed var(--ap-border-strong)',
-                        background: 'var(--ap-subcard-bg)',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        padding: 16,
-                        color: 'var(--ap-text-secondary)',
-                        fontSize: 12.5,
-                        textAlign: 'center',
-                      }}
-                    >
-                      Click &ldquo;Evaluate Sample&rdquo; or pick a preset above to inspect rule hits and redactions.
-                    </div>
-                  )}
-                </div>
-              </form>
-            </div>
-          </section>
+          <GuardrailPlayground />
 
           {/* Guardrail Rules Inventory */}
           <section className="ap-card" aria-label="Guardrail rules">
@@ -971,279 +615,19 @@ export function SecurityView({
         </section>
       )}
 
-      {/* Guardrail Rule Modal */}
-      <Modal
+      <GuardrailRuleModal
         open={ruleModalOpen}
-        title={editingRule ? `Edit Guardrail (${editingRule.name})` : 'Add Guardrail Rule'}
+        editingRule={editingRule}
         onClose={() => setRuleModalOpen(false)}
-        error={ruleModalError}
-      >
-        <form
-          onSubmit={handleSaveRule}
-          style={{ display: 'flex', flexDirection: 'column', gap: 14 }}
-        >
-          {editingRule?.builtin && (
-            <div className="ap-alert ap-alert--info">
-              <AlertIcon style={{ flexShrink: 0, marginTop: 1 }} />
-              <span>
-                Built-in detector presets keep Name, Category, and Regex read-only. You can customize Action and Enabled state below.
-              </span>
-            </div>
-          )}
+        onSaved={loadAll}
+      />
 
-          <div className="ap-form-grid">
-            <label className="ap-field">
-              <span className="ap-label">Rule ID</span>
-              <input
-                className="ap-input ap-mono"
-                disabled={Boolean(editingRule)}
-                value={ruleId}
-                onChange={(e) => setRuleId(e.target.value)}
-                placeholder="Auto-generated if blank"
-              />
-            </label>
-            <label className="ap-field">
-              <span className="ap-label">Display Name</span>
-              <input
-                className="ap-input"
-                required={!editingRule?.builtin}
-                disabled={Boolean(editingRule?.builtin)}
-                value={ruleName}
-                onChange={(e) => setRuleName(e.target.value)}
-                placeholder="Internal Deploy Token"
-              />
-            </label>
-          </div>
-
-          <div className="ap-form-grid">
-            <label className="ap-field">
-              <span className="ap-label">Category</span>
-              <select
-                className="ap-select"
-                disabled={Boolean(editingRule?.builtin)}
-                value={ruleCategory}
-                onChange={(e) => setRuleCategory(e.target.value)}
-              >
-                <option value="secret">secret</option>
-                <option value="pii">pii</option>
-                <option value="custom">custom</option>
-              </select>
-            </label>
-            <label className="ap-field">
-              <span className="ap-label">Action on Match</span>
-              <select
-                className="ap-select"
-                value={ruleAction}
-                onChange={(e) => setRuleAction(e.target.value)}
-              >
-                <option value="redact">redact (mask matched value)</option>
-                <option value="block">block (HTTP 400 reject)</option>
-                <option value="log_only">log_only (audit without modifying)</option>
-              </select>
-            </label>
-          </div>
-
-          <label className="ap-field">
-            <span className="ap-label">Go Regular Expression (RE2)</span>
-            <input
-              className="ap-input ap-mono"
-              required={!editingRule?.builtin}
-              disabled={Boolean(editingRule?.builtin)}
-              value={rulePattern}
-              onChange={(e) => setRulePattern(e.target.value)}
-              placeholder="hlp_[a-zA-Z0-9]{24,}"
-            />
-          </label>
-
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <span className="ap-label">Enabled</span>
-            <Toggle
-              checked={ruleEnabled}
-              onChange={setRuleEnabled}
-              label="Rule Enabled"
-            />
-          </div>
-
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, paddingTop: 6 }}>
-            <button
-              type="button"
-              className="ap-btn"
-              onClick={() => setRuleModalOpen(false)}
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              className="ap-btn ap-btn-primary"
-              disabled={savingRule}
-            >
-              {savingRule ? 'Saving...' : 'Save Rule'}
-            </button>
-          </div>
-        </form>
-      </Modal>
-
-      {/* Webhook Modal */}
-      <Modal
+      <WebhookModal
         open={whModalOpen}
-        title={editingWebhook ? `Edit Webhook (${editingWebhook.name})` : 'Add Webhook'}
+        editingWebhook={editingWebhook}
         onClose={() => setWhModalOpen(false)}
-        maxWidth={600}
-        error={whModalError}
-      >
-        <form
-          onSubmit={handleSaveWebhook}
-          style={{ display: 'flex', flexDirection: 'column', gap: 14 }}
-        >
-          <div className="ap-form-grid">
-            <label className="ap-field">
-              <span className="ap-label">Webhook ID</span>
-              <input
-                className="ap-input ap-mono"
-                disabled={Boolean(editingWebhook)}
-                value={whId}
-                onChange={(e) => setWhId(e.target.value)}
-                placeholder="Auto-generated if blank"
-              />
-            </label>
-            <label className="ap-field">
-              <span className="ap-label">Display Name</span>
-              <input
-                className="ap-input"
-                required
-                value={whName}
-                onChange={(e) => setWhName(e.target.value)}
-                placeholder="SecOps Alerts"
-              />
-            </label>
-          </div>
-
-          <div className="ap-form-grid">
-            <label className="ap-field">
-              <span className="ap-label">Mode</span>
-              <select
-                className="ap-select"
-                value={whType}
-                onChange={(e) => setWhType(e.target.value)}
-              >
-                <option value="async_event">async_event (non-blocking notifications)</option>
-                <option value="sync_review">sync_review (pre-request allow/block)</option>
-              </select>
-            </label>
-            <label className="ap-field">
-              <span className="ap-label">Timeout (ms)</span>
-              <input
-                type="number"
-                min={100}
-                className="ap-input ap-tabular"
-                value={whTimeout}
-                onChange={(e) => setWhTimeout(e.target.value)}
-              />
-            </label>
-          </div>
-
-          <label className="ap-field">
-            <span className="ap-label">Target Endpoint URL</span>
-            <input
-              className="ap-input ap-mono"
-              required
-              value={whUrl}
-              onChange={(e) => setWhUrl(e.target.value)}
-              placeholder="https://secops.internal/hooks/headlamp"
-            />
-          </label>
-
-          <label className="ap-field">
-            <span className="ap-label">HMAC-SHA256 Signing Secret (optional)</span>
-            <input
-              type="password"
-              className="ap-input ap-mono"
-              value={whSecret}
-              onChange={(e) => {
-                setWhSecret(e.target.value);
-                if (e.target.value) setWhClearSecret(false);
-              }}
-              placeholder={
-                editingWebhook?.has_secret
-                  ? 'Signed — leave blank to keep current secret'
-                  : 'whsec_...'
-              }
-            />
-          </label>
-
-          {editingWebhook?.has_secret && (
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <span className="ap-label">Clear stored HMAC secret</span>
-              <Toggle
-                checked={whClearSecret}
-                onChange={setWhClearSecret}
-                label="Clear stored HMAC secret"
-              />
-            </div>
-          )}
-
-          {whType === 'async_event' ? (
-            <div className="ap-field">
-              <span className="ap-label">Subscribed Events</span>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                {WEBHOOK_EVENTS.map((evt) => {
-                  const selected = whEvents.includes(evt);
-                  return (
-                    <button
-                      key={evt}
-                      type="button"
-                      className={`ap-btn ap-btn-sm ap-mono ${
-                        selected ? 'ap-btn-primary' : ''
-                      }`}
-                      onClick={() => toggleWebhookEvent(evt)}
-                    >
-                      {evt}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          ) : (
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <div>
-                <div className="ap-label">Fail Open on Webhook Timeout / Error</div>
-                <div className="ap-hint">Allow requests through when the review service is unreachable.</div>
-              </div>
-              <Toggle
-                checked={whFailOpen}
-                onChange={setWhFailOpen}
-                label="Fail Open"
-              />
-            </div>
-          )}
-
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <span className="ap-label">Enabled</span>
-            <Toggle
-              checked={whEnabled}
-              onChange={setWhEnabled}
-              label="Webhook Enabled"
-            />
-          </div>
-
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, paddingTop: 6 }}>
-            <button
-              type="button"
-              className="ap-btn"
-              onClick={() => setWhModalOpen(false)}
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              className="ap-btn ap-btn-primary"
-              disabled={savingWebhook}
-            >
-              {savingWebhook ? 'Saving...' : 'Save Webhook'}
-            </button>
-          </div>
-        </form>
-      </Modal>
+        onSaved={loadAll}
+      />
     </div>
   );
 }

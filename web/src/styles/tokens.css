@@ -1,0 +1,111 @@
+:root {
+  --font-sans: 'Geist Variable', 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'Geist Mono Variable', 'Geist Mono', ui-monospace, SFMono-Regular, monospace;
+
+  /* Tailscale Aperture light-first warm/cool neutral palette */
+  --ap-sidebar-bg: #F6F5F2;
+  --ap-sidebar-hover: #ECEBE6;
+  --ap-sidebar-active: #E6E5DF;
+  --ap-canvas-bg: #FAF9F7;
+  --ap-card-bg: #FFFFFF;
+  --ap-subcard-bg: #F6F5F2;
+  --ap-tray-bg: rgba(24, 24, 21, 0.028);
+
+  --ap-border: rgba(24, 24, 21, 0.08);
+  --ap-border-subtle: rgba(24, 24, 21, 0.055);
+  --ap-border-strong: rgba(24, 24, 21, 0.14);
+
+  --ap-text: #151514;
+  --ap-text-secondary: #5B5A55;
+  --ap-text-muted: #84827C;
+
+  /* Aperture royal blue & semantic status palette */
+  --ap-blue: #2563EB;
+  --ap-blue-hover: #1D4ED8;
+  --ap-blue-soft: #EFF5FF;
+  --ap-blue-border: #D6E4FF;
+  --ap-blue-text: #1E40AF;
+
+  --ap-green: #15803D;
+  --ap-green-soft: #ECFDF3;
+  --ap-green-border: #BBF7D0;
+
+  --ap-amber: #B45309;
+  --ap-amber-soft: #FFFBEB;
+  --ap-amber-border: #FDE68A;
+
+  --ap-red: #DC2626;
+  --ap-red-soft: #FEF2F2;
+  --ap-red-border: #FECACA;
+
+  --ap-purple: #6D28D9;
+  --ap-purple-soft: #F5F3FF;
+  --ap-purple-border: #DDD6FE;
+
+  --ap-radius-xs: 6px;
+  --ap-radius-sm: 8px;
+  --ap-radius-md: 10px;
+  --ap-radius-lg: 13px;
+  --ap-radius-xl: 16px;
+
+  --ap-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --ap-shadow-card: 0 1px 2px rgba(18, 18, 16, 0.035), inset 0 1px 0 rgba(255, 255, 255, 0.85);
+  --ap-shadow-float: 0 16px 40px rgba(18, 18, 16, 0.12), 0 2px 6px rgba(18, 18, 16, 0.05);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  max-width: 100vw;
+  overflow-x: clip;
+  background: var(--ap-canvas-bg);
+  color: var(--ap-text);
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  min-height: 100dvh;
+  display: flex;
+  width: 100%;
+}
+
+h1,
+h2,
+h3,
+h4,
+p {
+  margin: 0;
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--ap-text);
+}
+
+code,
+pre,
+.ap-mono {
+  font-family: var(--font-mono);
+  font-feature-settings: 'tnum' 1, 'zero' 1;
+}
+
+.ap-tabular {
+  font-variant-numeric: tabular-nums;
+}
