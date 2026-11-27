@@ -635,9 +635,10 @@ webhooks:
 		t.Fatalf("first SyncConfig: %v", err)
 	}
 
-	// Verify built-in guardrails were seeded alongside custom rule.
-	if _, err := st.GetGuardrailRule(ctx, "builtin-aws-access-key"); err != nil {
-		t.Fatalf("expected builtin-aws-access-key seeded: %v", err)
+	// Verify built-in guardrails were seeded with SourceBuiltin alongside custom rule.
+	seededAWS, err := st.GetGuardrailRule(ctx, "builtin-aws-access-key")
+	if err != nil || seededAWS.Source != SourceBuiltin || !seededAWS.Builtin {
+		t.Fatalf("expected builtin-aws-access-key seeded with source=%q, got (%+v, %v)", SourceBuiltin, seededAWS, err)
 	}
 
 	// Simulate Admin UI customizing a built-in guardrail rule (flips source='local', action='block').
@@ -729,5 +730,56 @@ webhooks:
 	}
 	if _, err := st.GetWebhook(ctx, "ui-wh-1"); err != nil {
 		t.Fatalf("local webhook lost: %v", err)
+	}
+}
+
+func TestSyncConfigBuiltinOverrideAndRestore(t *testing.T) {
+	st, _ := newTestStore(t, ":memory:")
+	ctx := context.Background()
+
+	// 1. Pin builtin-email explicitly in YAML -> must become source='config' with builtin=true.
+	cfgPinned, err := config.LoadFromBytes([]byte(`
+guardrails:
+  builtin_defaults: true
+  rules:
+    - id: builtin-email
+      name: Email Strict
+      category: pii
+      pattern: 'custom-email-regex@example\.com'
+      action: block
+      enabled: true
+`))
+	if err != nil {
+		t.Fatalf("LoadFromBytes cfgPinned: %v", err)
+	}
+	if err := st.SyncConfig(ctx, cfgPinned); err != nil {
+		t.Fatalf("SyncConfig cfgPinned: %v", err)
+	}
+
+	pinned, err := st.GetGuardrailRule(ctx, "builtin-email")
+	if err != nil || !pinned.Builtin || pinned.Source != SourceConfig || pinned.Action != config.GuardrailActionBlock || !pinned.Enabled {
+		t.Fatalf("expected YAML-pinned builtin-email with source=config, got (%+v, %v)", pinned, err)
+	}
+	untouched, err := st.GetGuardrailRule(ctx, "builtin-openai-key")
+	if err != nil || !untouched.Builtin || untouched.Source != SourceBuiltin {
+		t.Fatalf("expected unpinned builtin-openai-key with source=builtin, got (%+v, %v)", untouched, err)
+	}
+
+	// 2. Remove builtin-email from YAML rules while keeping builtin_defaults: true ->
+	// stale source='config' override is pruned and default SourceBuiltin preset is restored in the same tx!
+	cfgRestored, err := config.LoadFromBytes([]byte(`
+guardrails:
+  builtin_defaults: true
+`))
+	if err != nil {
+		t.Fatalf("LoadFromBytes cfgRestored: %v", err)
+	}
+	if err := st.SyncConfig(ctx, cfgRestored); err != nil {
+		t.Fatalf("SyncConfig cfgRestored: %v", err)
+	}
+
+	restored, err := st.GetGuardrailRule(ctx, "builtin-email")
+	if err != nil || !restored.Builtin || restored.Source != SourceBuiltin || restored.Action != config.GuardrailActionLogOnly || restored.Enabled {
+		t.Fatalf("expected default builtin-email restored with source=builtin, got (%+v, %v)", restored, err)
 	}
 }

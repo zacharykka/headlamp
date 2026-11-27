@@ -9,8 +9,9 @@ import (
 )
 
 const (
-	SourceConfig = "config"
-	SourceLocal  = "local"
+	SourceConfig  = "config"
+	SourceLocal   = "local"
+	SourceBuiltin = "builtin"
 )
 
 // ErrNotFound is returned when a requested record does not exist.

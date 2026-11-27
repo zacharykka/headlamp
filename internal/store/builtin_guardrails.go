@@ -15,7 +15,7 @@ func DefaultBuiltinGuardrailRules() []GuardrailRule {
 			Action:   config.GuardrailActionRedact,
 			Builtin:  true,
 			Enabled:  true,
-			Source:   SourceConfig,
+			Source:   SourceBuiltin,
 		},
 		{
 			ID:       "builtin-anthropic-key",
@@ -25,7 +25,7 @@ func DefaultBuiltinGuardrailRules() []GuardrailRule {
 			Action:   config.GuardrailActionRedact,
 			Builtin:  true,
 			Enabled:  true,
-			Source:   SourceConfig,
+			Source:   SourceBuiltin,
 		},
 		{
 			ID:       "builtin-aws-access-key",
@@ -35,7 +35,7 @@ func DefaultBuiltinGuardrailRules() []GuardrailRule {
 			Action:   config.GuardrailActionRedact,
 			Builtin:  true,
 			Enabled:  true,
-			Source:   SourceConfig,
+			Source:   SourceBuiltin,
 		},
 		{
 			ID:       "builtin-github-token",
@@ -45,7 +45,7 @@ func DefaultBuiltinGuardrailRules() []GuardrailRule {
 			Action:   config.GuardrailActionRedact,
 			Builtin:  true,
 			Enabled:  true,
-			Source:   SourceConfig,
+			Source:   SourceBuiltin,
 		},
 		{
 			ID:       "builtin-gcp-api-key",
@@ -55,7 +55,7 @@ func DefaultBuiltinGuardrailRules() []GuardrailRule {
 			Action:   config.GuardrailActionRedact,
 			Builtin:  true,
 			Enabled:  true,
-			Source:   SourceConfig,
+			Source:   SourceBuiltin,
 		},
 		{
 			ID:       "builtin-pem-private-key",
@@ -65,7 +65,7 @@ func DefaultBuiltinGuardrailRules() []GuardrailRule {
 			Action:   config.GuardrailActionBlock,
 			Builtin:  true,
 			Enabled:  true,
-			Source:   SourceConfig,
+			Source:   SourceBuiltin,
 		},
 		{
 			ID:       "builtin-jwt",
@@ -75,7 +75,7 @@ func DefaultBuiltinGuardrailRules() []GuardrailRule {
 			Action:   config.GuardrailActionLogOnly,
 			Builtin:  true,
 			Enabled:  false,
-			Source:   SourceConfig,
+			Source:   SourceBuiltin,
 		},
 		{
 			ID:       "builtin-credit-card",
@@ -85,7 +85,7 @@ func DefaultBuiltinGuardrailRules() []GuardrailRule {
 			Action:   config.GuardrailActionRedact,
 			Builtin:  true,
 			Enabled:  false,
-			Source:   SourceConfig,
+			Source:   SourceBuiltin,
 		},
 		{
 			ID:       "builtin-email",
@@ -95,7 +95,7 @@ func DefaultBuiltinGuardrailRules() []GuardrailRule {
 			Action:   config.GuardrailActionLogOnly,
 			Builtin:  true,
 			Enabled:  false,
-			Source:   SourceConfig,
+			Source:   SourceBuiltin,
 		},
 		{
 			ID:       "builtin-phone",
@@ -105,7 +105,7 @@ func DefaultBuiltinGuardrailRules() []GuardrailRule {
 			Action:   config.GuardrailActionLogOnly,
 			Builtin:  true,
 			Enabled:  false,
-			Source:   SourceConfig,
+			Source:   SourceBuiltin,
 		},
 	}
 }

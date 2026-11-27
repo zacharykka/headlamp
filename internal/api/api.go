@@ -533,7 +533,7 @@ func ssrfSafeDialControl(_, address string, _ syscall.RawConn) error {
 		return fmt.Errorf("probe dial blocked: invalid resolved address %q", address)
 	}
 	addr := ap.Addr().Unmap()
-	if addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsMulticast() || addr.IsUnspecified() || addr == awsIPv6IMDSAddr {
+	if addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsMulticast() || addr.IsUnspecified() || addr.WithZone("") == awsIPv6IMDSAddr {
 		return fmt.Errorf("probe dial blocked: destination IP %s is a restricted link-local, metadata, multicast, or unspecified address", addr)
 	}
 	return nil

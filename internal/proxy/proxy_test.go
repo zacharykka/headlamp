@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1976,4 +1977,101 @@ func TestSyncReviewModifyRepinsModelAndStream(t *testing.T) {
 		t.Fatalf("case D: combined redact+modify hijacked model=%v stream=%v", seenBody["model"], seenBody["stream"])
 	}
 	mu.Unlock()
+}
+
+func TestUpstreamSSRFGuardAndRedirectBlock(t *testing.T) {
+	// 1. Unit-test dial control IP policy (blocks link-local, AWS IMDS IPv4/IPv6 + zoned,
+	//    unspecified, multicast; allows loopback, Tailnet, RFC1918, public).
+	for _, addr := range []string{
+		"169.254.169.254:80",
+		"169.254.0.1:443",
+		"[::ffff:169.254.169.254]:80",
+		"[fe80::1]:80",
+		"[fd00:ec2::254]:80",
+		"[fd00:ec2::254%eth0]:80",
+		"0.0.0.0:80",
+		"[::]:80",
+		"224.0.0.1:80",
+		"[ff02::1]:80",
+	} {
+		if err := validateUpstreamDialAddr(addr); !errors.Is(err, errBlockedUpstreamAddress) {
+			t.Fatalf("expected %s to be blocked, got err=%v", addr, err)
+		}
+	}
+	for _, addr := range []string{
+		"127.0.0.1:11434",
+		"[::1]:11434",
+		"100.64.0.10:8080",
+		"10.0.0.5:8080",
+		"1.1.1.1:443",
+	} {
+		if err := validateUpstreamDialAddr(addr); err != nil {
+			t.Fatalf("expected %s to be allowed, got err=%v", addr, err)
+		}
+	}
+
+	// 2. Upstream 307 Temporary Redirect MUST NOT be followed for Anthropic (x-api-key) or Gemini (x-goog-api-key).
+	var attackerHits atomic.Int32
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attackerHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"stolen":true}`))
+	}))
+	defer attacker.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, attacker.URL+"/steal", http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "ant-redir", Type: config.ProviderTypeAnthropic, BaseURL: redirector.URL, APIKey: "sk-ant-secret", Models: []string{"claude-sonnet-4-6"}, Enabled: true,
+	})
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "gem-redir", Type: config.ProviderTypeGemini, BaseURL: redirector.URL, APIKey: "AIza-secret", Models: []string{"gemini-2.5-flash"}, Enabled: true,
+	})
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "imds-v4", Type: config.ProviderTypeOpenAI, BaseURL: "http://169.254.169.254", APIKey: "k", Models: []string{"imds-v4-model"}, Enabled: true,
+	})
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "imds-v6", Type: config.ProviderTypeGemini, BaseURL: "http://[fd00:ec2::254]", Passthrough: true, Models: []string{"imds-v6-model"}, Enabled: true,
+	})
+
+	gw, err := NewGateway(GatewayConfig{Store: st})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recAnt := httptest.NewRecorder()
+	gw.ServeHTTP(recAnt, authedReq(http.MethodPost, "/anthropic/v1/messages", `{"model":"ant-redir/claude-sonnet-4-6","max_tokens":16,"messages":[{"role":"user","content":"secret prompt"}]}`))
+	if recAnt.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("expected 307 non-followed redirect for Anthropic, got %d: %s", recAnt.Code, recAnt.Body.String())
+	}
+
+	recGem := httptest.NewRecorder()
+	gw.ServeHTTP(recGem, authedReq(http.MethodPost, "/gemini/v1beta/models/gem-redir%2Fgemini-2.5-flash:generateContent", `{"contents":[{"parts":[{"text":"secret prompt"}]}]}`))
+	if recGem.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("expected 307 non-followed redirect for Gemini, got %d: %s", recGem.Code, recGem.Body.String())
+	}
+
+	if attackerHits.Load() != 0 {
+		t.Fatalf("upstream redirect was followed %d times, leaking API key and prompt!", attackerHits.Load())
+	}
+
+	// 3. Providers targeting AWS IPv4 / IPv6 IMDS fail immediately before TCP connect with sanitized 502.
+	recIMDSv4 := httptest.NewRecorder()
+	gw.ServeHTTP(recIMDSv4, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"imds-v4/imds-v4-model","messages":[{"role":"user","content":"hi"}]}`))
+	if recIMDSv4.Code != http.StatusBadGateway || !strings.Contains(recIMDSv4.Body.String(), errBlockedUpstreamAddress.Error()) {
+		t.Fatalf("expected 502 blocked upstream IP for 169.254.169.254, got %d: %s", recIMDSv4.Code, recIMDSv4.Body.String())
+	}
+
+	recIMDSv6 := httptest.NewRecorder()
+	gw.ServeHTTP(recIMDSv6, authedReq(http.MethodPost, "/gemini/v1beta/models/imds-v6%2Fimds-v6-model:generateContent?key=super-secret-query-key", `{"contents":[{"parts":[{"text":"hi"}]}]}`))
+	if recIMDSv6.Code != http.StatusBadGateway || !strings.Contains(recIMDSv6.Body.String(), errBlockedUpstreamAddress.Error()) {
+		t.Fatalf("expected 502 blocked upstream IP for fd00:ec2::254, got %d: %s", recIMDSv6.Code, recIMDSv6.Body.String())
+	}
+	if strings.Contains(recIMDSv6.Body.String(), "super-secret-query-key") {
+		t.Fatalf("sanitized 502 error leaked Gemini query key: %s", recIMDSv6.Body.String())
+	}
 }

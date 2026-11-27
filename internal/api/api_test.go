@@ -540,10 +540,17 @@ func TestBackendReviewFixRegressions(t *testing.T) {
 		}
 		if err := st.UpsertGuardrailRule(ctx, store.GuardrailRule{
 			ID: "builtin-email", Name: "Email Address", Category: config.GuardrailCategoryPII,
-			Pattern: `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`, Action: config.GuardrailActionRedact,
-			Builtin: true, Enabled: false, Source: store.SourceConfig,
+			Pattern: `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`, Action: config.GuardrailActionLogOnly,
+			Builtin: true, Enabled: false, Source: store.SourceBuiltin,
 		}); err != nil {
 			t.Fatalf("seed builtin guardrail: %v", err)
+		}
+		if err := st.UpsertGuardrailRule(ctx, store.GuardrailRule{
+			ID: "builtin-aws-access-key", Name: "AWS Access Key ID", Category: config.GuardrailCategorySecret,
+			Pattern: `\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`, Action: config.GuardrailActionBlock,
+			Builtin: true, Enabled: true, Source: store.SourceConfig,
+		}); err != nil {
+			t.Fatalf("seed YAML-pinned builtin guardrail: %v", err)
 		}
 		if err := st.UpsertWebhook(ctx, store.Webhook{
 			ID: "cfg-wh", Name: "YAML Alerts", URL: "https://hooks.example.com/a",
@@ -572,6 +579,9 @@ func TestBackendReviewFixRegressions(t *testing.T) {
 			{"post config guardrail", http.MethodPost, "/api/v1/admin/guardrails", `{"id":"cfg-custom-rule","name":"X","pattern":"foo","action":"redact"}`},
 			{"put config guardrail", http.MethodPut, "/api/v1/admin/guardrails/cfg-custom-rule", `{"enabled":false}`},
 			{"delete config guardrail", http.MethodDelete, "/api/v1/admin/guardrails/cfg-custom-rule", ""},
+			{"post yaml-pinned builtin guardrail", http.MethodPost, "/api/v1/admin/guardrails", `{"id":"builtin-aws-access-key","name":"X","pattern":"foo","action":"redact"}`},
+			{"put yaml-pinned builtin guardrail", http.MethodPut, "/api/v1/admin/guardrails/builtin-aws-access-key", `{"enabled":false}`},
+			{"delete yaml-pinned builtin guardrail", http.MethodDelete, "/api/v1/admin/guardrails/builtin-aws-access-key", ""},
 			{"post config webhook", http.MethodPost, "/api/v1/admin/webhooks", `{"id":"cfg-wh","name":"X","url":"https://hooks.example.com/b","type":"async_event"}`},
 			{"put config webhook", http.MethodPut, "/api/v1/admin/webhooks/cfg-wh", `{"name":"Edited"}`},
 			{"delete config webhook", http.MethodDelete, "/api/v1/admin/webhooks/cfg-wh", ""},
@@ -583,9 +593,21 @@ func TestBackendReviewFixRegressions(t *testing.T) {
 			}
 		}
 
-		// Built-in guardrail presets remain toggleable/editable via PUT, but DELETE returns 409 Conflict.
-		if rec := doAPIRequest(h, adminPrincipal(), http.MethodPut, "/api/v1/admin/guardrails/builtin-email", `{"enabled":true,"action":"log_only"}`, nil); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"enabled":true`) || !strings.Contains(rec.Body.String(), `"builtin":true`) {
-			t.Fatalf("PUT builtin guardrail = %d: %s", rec.Code, rec.Body.String())
+		// Default built-in guardrail presets (source='builtin') ONLY allow modifying action & enabled via PUT:
+		// attempting to alter pattern, category, or name must return 400 Bad Request.
+		for _, badBody := range []string{
+			`{"pattern":".*"}`,
+			`{"category":"custom"}`,
+			`{"name":"Renamed Email"}`,
+		} {
+			if rec := doAPIRequest(h, adminPrincipal(), http.MethodPut, "/api/v1/admin/guardrails/builtin-email", badBody, nil); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "only allow modifying action and enabled") {
+				t.Fatalf("PUT builtin guardrail immutable field %s = %d: %s", badBody, rec.Code, rec.Body.String())
+			}
+		}
+		// Updating action + enabled (including echoing unchanged name/category/pattern) succeeds and flips source='local'.
+		if rec := doAPIRequest(h, adminPrincipal(), http.MethodPut, "/api/v1/admin/guardrails/builtin-email",
+			`{"name":"Email Address","category":"pii","pattern":"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}","enabled":true,"action":"redact"}`, nil); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"enabled":true`) || !strings.Contains(rec.Body.String(), `"action":"redact"`) || !strings.Contains(rec.Body.String(), `"builtin":true`) || !strings.Contains(rec.Body.String(), `"source":"local"`) {
+			t.Fatalf("PUT builtin guardrail action+enabled = %d: %s", rec.Code, rec.Body.String())
 		}
 		if rec := doAPIRequest(h, adminPrincipal(), http.MethodPost, "/api/v1/admin/guardrails", `{"id":"builtin-email","name":"Dup","pattern":"foo","action":"redact"}`, nil); rec.Code != http.StatusConflict {
 			t.Fatalf("POST over builtin guardrail = %d, want 409", rec.Code)
@@ -601,6 +623,7 @@ func TestBackendReviewFixRegressions(t *testing.T) {
 			"[::ffff:169.254.169.254]:80",
 			"[fe80::1]:443",
 			"[fd00:ec2::254]:80",
+			"[fd00:ec2::254%lo0]:80",
 			"0.0.0.0:80",
 			"[::]:80",
 			"224.0.0.1:80",

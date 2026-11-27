@@ -11,9 +11,11 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -108,6 +110,11 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.mux.ServeHTTP(w, r)
 }
 
+var (
+	errBlockedUpstreamAddress = errors.New("proxy: blocked upstream IP address")
+	awsIPv6IMDSAddr           = netip.MustParseAddr("fd00:ec2::254")
+)
+
 func defaultHTTPClient() *http.Client {
 	// Never set http.Client.Timeout: that would abort long-running SSE streams.
 	return &http.Client{
@@ -116,6 +123,7 @@ func defaultHTTPClient() *http.Client {
 			DialContext: (&net.Dialer{
 				Timeout:   30 * time.Second,
 				KeepAlive: 30 * time.Second,
+				Control:   upstreamDialControl,
 			}).DialContext,
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          100,
@@ -125,7 +133,35 @@ func defaultHTTPClient() *http.Client {
 			ResponseHeaderTimeout: 120 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
 		},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
+}
+
+func upstreamDialControl(_ string, address string, _ syscall.RawConn) error {
+	return validateUpstreamDialAddr(address)
+}
+
+func validateUpstreamDialAddr(address string) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("%w: invalid dial address %q", errBlockedUpstreamAddress, address)
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return fmt.Errorf("%w: invalid IP %q", errBlockedUpstreamAddress, host)
+	}
+	addr = addr.Unmap()
+	switch {
+	case addr.IsLinkLocalUnicast(),
+		addr.IsLinkLocalMulticast(),
+		addr.WithZone("") == awsIPv6IMDSAddr,
+		addr.IsUnspecified(),
+		addr.IsMulticast():
+		return fmt.Errorf("%w: %s", errBlockedUpstreamAddress, addr)
+	}
+	return nil
 }
 
 func (g *Gateway) registerRoutes() {

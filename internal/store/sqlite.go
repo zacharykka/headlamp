@@ -379,33 +379,16 @@ ON CONFLICT(scope) DO UPDATE SET
 		}
 	}
 
-	// 4. Built-in + YAML guardrail rules
+	// 4. Explicit YAML guardrail rules (source='config') + default built-in presets (source='builtin')
 	builtins := DefaultBuiltinGuardrailRules()
 	builtinIDs := make(map[string]bool, len(builtins))
 	for _, br := range builtins {
 		builtinIDs[br.ID] = true
 	}
 
-	keepGuardrailIDs := make([]string, 0, len(builtins)+len(cfg.Guardrails.Rules))
-	if cfg.Guardrails.UseBuiltinDefaults() {
-		for _, br := range builtins {
-			keepGuardrailIDs = append(keepGuardrailIDs, br.ID)
-			// Seed built-in defaults without clobbering Admin UI customizations (source='local').
-			_, err = tx.ExecContext(ctx, `
-INSERT INTO guardrail_rules (id, name, category, pattern, action, builtin, enabled, source, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
-ON CONFLICT(id) DO NOTHING`,
-				br.ID, br.Name, br.Category, br.Pattern, br.Action,
-				boolToInt(br.Enabled), SourceConfig, nowStr, nowStr,
-			)
-			if err != nil {
-				return fmt.Errorf("store: seed builtin guardrail %q: %w", br.ID, err)
-			}
-		}
-	}
-
+	configGuardrailIDs := make([]string, 0, len(cfg.Guardrails.Rules))
 	for _, r := range cfg.Guardrails.Rules {
-		keepGuardrailIDs = append(keepGuardrailIDs, r.ID)
+		configGuardrailIDs = append(configGuardrailIDs, r.ID)
 		_, err = tx.ExecContext(ctx, `
 INSERT INTO guardrail_rules (id, name, category, pattern, action, builtin, enabled, source, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -488,8 +471,29 @@ ON CONFLICT(id) DO UPDATE SET
 	if err := deleteStaleConfigRowsTx(ctx, tx, "budgets", "scope", budgetScopes); err != nil {
 		return err
 	}
-	if err := deleteStaleConfigRowsTx(ctx, tx, "guardrail_rules", "id", keepGuardrailIDs); err != nil {
+	if err := deleteStaleConfigRowsTx(ctx, tx, "guardrail_rules", "id", configGuardrailIDs); err != nil {
 		return err
+	}
+	if cfg.Guardrails.UseBuiltinDefaults() {
+		// Seed default built-in presets with source='builtin' after pruning stale source='config'
+		// rows, so removing a YAML override of a builtin-* ID cleanly restores its default preset
+		// while ON CONFLICT DO NOTHING preserves UI customizations (source='local') and active YAML pins.
+		for _, br := range builtins {
+			_, err = tx.ExecContext(ctx, `
+INSERT INTO guardrail_rules (id, name, category, pattern, action, builtin, enabled, source, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+ON CONFLICT(id) DO NOTHING`,
+				br.ID, br.Name, br.Category, br.Pattern, br.Action,
+				boolToInt(br.Enabled), SourceBuiltin, nowStr, nowStr,
+			)
+			if err != nil {
+				return fmt.Errorf("store: seed builtin guardrail %q: %w", br.ID, err)
+			}
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM guardrail_rules WHERE source = ?`, SourceBuiltin); err != nil {
+			return fmt.Errorf("store: prune uncustomized builtin guardrails: %w", err)
+		}
 	}
 	if err := deleteStaleConfigRowsTx(ctx, tx, "webhooks", "id", webhookIDs); err != nil {
 		return err

@@ -1384,12 +1384,12 @@ func (h *Handler) handleAdminCreateGuardrail(w http.ResponseWriter, r *http.Requ
 	}
 	if rule.ID != "" {
 		if existing, err := h.store.GetGuardrailRule(r.Context(), rule.ID); err == nil {
-			if existing.Builtin {
-				writeError(w, http.StatusConflict, "conflict", fmt.Sprintf("built-in guardrail rule %q already exists; update it via PUT instead", rule.ID))
-				return
-			}
 			if existing.Source == store.SourceConfig {
 				writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("guardrail rule", rule.ID))
+				return
+			}
+			if existing.Builtin {
+				writeError(w, http.StatusConflict, "conflict", fmt.Sprintf("built-in guardrail rule %q already exists; update it via PUT instead", rule.ID))
 				return
 			}
 			writeError(w, http.StatusConflict, "conflict", fmt.Sprintf("guardrail rule %q already exists", rule.ID))
@@ -1423,9 +1423,10 @@ func (h *Handler) handleAdminUpdateGuardrail(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
-	// Built-in guardrail presets remain editable via PUT so admins can toggle/tune them
-	// (SyncConfig uses ON CONFLICT DO NOTHING for built-ins); non-builtin YAML rules are read-only.
-	if !existing.Builtin && existing.Source == store.SourceConfig {
+	// Any rule explicitly declared in headlamp.yaml (source='config'), including a YAML-pinned
+	// built-in ID, is read-only via the API. Default built-in presets (source='builtin'/'local')
+	// allow toggling enabled and action only.
+	if existing.Source == store.SourceConfig {
 		writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("guardrail rule", id))
 		return
 	}
@@ -1461,12 +1462,12 @@ func (h *Handler) handleAdminDeleteGuardrail(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
-	if existing.Builtin {
-		writeError(w, http.StatusConflict, "conflict", fmt.Sprintf("built-in guardrail rule %q cannot be deleted; disable it with enabled=false instead", id))
-		return
-	}
 	if existing.Source == store.SourceConfig {
 		writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("guardrail rule", id))
+		return
+	}
+	if existing.Builtin {
+		writeError(w, http.StatusConflict, "conflict", fmt.Sprintf("built-in guardrail rule %q cannot be deleted; disable it with enabled=false instead", id))
 		return
 	}
 	if err := h.store.DeleteGuardrailRule(r.Context(), id); err != nil {
@@ -1514,6 +1515,39 @@ func validateGuardrailPayload(id string, req guardrailRequest, existing *store.G
 	if strings.EqualFold(id, "test") {
 		return store.GuardrailRule{}, errors.New("guardrail id \"test\" is reserved")
 	}
+	if existing != nil && existing.Builtin {
+		reqName := strings.TrimSpace(req.Name)
+		reqCat := strings.ToLower(strings.TrimSpace(req.Category))
+		if (reqName != "" && reqName != existing.Name) ||
+			(reqCat != "" && reqCat != existing.Category) ||
+			(req.Pattern != "" && req.Pattern != existing.Pattern) {
+			return store.GuardrailRule{}, errors.New("built-in guardrail rules only allow modifying action and enabled")
+		}
+		action := strings.ToLower(strings.TrimSpace(req.Action))
+		if action == "" {
+			action = existing.Action
+		}
+		switch action {
+		case config.GuardrailActionLogOnly, config.GuardrailActionRedact, config.GuardrailActionBlock:
+		default:
+			return store.GuardrailRule{}, fmt.Errorf("action %q must be log_only, redact, or block", action)
+		}
+		enabled := existing.Enabled
+		if req.Enabled != nil {
+			enabled = *req.Enabled
+		}
+		return store.GuardrailRule{
+			ID:       id,
+			Name:     existing.Name,
+			Category: existing.Category,
+			Pattern:  existing.Pattern,
+			Action:   action,
+			Builtin:  true,
+			Enabled:  enabled,
+			Source:   store.SourceLocal,
+		}, nil
+	}
+
 	name := strings.TrimSpace(req.Name)
 	if name == "" && existing != nil {
 		name = existing.Name
