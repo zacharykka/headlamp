@@ -34,6 +34,10 @@ export class ApiError extends Error {
   }
 }
 
+export interface RequestOptions {
+  signal?: AbortSignal;
+}
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (init?.body !== undefined && !headers.has('Content-Type')) {
@@ -72,26 +76,42 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  getMe(): Promise<MeResponse> {
-    return requestJson<MeResponse>('/api/v1/me');
+  getMe(opts?: RequestOptions): Promise<MeResponse> {
+    return requestJson<MeResponse>('/api/v1/me', { signal: opts?.signal });
   },
 
-  getMeUsage(window: TimeWindow, limit = 50, offset = 0): Promise<MeUsageResponse> {
+  getMeUsage(
+    window: TimeWindow,
+    limit = 50,
+    offset = 0,
+    opts?: RequestOptions,
+  ): Promise<MeUsageResponse> {
     const params = new URLSearchParams({
       window,
       limit: String(limit),
       offset: String(offset),
     });
-    return requestJson<MeUsageResponse>(`/api/v1/me/usage?${params.toString()}`);
+    return requestJson<MeUsageResponse>(`/api/v1/me/usage?${params.toString()}`, {
+      signal: opts?.signal,
+    });
   },
 
-  getAdminOverview(window: TimeWindow): Promise<AdminOverviewResponse> {
+  getAdminOverview(
+    window: TimeWindow,
+    opts?: RequestOptions,
+  ): Promise<AdminOverviewResponse> {
     const params = new URLSearchParams({ window });
-    return requestJson<AdminOverviewResponse>(`/api/v1/admin/overview?${params.toString()}`);
+    return requestJson<AdminOverviewResponse>(
+      `/api/v1/admin/overview?${params.toString()}`,
+      { signal: opts?.signal },
+    );
   },
 
-  async listProviders(): Promise<ProviderItem[]> {
-    const res = await requestJson<{ providers?: ProviderItem[] | null }>('/api/v1/admin/providers');
+  async listProviders(opts?: RequestOptions): Promise<ProviderItem[]> {
+    const res = await requestJson<{ providers?: ProviderItem[] | null }>(
+      '/api/v1/admin/providers',
+      { signal: opts?.signal },
+    );
     return res.providers ?? [];
   },
 
@@ -103,10 +123,13 @@ export const api = {
   },
 
   updateProvider(name: string, payload: ProviderUpsertPayload): Promise<ProviderItem> {
-    return requestJson<ProviderItem>(`/api/v1/admin/providers/${encodeURIComponent(name)}`, {
-      method: 'PUT',
-      body: JSON.stringify(payload),
-    });
+    return requestJson<ProviderItem>(
+      `/api/v1/admin/providers/${encodeURIComponent(name)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      },
+    );
   },
 
   deleteProvider(name: string): Promise<void> {
@@ -122,8 +145,11 @@ export const api = {
     );
   },
 
-  async listRoutes(): Promise<ModelRouteItem[]> {
-    const res = await requestJson<{ routes?: ModelRouteItem[] | null }>('/api/v1/admin/routes');
+  async listRoutes(opts?: RequestOptions): Promise<ModelRouteItem[]> {
+    const res = await requestJson<{ routes?: ModelRouteItem[] | null }>(
+      '/api/v1/admin/routes',
+      { signal: opts?.signal },
+    );
     return res.routes ?? [];
   },
 
@@ -149,12 +175,17 @@ export const api = {
     });
   },
 
-  getPricing(): Promise<PricingResponse> {
-    return requestJson<PricingResponse>('/api/v1/admin/pricing');
+  getPricing(opts?: RequestOptions): Promise<PricingResponse> {
+    return requestJson<PricingResponse>('/api/v1/admin/pricing', {
+      signal: opts?.signal,
+    });
   },
 
-  async listBudgets(): Promise<BudgetItem[]> {
-    const res = await requestJson<{ budgets?: BudgetItem[] | null }>('/api/v1/admin/budgets');
+  async listBudgets(opts?: RequestOptions): Promise<BudgetItem[]> {
+    const res = await requestJson<{ budgets?: BudgetItem[] | null }>(
+      '/api/v1/admin/budgets',
+      { signal: opts?.signal },
+    );
     return res.budgets ?? [];
   },
 
@@ -180,11 +211,16 @@ export const api = {
     });
   },
 
-  getGrantsGuide(): Promise<GrantsGuideResponse> {
-    return requestJson<GrantsGuideResponse>('/api/v1/admin/grants-guide');
+  getGrantsGuide(opts?: RequestOptions): Promise<GrantsGuideResponse> {
+    return requestJson<GrantsGuideResponse>('/api/v1/admin/grants-guide', {
+      signal: opts?.signal,
+    });
   },
 
-  listAdminLogs(filter: AdminLogsFilter): Promise<AdminLogsResponse> {
+  listAdminLogs(
+    filter: AdminLogsFilter,
+    opts?: RequestOptions,
+  ): Promise<AdminLogsResponse> {
     const params = new URLSearchParams();
     if (filter.subject) params.set('subject', filter.subject);
     if (filter.provider) params.set('provider', filter.provider);
@@ -195,15 +231,22 @@ export const api = {
     if (filter.until) params.set('until', filter.until);
     params.set('limit', String(filter.limit ?? 50));
     params.set('offset', String(filter.offset ?? 0));
-    return requestJson<AdminLogsResponse>(`/api/v1/admin/logs?${params.toString()}`);
+    return requestJson<AdminLogsResponse>(`/api/v1/admin/logs?${params.toString()}`, {
+      signal: opts?.signal,
+    });
   },
 
-  getLogPayload(id: string): Promise<AuditPayload> {
-    return requestJson<AuditPayload>(`/api/v1/admin/logs/${encodeURIComponent(id)}/payload`);
+  getLogPayload(id: string, opts?: RequestOptions): Promise<AuditPayload> {
+    return requestJson<AuditPayload>(
+      `/api/v1/admin/logs/${encodeURIComponent(id)}/payload`,
+      { signal: opts?.signal },
+    );
   },
 
-  getAuditSettings(): Promise<AuditSettings> {
-    return requestJson<AuditSettings>('/api/v1/admin/settings/audit');
+  getAuditSettings(opts?: RequestOptions): Promise<AuditSettings> {
+    return requestJson<AuditSettings>('/api/v1/admin/settings/audit', {
+      signal: opts?.signal,
+    });
   },
 
   updateAuditSettings(settings: AuditSettings): Promise<AuditSettings> {
@@ -213,14 +256,18 @@ export const api = {
     });
   },
 
-  purgeAuditPayloads(): Promise<{ purged: number }> {
+  purgeAuditPayloads(retentionDays: number): Promise<{ purged: number }> {
     return requestJson<{ purged: number }>('/api/v1/admin/settings/audit/purge', {
       method: 'POST',
+      body: JSON.stringify({ retention_days: retentionDays }),
     });
   },
 
-  async listGuardrails(): Promise<GuardrailRule[]> {
-    const res = await requestJson<{ rules?: GuardrailRule[] | null }>('/api/v1/admin/guardrails');
+  async listGuardrails(opts?: RequestOptions): Promise<GuardrailRule[]> {
+    const res = await requestJson<{ rules?: GuardrailRule[] | null }>(
+      '/api/v1/admin/guardrails',
+      { signal: opts?.signal },
+    );
     return res.rules ?? [];
   },
 
@@ -232,10 +279,13 @@ export const api = {
   },
 
   updateGuardrail(id: string, payload: GuardrailUpsertPayload): Promise<GuardrailRule> {
-    return requestJson<GuardrailRule>(`/api/v1/admin/guardrails/${encodeURIComponent(id)}`, {
-      method: 'PUT',
-      body: JSON.stringify(payload),
-    });
+    return requestJson<GuardrailRule>(
+      `/api/v1/admin/guardrails/${encodeURIComponent(id)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      },
+    );
   },
 
   deleteGuardrail(id: string): Promise<void> {
@@ -251,8 +301,11 @@ export const api = {
     });
   },
 
-  async listWebhooks(): Promise<WebhookItem[]> {
-    const res = await requestJson<{ webhooks?: WebhookItem[] | null }>('/api/v1/admin/webhooks');
+  async listWebhooks(opts?: RequestOptions): Promise<WebhookItem[]> {
+    const res = await requestJson<{ webhooks?: WebhookItem[] | null }>(
+      '/api/v1/admin/webhooks',
+      { signal: opts?.signal },
+    );
     return res.webhooks ?? [];
   },
 
@@ -264,10 +317,13 @@ export const api = {
   },
 
   updateWebhook(id: string, payload: WebhookUpsertPayload): Promise<WebhookItem> {
-    return requestJson<WebhookItem>(`/api/v1/admin/webhooks/${encodeURIComponent(id)}`, {
-      method: 'PUT',
-      body: JSON.stringify(payload),
-    });
+    return requestJson<WebhookItem>(
+      `/api/v1/admin/webhooks/${encodeURIComponent(id)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      },
+    );
   },
 
   deleteWebhook(id: string): Promise<void> {

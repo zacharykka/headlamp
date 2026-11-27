@@ -1,13 +1,20 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
-import { Add, Edit, Trash } from 'reicon-react';
 import { api } from '../api/client';
-import { Icon } from '../components/Icon';
+import {
+  AlertIcon,
+  EditIcon,
+  PlusIcon,
+  TailnetMeshGlyph,
+  TrashIcon,
+} from '../components/ApertureIcons';
 import {
   CodeBlock,
   Modal,
   ProgressBar,
   SegmentedControl,
+  SourceBadge,
   Toggle,
+  YAML_LOCK_TOOLTIP,
 } from '../components/Primitives';
 import { formatCompactTokens, formatNumber, formatUSD } from '../lib/format';
 import type {
@@ -26,22 +33,33 @@ export interface BudgetsFocusState {
 
 interface BudgetsAccessViewProps {
   focus?: BudgetsFocusState;
+  onCountChange?: (count: number) => void;
 }
 
-function parseNullableFloat(raw: string): number | null {
+function parseOptionalCap(
+  raw: string,
+  label: string,
+): { value: number | null; error: string | null } {
   const trimmed = raw.trim();
-  if (!trimmed) return null;
+  if (!trimmed) return { value: null, error: null };
   const val = Number(trimmed);
-  return Number.isFinite(val) && val >= 0 ? val : null;
+  if (!Number.isFinite(val) || val < 0) {
+    return { value: null, error: `${label} must be 0 or greater.` };
+  }
+  return { value: val, error: null };
 }
 
-export function BudgetsAccessView({ focus }: BudgetsAccessViewProps) {
+export function BudgetsAccessView({
+  focus,
+  onCountChange,
+}: BudgetsAccessViewProps) {
   const [budgets, setBudgets] = useState<BudgetItem[]>([]);
   const [grantsGuide, setGrantsGuide] = useState<GrantsGuideResponse | null>(null);
   const [scopeFilter, setScopeFilter] = useState<ScopeFilter>('all');
-  const [error, setError] = useState<string | null>(null);
+  const [pageError, setPageError] = useState<string | null>(null);
 
   const [modalOpen, setModalOpen] = useState(false);
+  const [modalError, setModalError] = useState<string | null>(null);
   const [editingBudget, setEditingBudget] = useState<BudgetItem | null>(null);
   const [scope, setScope] = useState('*');
   const [dailyUSD, setDailyUSD] = useState('');
@@ -54,16 +72,17 @@ export function BudgetsAccessView({ focus }: BudgetsAccessViewProps) {
   const [saving, setSaving] = useState(false);
 
   const loadAll = async () => {
-    setError(null);
+    setPageError(null);
     try {
       const [budgetList, guide] = await Promise.all([
         api.listBudgets(),
         api.getGrantsGuide().catch(() => null),
       ]);
       setBudgets(budgetList);
+      onCountChange?.(budgetList.length);
       if (guide) setGrantsGuide(guide);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to load budgets');
+      setPageError(err instanceof Error ? err.message : 'Failed to load quotas and grants');
     }
   };
 
@@ -79,9 +98,10 @@ export function BudgetsAccessView({ focus }: BudgetsAccessViewProps) {
 
   const openCreateModal = () => {
     setEditingBudget(null);
+    setModalError(null);
     setScope('*');
-    setDailyUSD('');
-    setMonthlyUSD('100');
+    setDailyUSD('25');
+    setMonthlyUSD('250');
     setRpm('60');
     setTpm('200000');
     setMaxConcurrent('8');
@@ -91,7 +111,9 @@ export function BudgetsAccessView({ focus }: BudgetsAccessViewProps) {
   };
 
   const openEditModal = (item: BudgetItem) => {
+    if (item.source === 'config') return;
     setEditingBudget(item);
+    setModalError(null);
     setScope(item.scope);
     setDailyUSD(item.daily_usd != null ? String(item.daily_usd) : '');
     setMonthlyUSD(item.monthly_usd != null ? String(item.monthly_usd) : '');
@@ -105,17 +127,40 @@ export function BudgetsAccessView({ focus }: BudgetsAccessViewProps) {
 
   const handleSave = async (event: FormEvent) => {
     event.preventDefault();
-    setSaving(true);
-    setError(null);
+    setModalError(null);
 
+    const trimmedScope = scope.trim();
+    if (!trimmedScope) {
+      setModalError('Budget scope is required (*, tag:<name>, or user@domain).');
+      return;
+    }
+
+    const parsedDaily = parseOptionalCap(dailyUSD, 'Daily cap');
+    if (parsedDaily.error) {
+      setModalError(parsedDaily.error);
+      return;
+    }
+    const parsedMonthly = parseOptionalCap(monthlyUSD, 'Monthly cap');
+    if (parsedMonthly.error) {
+      setModalError(parsedMonthly.error);
+      return;
+    }
+
+    const parsedSoft = Number(softAlertPct);
+    if (!Number.isFinite(parsedSoft) || parsedSoft < 1 || parsedSoft > 100) {
+      setModalError('Soft alert threshold must be between 1% and 100%.');
+      return;
+    }
+
+    setSaving(true);
     const payload: BudgetUpsertPayload = {
-      scope: scope.trim(),
-      daily_usd: parseNullableFloat(dailyUSD),
-      monthly_usd: parseNullableFloat(monthlyUSD),
-      rpm: Math.max(0, Number(rpm) || 0),
-      tpm: Math.max(0, Number(tpm) || 0),
-      max_concurrent: Math.max(0, Number(maxConcurrent) || 0),
-      soft_alert_pct: Math.min(100, Math.max(1, Number(softAlertPct) || 80)),
+      scope: trimmedScope,
+      daily_usd: parsedDaily.value,
+      monthly_usd: parsedMonthly.value,
+      rpm: Math.max(0, Math.floor(Number(rpm) || 0)),
+      tpm: Math.max(0, Math.floor(Number(tpm) || 0)),
+      max_concurrent: Math.max(0, Math.floor(Number(maxConcurrent) || 0)),
+      soft_alert_pct: Math.floor(parsedSoft),
       enabled,
     };
 
@@ -128,13 +173,15 @@ export function BudgetsAccessView({ focus }: BudgetsAccessViewProps) {
       setModalOpen(false);
       await loadAll();
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to save budget');
+      setModalError(err instanceof Error ? err.message : 'Failed to save quota');
     } finally {
       setSaving(false);
     }
   };
 
   const handleToggle = async (item: BudgetItem, next: boolean) => {
+    if (item.source === 'config') return;
+    setPageError(null);
     try {
       await api.updateBudget(item.scope, {
         scope: item.scope,
@@ -150,16 +197,18 @@ export function BudgetsAccessView({ focus }: BudgetsAccessViewProps) {
         prev.map((b) => (b.scope === item.scope ? { ...b, enabled: next } : b)),
       );
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to update budget');
+      setPageError(err instanceof Error ? err.message : 'Failed to update quota');
     }
   };
 
-  const handleDelete = async (targetScope: string) => {
+  const handleDelete = async (item: BudgetItem) => {
+    if (item.source === 'config') return;
+    setPageError(null);
     try {
-      await api.deleteBudget(targetScope);
+      await api.deleteBudget(item.scope);
       await loadAll();
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to delete budget');
+      setPageError(err instanceof Error ? err.message : 'Failed to delete quota');
     }
   };
 
@@ -175,210 +224,344 @@ export function BudgetsAccessView({ focus }: BudgetsAccessViewProps) {
   const policy = grantsGuide?.policy;
 
   return (
-    <>
-      <section className="hl-section">
-        <div className="hl-section-bar">
-          <h1>Budgets</h1>
-          <div className="hl-toolbar">
+    <div className="ap-page">
+      <header className="ap-page-header">
+        <div className="ap-page-title-row">
+          <div>
+            <h1 className="ap-page-title">Quotas & Tailnet Grants</h1>
+            <p className="ap-page-subtitle">
+              Enforce USD spend caps and rate limits per scope while delegating model access to Headscale & Tailscale grants.
+            </p>
+          </div>
+        </div>
+
+        <div className="ap-filter-bar">
+          <div className="ap-filter-group">
             <SegmentedControl
               ariaLabel="Budget scope filter"
               value={scopeFilter}
               onChange={setScopeFilter}
               options={[
-                { value: 'all', label: 'All' },
-                { value: 'global', label: 'Global' },
-                { value: 'tag', label: 'Tags' },
+                { value: 'all', label: 'All Scopes' },
+                { value: 'global', label: 'Global (*)' },
+                { value: 'tag', label: 'Node Tags' },
                 { value: 'user', label: 'Users' },
               ]}
             />
-            <button
-              type="button"
-              className="hl-btn hl-btn-primary"
-              onClick={openCreateModal}
-            >
-              <Icon icon={Add} />
-              <span>Add Budget</span>
-            </button>
+          </div>
+
+          <button
+            type="button"
+            className="ap-btn ap-btn-primary"
+            onClick={openCreateModal}
+          >
+            <PlusIcon />
+            <span>Add Quota</span>
+          </button>
+        </div>
+      </header>
+
+      {pageError && (
+        <div className="ap-alert ap-alert--danger" role="alert">
+          <AlertIcon style={{ flexShrink: 0, marginTop: 1 }} />
+          <span>{pageError}</span>
+        </div>
+      )}
+
+      <section className="ap-card" aria-label="Spend and rate limit budgets">
+        <div className="ap-card-header">
+          <div>
+            <h2 className="ap-card-title">Quota Policies ({filteredBudgets.length})</h2>
+            <p className="ap-card-subtitle">
+              Scopes match Global (*), Tailnet node tags (tag:*), or individual Tailnet user subjects.
+            </p>
           </div>
         </div>
 
-        {error && <p className="hl-status-text hl-status-danger">{error}</p>}
-
-        <div className="hl-table-wrap">
-          <table className="hl-table">
+        <div className="ap-table-wrap">
+          <table className="ap-table">
             <thead>
               <tr>
                 <th>Scope</th>
-                <th style={{ minWidth: 168 }}>Daily Spend</th>
-                <th style={{ minWidth: 168 }}>Monthly Spend</th>
-                <th>Rate Limits</th>
-                <th>Soft Alert</th>
+                <th>Origin</th>
+                <th style={{ minWidth: 165 }}>Daily Consumption</th>
+                <th style={{ minWidth: 165 }}>Monthly Consumption</th>
+                <th>Rate & Concurrency</th>
                 <th>Enabled</th>
-                <th />
+                <th style={{ textAlign: 'right' }}>Actions</th>
               </tr>
             </thead>
             <tbody>
               {filteredBudgets.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="hl-secondary">
-                    No budgets configured
+                  <td colSpan={7} style={{ color: 'var(--ap-text-muted)', padding: '26px 14px', textAlign: 'center' }}>
+                    No quota policies configured for this scope filter.
                   </td>
                 </tr>
               ) : (
-                filteredBudgets.map((item) => (
-                  <tr key={item.scope} className="hl-row">
-                    <td className="hl-mono hl-nowrap" style={{ fontWeight: 500 }}>
-                      {item.scope === '*' ? '* (Global)' : item.scope}
-                    </td>
-                    <td>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                          <span>{formatUSD(item.daily_spent_usd)}</span>
-                          <span className="hl-secondary">
-                            {item.daily_usd != null ? formatUSD(item.daily_usd) : 'No cap'}
+                filteredBudgets.map((item) => {
+                  const isYaml = item.source === 'config';
+                  return (
+                    <tr key={item.scope} className="ap-row">
+                      <td>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                          <span className="ap-mono" style={{ fontWeight: 600 }}>
+                            {item.scope === '*' ? '* (Global)' : item.scope}
+                          </span>
+                          <span style={{ fontSize: 11.5, color: 'var(--ap-text-muted)' }}>
+                            Alert at {item.soft_alert_pct}%
                           </span>
                         </div>
-                        {item.daily_usd != null && (
-                          <ProgressBar
-                            spent={item.daily_spent_usd}
-                            limit={item.daily_usd}
-                            softAlertPct={item.soft_alert_pct}
-                          />
-                        )}
-                      </div>
-                    </td>
-                    <td>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                          <span>{formatUSD(item.monthly_spent_usd)}</span>
-                          <span className="hl-secondary">
-                            {item.monthly_usd != null
-                              ? formatUSD(item.monthly_usd)
-                              : 'No cap'}
-                          </span>
+                      </td>
+                      <td>
+                        <SourceBadge source={item.source} />
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                          <div
+                            className="ap-tabular"
+                            style={{
+                              display: 'flex',
+                              justifyContent: 'space-between',
+                              gap: 8,
+                              fontSize: 12,
+                            }}
+                          >
+                            <span style={{ fontWeight: 600 }}>
+                              {formatUSD(item.daily_spent_usd)}
+                            </span>
+                            <span style={{ color: 'var(--ap-text-muted)' }}>
+                              {item.daily_usd != null
+                                ? `/ ${formatUSD(item.daily_usd)}`
+                                : 'No cap'}
+                            </span>
+                          </div>
+                          {item.daily_usd != null && (
+                            <ProgressBar
+                              spent={item.daily_spent_usd}
+                              limit={item.daily_usd}
+                              softAlertPct={item.soft_alert_pct}
+                            />
+                          )}
                         </div>
-                        {item.monthly_usd != null && (
-                          <ProgressBar
-                            spent={item.monthly_spent_usd}
-                            limit={item.monthly_usd}
-                            softAlertPct={item.soft_alert_pct}
-                          />
-                        )}
-                      </div>
-                    </td>
-                    <td className="hl-secondary hl-nowrap">
-                      {[
-                        item.rpm > 0 ? `${formatNumber(item.rpm)} RPM` : null,
-                        item.tpm > 0 ? `${formatCompactTokens(item.tpm)} TPM` : null,
-                        item.max_concurrent > 0 ? `${item.max_concurrent} conc` : null,
-                      ]
-                        .filter(Boolean)
-                        .join(' · ') || '—'}
-                    </td>
-                    <td className="hl-secondary hl-nowrap">{item.soft_alert_pct}%</td>
-                    <td>
-                      <Toggle
-                        checked={item.enabled}
-                        onChange={(next) => handleToggle(item, next)}
-                        label={`Enable budget ${item.scope}`}
-                      />
-                    </td>
-                    <td>
-                      <div className="hl-row-actions">
-                        <button
-                          type="button"
-                          className="hl-btn hl-btn-ghost"
-                          onClick={() => openEditModal(item)}
-                        >
-                          <Icon icon={Edit} />
-                          <span>Edit</span>
-                        </button>
-                        <button
-                          type="button"
-                          className="hl-btn hl-btn-ghost hl-btn-danger"
-                          onClick={() => handleDelete(item.scope)}
-                        >
-                          <Icon icon={Trash} />
-                          <span>Delete</span>
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                          <div
+                            className="ap-tabular"
+                            style={{
+                              display: 'flex',
+                              justifyContent: 'space-between',
+                              gap: 8,
+                              fontSize: 12,
+                            }}
+                          >
+                            <span style={{ fontWeight: 600 }}>
+                              {formatUSD(item.monthly_spent_usd)}
+                            </span>
+                            <span style={{ color: 'var(--ap-text-muted)' }}>
+                              {item.monthly_usd != null
+                                ? `/ ${formatUSD(item.monthly_usd)}`
+                                : 'No cap'}
+                            </span>
+                          </div>
+                          {item.monthly_usd != null && (
+                            <ProgressBar
+                              spent={item.monthly_spent_usd}
+                              limit={item.monthly_usd}
+                              softAlertPct={item.soft_alert_pct}
+                            />
+                          )}
+                        </div>
+                      </td>
+                      <td className="ap-tabular" style={{ color: 'var(--ap-text-secondary)', fontSize: 12 }}>
+                        {[
+                          item.rpm > 0 ? `${formatNumber(item.rpm)} RPM` : null,
+                          item.tpm > 0 ? `${formatCompactTokens(item.tpm)} TPM` : null,
+                          item.max_concurrent > 0 ? `${item.max_concurrent} conc` : null,
+                        ]
+                          .filter(Boolean)
+                          .join(' · ') || 'Unlimited'}
+                      </td>
+                      <td>
+                        <Toggle
+                          checked={item.enabled}
+                          disabled={isYaml}
+                          title={isYaml ? YAML_LOCK_TOOLTIP : undefined}
+                          onChange={(next) => handleToggle(item, next)}
+                          label={`Enable budget ${item.scope}`}
+                        />
+                      </td>
+                      <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                        <div className="ap-row-actions">
+                          <button
+                            type="button"
+                            className="ap-btn ap-btn-ghost ap-btn-sm"
+                            disabled={isYaml}
+                            title={isYaml ? YAML_LOCK_TOOLTIP : `Edit ${item.scope}`}
+                            onClick={() => openEditModal(item)}
+                          >
+                            <EditIcon />
+                            <span>Edit</span>
+                          </button>
+                          <button
+                            type="button"
+                            className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm"
+                            disabled={isYaml}
+                            title={isYaml ? YAML_LOCK_TOOLTIP : `Delete ${item.scope}`}
+                            onClick={() => handleDelete(item)}
+                          >
+                            <TrashIcon />
+                            <span>Delete</span>
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>
         </div>
       </section>
 
-      <section className="hl-section">
-        <div className="hl-section-bar">
-          <h2>Headscale Grants</h2>
-        </div>
+      <div className="ap-split-2">
+        <section className="ap-card" aria-label="Live Headscale grants inspector">
+          <div className="ap-card-header">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <TailnetMeshGlyph size={16} />
+              <div>
+                <h2 className="ap-card-title">Live Policy Inspector</h2>
+                <p className="ap-card-subtitle">
+                  Evaluated headlamp.dev/cap/gateway capabilities for your session.
+                </p>
+              </div>
+            </div>
+            <span
+              className={`ap-badge ${
+                policy?.grants_applied ? 'ap-badge--green' : 'ap-badge--amber'
+              }`}
+            >
+              {policy?.grants_applied ? 'Grants Active' : 'No Matching Grants'}
+            </span>
+          </div>
 
-        <div className="hl-split-2">
-          <div className="hl-table-wrap">
-            <table className="hl-table">
+          <div className="ap-table-wrap">
+            <table className="ap-table">
               <tbody>
-                <tr className="hl-row">
-                  <td className="hl-secondary">Subject</td>
-                  <td className="hl-mono">{policy?.subject || '—'}</td>
-                </tr>
-                <tr className="hl-row">
-                  <td className="hl-secondary">Grants Status</td>
-                  <td
-                    className={
-                      policy?.grants_applied ? 'hl-status-accent' : 'hl-secondary'
-                    }
-                    style={{ fontWeight: 500 }}
-                  >
-                    {policy?.grants_applied ? 'Active' : 'No matching grants'}
+                <tr className="ap-row">
+                  <td style={{ color: 'var(--ap-text-secondary)', width: 140 }}>Subject</td>
+                  <td className="ap-mono" style={{ fontWeight: 560 }}>
+                    {policy?.subject || '—'}
                   </td>
                 </tr>
-                <tr className="hl-row">
-                  <td className="hl-secondary">Roles</td>
-                  <td className="hl-mono">
-                    {(policy?.roles ?? []).join(', ') || '—'}
+                <tr className="ap-row">
+                  <td style={{ color: 'var(--ap-text-secondary)' }}>Roles</td>
+                  <td>
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      {(policy?.roles ?? []).length > 0 ? (
+                        (policy?.roles ?? []).map((r) => (
+                          <span key={r} className="ap-badge ap-badge--blue ap-mono">
+                            {r}
+                          </span>
+                        ))
+                      ) : (
+                        <span style={{ color: 'var(--ap-text-muted)' }}>—</span>
+                      )}
+                    </div>
                   </td>
                 </tr>
-                <tr className="hl-row">
-                  <td className="hl-secondary">Allow Models</td>
-                  <td className="hl-mono">
-                    {(policy?.allow_models ?? []).join(', ') || '—'}
+                <tr className="ap-row">
+                  <td style={{ color: 'var(--ap-text-secondary)' }}>Allowed Models</td>
+                  <td>
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      {(policy?.allow_models ?? []).length > 0 ? (
+                        (policy?.allow_models ?? []).map((m) => (
+                          <span key={m} className="ap-badge ap-mono">
+                            {m}
+                          </span>
+                        ))
+                      ) : (
+                        <span style={{ color: 'var(--ap-text-muted)' }}>None</span>
+                      )}
+                    </div>
                   </td>
                 </tr>
-                <tr className="hl-row">
-                  <td className="hl-secondary">Deny Models</td>
-                  <td className="hl-mono">
-                    {(policy?.deny_models ?? []).join(', ') || '—'}
+                <tr className="ap-row">
+                  <td style={{ color: 'var(--ap-text-secondary)' }}>Denied Models</td>
+                  <td>
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      {(policy?.deny_models ?? []).length > 0 ? (
+                        (policy?.deny_models ?? []).map((m) => (
+                          <span key={m} className="ap-badge ap-badge--red ap-mono">
+                            {m}
+                          </span>
+                        ))
+                      ) : (
+                        <span style={{ color: 'var(--ap-text-muted)' }}>None</span>
+                      )}
+                    </div>
                   </td>
                 </tr>
-                <tr className="hl-row">
-                  <td className="hl-secondary">Allow MCP Tools</td>
-                  <td className="hl-mono">
-                    {(policy?.allow_mcp_tools ?? []).join(', ') || '—'}
+                <tr className="ap-row">
+                  <td style={{ color: 'var(--ap-text-secondary)' }}>Allowed MCP Tools</td>
+                  <td>
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      {(policy?.allow_mcp_tools ?? []).length > 0 ? (
+                        (policy?.allow_mcp_tools ?? []).map((t) => (
+                          <span key={t} className="ap-badge ap-mono">
+                            {t}
+                          </span>
+                        ))
+                      ) : (
+                        <span style={{ color: 'var(--ap-text-muted)' }}>—</span>
+                      )}
+                    </div>
                   </td>
                 </tr>
               </tbody>
             </table>
           </div>
+        </section>
 
-          {grantsGuide?.headscale_example && (
-            <CodeBlock code={grantsGuide.headscale_example} />
-          )}
-        </div>
-      </section>
+        <section className="ap-card" aria-label="Headscale policy template">
+          <div className="ap-card-header">
+            <div>
+              <h2 className="ap-card-title">Headscale policy.hujson Template</h2>
+              <p className="ap-card-subtitle">
+                Paste into Headscale v0.29+ or Tailscale ACL grants to govern roles and model globs.
+              </p>
+            </div>
+          </div>
+          <div className="ap-card-body">
+            {grantsGuide?.headscale_example ? (
+              <CodeBlock
+                label="policy.hujson · headlamp.dev/cap/gateway"
+                code={grantsGuide.headscale_example}
+              />
+            ) : (
+              <p style={{ color: 'var(--ap-text-muted)' }}>
+                Loading policy template...
+              </p>
+            )}
+          </div>
+        </section>
+      </div>
 
       <Modal
         open={modalOpen}
-        title={editingBudget ? `Edit Budget (${editingBudget.scope})` : 'Add Budget'}
+        title={editingBudget ? `Edit Quota (${editingBudget.scope})` : 'Add Quota Policy'}
         onClose={() => setModalOpen(false)}
+        error={modalError}
       >
-        <form onSubmit={handleSave} style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-          <label className="hl-field">
-            <span className="hl-label">Scope (*, tag:name, or user@domain)</span>
+        <form
+          onSubmit={handleSave}
+          style={{ display: 'flex', flexDirection: 'column', gap: 14 }}
+        >
+          <label className="ap-field">
+            <span className="ap-label">Scope (*, tag:name, or user@domain)</span>
             <input
-              className="hl-input hl-mono"
+              className="ap-input ap-mono"
               required
               disabled={Boolean(editingBudget)}
               value={scope}
@@ -387,65 +570,68 @@ export function BudgetsAccessView({ focus }: BudgetsAccessViewProps) {
             />
           </label>
 
-          <div className="hl-form-grid">
-            <label className="hl-field">
-              <span className="hl-label">Daily Cap (USD)</span>
+          <div className="ap-form-grid">
+            <label className="ap-field">
+              <span className="ap-label">Daily Cap (USD)</span>
               <input
                 type="number"
                 min={0}
                 step="any"
-                className="hl-input"
+                className="ap-input ap-tabular"
                 value={dailyUSD}
                 onChange={(e) => setDailyUSD(e.target.value)}
                 placeholder="No cap"
               />
             </label>
-            <label className="hl-field">
-              <span className="hl-label">Monthly Cap (USD)</span>
+            <label className="ap-field">
+              <span className="ap-label">Monthly Cap (USD)</span>
               <input
                 type="number"
                 min={0}
                 step="any"
-                className="hl-input"
+                className="ap-input ap-tabular"
                 value={monthlyUSD}
                 onChange={(e) => setMonthlyUSD(e.target.value)}
-                placeholder="100.00"
+                placeholder="No cap"
               />
             </label>
-            <label className="hl-field">
-              <span className="hl-label">RPM Limit</span>
+            <label className="ap-field">
+              <span className="ap-label">RPM Limit (0 = unlimited)</span>
               <input
                 type="number"
-                className="hl-input"
+                min={0}
+                className="ap-input ap-tabular"
                 value={rpm}
                 onChange={(e) => setRpm(e.target.value)}
               />
             </label>
-            <label className="hl-field">
-              <span className="hl-label">TPM Limit</span>
+            <label className="ap-field">
+              <span className="ap-label">TPM Limit (0 = unlimited)</span>
               <input
                 type="number"
-                className="hl-input"
+                min={0}
+                className="ap-input ap-tabular"
                 value={tpm}
                 onChange={(e) => setTpm(e.target.value)}
               />
             </label>
-            <label className="hl-field">
-              <span className="hl-label">Max Concurrent</span>
+            <label className="ap-field">
+              <span className="ap-label">Max Concurrent Requests</span>
               <input
                 type="number"
-                className="hl-input"
+                min={0}
+                className="ap-input ap-tabular"
                 value={maxConcurrent}
                 onChange={(e) => setMaxConcurrent(e.target.value)}
               />
             </label>
-            <label className="hl-field">
-              <span className="hl-label">Soft Alert (%)</span>
+            <label className="ap-field">
+              <span className="ap-label">Soft Alert Threshold (%)</span>
               <input
                 type="number"
                 min={1}
                 max={100}
-                className="hl-input"
+                className="ap-input ap-tabular"
                 value={softAlertPct}
                 onChange={(e) => setSoftAlertPct(e.target.value)}
               />
@@ -453,24 +639,24 @@ export function BudgetsAccessView({ focus }: BudgetsAccessViewProps) {
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <span className="hl-label">Enabled</span>
-            <Toggle checked={enabled} onChange={setEnabled} label="Budget Enabled" />
+            <span className="ap-label">Enabled</span>
+            <Toggle checked={enabled} onChange={setEnabled} label="Quota Enabled" />
           </div>
 
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, paddingTop: 8 }}>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, paddingTop: 6 }}>
             <button
               type="button"
-              className="hl-btn"
+              className="ap-btn"
               onClick={() => setModalOpen(false)}
             >
               Cancel
             </button>
-            <button type="submit" className="hl-btn hl-btn-primary" disabled={saving}>
-              {saving ? 'Saving' : 'Save Budget'}
+            <button type="submit" className="ap-btn ap-btn-primary" disabled={saving}>
+              {saving ? 'Saving...' : 'Save Quota'}
             </button>
           </div>
         </form>
       </Modal>
-    </>
+    </div>
   );
 }

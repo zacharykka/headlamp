@@ -1,45 +1,55 @@
-import { useState } from 'react';
+import { useId, useState } from 'react';
+import {
+  formatBucketLabel,
+  formatCompactTokens,
+  formatNumber,
+  formatUSD,
+} from '../lib/format';
 import type { UsageSeriesPoint } from '../types/api';
-import { formatBucketLabel, formatNumber, formatUSD } from '../lib/format';
+
+export type ChartMetric = 'cost_usd' | 'requests' | 'tokens' | 'errors';
 
 interface UsageChartProps {
   series: UsageSeriesPoint[];
-  metric: 'cost_usd' | 'requests';
+  metric: ChartMetric;
 }
 
 export function UsageChart({ series, metric }: UsageChartProps) {
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  const gradId = useId();
 
-  if (series.length === 0) {
+  const totalAcrossWindow = series.reduce(
+    (acc, pt) => acc + pt.requests + pt.tokens + pt.cost_usd + pt.errors,
+    0,
+  );
+
+  if (series.length === 0 || totalAcrossWindow === 0) {
     return (
-      <div
-        className="hl-surface"
-        style={{
-          height: 240,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-        }}
-      >
-        <span className="hl-secondary">No traffic in selected window</span>
+      <div className="ap-empty-state">
+        <span>No usage in the selected time range. Try adjusting the range.</span>
       </div>
     );
   }
 
-  const width = 1040;
-  const height = 240;
+  const width = 980;
+  const height = 220;
   const padLeft = 64;
-  const padRight = 24;
-  const padTop = 24;
-  const padBottom = 36;
+  const padRight = 22;
+  const padTop = 18;
+  const padBottom = 32;
   const plotW = width - padLeft - padRight;
   const plotH = height - padTop - padBottom;
 
-  const values = series.map((pt) =>
-    metric === 'cost_usd' ? pt.cost_usd : pt.requests,
-  );
+  const valueOf = (pt: UsageSeriesPoint): number => {
+    if (metric === 'cost_usd') return pt.cost_usd;
+    if (metric === 'tokens') return pt.tokens;
+    if (metric === 'errors') return pt.errors;
+    return pt.requests;
+  };
+
+  const values = series.map(valueOf);
   const rawMax = Math.max(...values, 0);
-  const maxVal = rawMax > 0 ? rawMax * 1.12 : 1;
+  const maxVal = rawMax > 0 ? rawMax * 1.15 : 1;
 
   const xFor = (idx: number) => {
     if (series.length === 1) return padLeft + plotW / 2;
@@ -55,11 +65,20 @@ export function UsageChart({ series, metric }: UsageChartProps) {
     raw: series[idx],
   }));
 
-  const pathD = points
+  const linePath = points
     .map((pt, idx) => `${idx === 0 ? 'M' : 'L'} ${pt.x.toFixed(2)} ${pt.y.toFixed(2)}`)
     .join(' ');
 
+  const areaPath =
+    points.length > 1
+      ? `${linePath} L ${points[points.length - 1].x.toFixed(2)} ${(
+          padTop + plotH
+        ).toFixed(2)} L ${points[0].x.toFixed(2)} ${(padTop + plotH).toFixed(2)} Z`
+      : '';
+
+  const strokeColor = metric === 'errors' ? '#DC2626' : '#2563EB';
   const activePoint = hoveredIndex !== null ? points[hoveredIndex] : null;
+
   const firstLabel = formatBucketLabel(series[0].bucket);
   const midLabel =
     series.length > 2
@@ -68,47 +87,79 @@ export function UsageChart({ series, metric }: UsageChartProps) {
   const lastLabel =
     series.length > 1 ? formatBucketLabel(series[series.length - 1].bucket) : '';
 
-  const formatAxisVal = (val: number) =>
-    metric === 'cost_usd' ? formatUSD(val) : formatNumber(Math.round(val));
+  const formatAxisVal = (val: number) => {
+    if (metric === 'cost_usd') return formatUSD(val);
+    if (metric === 'tokens') return formatCompactTokens(Math.round(val));
+    return formatNumber(Math.round(val));
+  };
+
+  const metricLabel =
+    metric === 'cost_usd'
+      ? 'Spend (USD)'
+      : metric === 'tokens'
+        ? 'Tokens'
+        : metric === 'errors'
+          ? 'Errors'
+          : 'Requests';
 
   return (
-    <div className="hl-surface" style={{ padding: 28 }}>
+    <div style={{ padding: '14px 18px 16px' }}>
       <div
         style={{
-          height: 24,
-          marginBottom: 12,
+          minHeight: 24,
+          marginBottom: 8,
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
-          fontSize: 14,
+          gap: 12,
+          flexWrap: 'wrap',
+          fontSize: 12.5,
         }}
       >
         {activePoint ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-            <span style={{ fontWeight: 500 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+            <span style={{ fontWeight: 600 }}>
               {formatBucketLabel(activePoint.raw.bucket)}
             </span>
-            <span className="hl-status-accent" style={{ fontWeight: 600 }}>
+            <span className="ap-tabular" style={{ color: '#1D4ED8', fontWeight: 600 }}>
               {formatUSD(activePoint.raw.cost_usd)}
             </span>
-            <span className="hl-secondary">
+            <span className="ap-tabular" style={{ color: 'var(--ap-text-secondary)' }}>
               {formatNumber(activePoint.raw.requests)} req
             </span>
+            <span className="ap-tabular" style={{ color: 'var(--ap-text-secondary)' }}>
+              {formatCompactTokens(activePoint.raw.tokens)} tok
+            </span>
+            {activePoint.raw.errors > 0 && (
+              <span className="ap-badge ap-badge--red ap-tabular">
+                {formatNumber(activePoint.raw.errors)} err
+              </span>
+            )}
           </div>
         ) : (
-          <span className="hl-secondary">
-            {metric === 'cost_usd' ? 'Spend (USD)' : 'Requests'}
+          <span style={{ color: 'var(--ap-text-secondary)', fontWeight: 500 }}>
+            {metricLabel} over time
           </span>
         )}
+        <span style={{ color: 'var(--ap-text-muted)', fontSize: 11.5 }}>
+          Hover buckets to inspect spend, requests, tokens & errors
+        </span>
       </div>
 
       <svg
         viewBox={`0 0 ${width} ${height}`}
-        style={{ width: '100%', height: 224, display: 'block', overflow: 'visible' }}
+        style={{ width: '100%', height: 210, display: 'block' }}
         role="img"
-        aria-label={metric === 'cost_usd' ? 'Spend trend chart' : 'Request trend chart'}
+        aria-label={`${metricLabel} trend chart`}
         onMouseLeave={() => setHoveredIndex(null)}
       >
+        <defs>
+          <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={strokeColor} stopOpacity="0.16" />
+            <stop offset="100%" stopColor={strokeColor} stopOpacity="0.0" />
+          </linearGradient>
+        </defs>
+
         {[0, 0.5, 1].map((tick) => {
           const val = maxVal * tick;
           const y = yFor(val);
@@ -119,15 +170,17 @@ export function UsageChart({ series, metric }: UsageChartProps) {
                 x2={width - padRight}
                 y1={y}
                 y2={y}
-                stroke="#E5E5EA"
+                stroke="rgba(24, 24, 21, 0.08)"
+                strokeDasharray={tick === 0 ? undefined : '3 3'}
                 strokeWidth="1"
               />
               <text
-                x={padLeft - 12}
+                x={padLeft - 10}
                 y={y + 4}
                 textAnchor="end"
-                fill="#6A6A6A"
-                fontSize="14"
+                fill="#84827C"
+                fontSize="11.5"
+                style={{ fontVariantNumeric: 'tabular-nums' }}
               >
                 {formatAxisVal(val)}
               </text>
@@ -135,26 +188,16 @@ export function UsageChart({ series, metric }: UsageChartProps) {
           );
         })}
 
+        {areaPath && <path d={areaPath} fill={`url(#${gradId})`} />}
+
         <path
-          d={pathD}
+          d={linePath}
           fill="none"
-          stroke="#0071E3"
+          stroke={strokeColor}
           strokeWidth="2"
           strokeLinecap="round"
           strokeLinejoin="round"
         />
-
-        {points.map((pt, idx) => (
-          <circle
-            key={pt.raw.bucket + String(idx)}
-            cx={pt.x}
-            cy={pt.y}
-            r={hoveredIndex === idx ? 5 : 3}
-            fill={hoveredIndex === idx ? '#0071E3' : '#FFFFFF'}
-            stroke="#0071E3"
-            strokeWidth="2"
-          />
-        ))}
 
         {activePoint && (
           <line
@@ -162,22 +205,46 @@ export function UsageChart({ series, metric }: UsageChartProps) {
             x2={activePoint.x}
             y1={padTop}
             y2={padTop + plotH}
-            stroke="#181818"
-            strokeOpacity="0.16"
+            stroke="#151514"
+            strokeOpacity="0.18"
             strokeWidth="1"
           />
         )}
 
-        <text x={padLeft} y={height - 8} textAnchor="start" fill="#6A6A6A" fontSize="14">
+        {points.map((pt, idx) => {
+          const hasError = pt.raw.errors > 0 && metric !== 'errors';
+          return (
+            <g key={pt.raw.bucket + String(idx)}>
+              <circle
+                cx={pt.x}
+                cy={pt.y}
+                r={hoveredIndex === idx ? 4.8 : 3}
+                fill={hoveredIndex === idx ? strokeColor : '#FFFFFF'}
+                stroke={strokeColor}
+                strokeWidth="2"
+              />
+              {hasError && (
+                <circle
+                  cx={pt.x}
+                  cy={padTop + 4}
+                  r={2.6}
+                  fill="#DC2626"
+                />
+              )}
+            </g>
+          );
+        })}
+
+        <text x={padLeft} y={height - 7} textAnchor="start" fill="#84827C" fontSize="11.5">
           {firstLabel}
         </text>
         {midLabel && (
           <text
             x={padLeft + plotW / 2}
-            y={height - 8}
+            y={height - 7}
             textAnchor="middle"
-            fill="#6A6A6A"
-            fontSize="14"
+            fill="#84827C"
+            fontSize="11.5"
           >
             {midLabel}
           </text>
@@ -185,10 +252,10 @@ export function UsageChart({ series, metric }: UsageChartProps) {
         {lastLabel && (
           <text
             x={width - padRight}
-            y={height - 8}
+            y={height - 7}
             textAnchor="end"
-            fill="#6A6A6A"
-            fontSize="14"
+            fill="#84827C"
+            fontSize="11.5"
           >
             {lastLabel}
           </text>

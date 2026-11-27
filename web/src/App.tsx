@@ -1,8 +1,20 @@
 import { useEffect, useState } from 'react';
-import { Sparkles, User } from 'reicon-react';
 import { api } from './api/client';
-import { CascadeMenu } from './components/CascadeMenu';
-import { Icon } from './components/Icon';
+import {
+  AlertIcon,
+  BookIcon,
+  ChartBarIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  CloseIcon,
+  GearIcon,
+  HeadlampMark,
+  ShieldIcon,
+  SidebarToggleIcon,
+  SparkleIcon,
+  TailnetMeshGlyph,
+  TerminalIcon,
+} from './components/ApertureIcons';
 import type { MeResponse, TimeWindow } from './types/api';
 import { AuditLogsView, type LogsFocusState } from './views/AuditLogsView';
 import {
@@ -14,15 +26,58 @@ import { PersonalView } from './views/PersonalView';
 import { RoutingView, type RoutingFocusState } from './views/RoutingView';
 import { SecurityView, type SecurityFocusState } from './views/SecurityView';
 
-type AdminTab = 'overview' | 'routing' | 'budgets' | 'logs' | 'security' | 'personal';
+type NavKey =
+  | 'overview'
+  | 'logs'
+  | 'providers'
+  | 'routes'
+  | 'budgets'
+  | 'guardrails'
+  | 'webhooks'
+  | 'quickstart';
+
+interface SidebarCounts {
+  providers: number;
+  routes: number;
+  budgets: number;
+  rules: number;
+  webhooks: number;
+}
+
+function initialsFromPrincipal(name: string): string {
+  const cleaned = name.replace(/^tag:/, '').trim();
+  if (!cleaned) return 'HL';
+  const parts = cleaned.split(/[@.\s_-]+/).filter(Boolean);
+  if (parts.length >= 2) {
+    return (parts[0][0] + parts[1][0]).toUpperCase();
+  }
+  return cleaned.slice(0, 2).toUpperCase();
+}
 
 export function App() {
   const [me, setMe] = useState<MeResponse | null>(null);
   const [loadingMe, setLoadingMe] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
 
-  const [activeTab, setActiveTab] = useState<AdminTab>('overview');
+  const [activeNav, setActiveNav] = useState<NavKey>('overview');
   const [overviewWindow, setOverviewWindow] = useState<TimeWindow>('7d');
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [bannerDismissed, setBannerDismissed] = useState(false);
+
+  const [openGroups, setOpenGroups] = useState({
+    telemetry: true,
+    security: true,
+    admin: true,
+    developer: true,
+  });
+
+  const [counts, setCounts] = useState<SidebarCounts>({
+    providers: 0,
+    routes: 0,
+    budgets: 0,
+    rules: 0,
+    webhooks: 0,
+  });
 
   const [routingFocus, setRoutingFocus] = useState<RoutingFocusState>({});
   const [budgetsFocus, setBudgetsFocus] = useState<BudgetsFocusState>({});
@@ -35,373 +90,486 @@ export function App() {
       .then((res) => {
         setMe(res);
         if (!res.is_admin) {
-          setActiveTab('personal');
+          setActiveNav('quickstart');
+        } else {
+          // Preload sidebar inventory counts in parallel for admin console
+          void Promise.all([
+            api.listProviders().catch(() => []),
+            api.listRoutes().catch(() => []),
+            api.listBudgets().catch(() => []),
+            api.listGuardrails().catch(() => []),
+            api.listWebhooks().catch(() => []),
+          ]).then(([p, r, b, g, w]) => {
+            setCounts({
+              providers: p.length,
+              routes: r.length,
+              budgets: b.length,
+              rules: g.length,
+              webhooks: w.length,
+            });
+          });
         }
         setLoadingMe(false);
       })
       .catch((err: unknown) => {
-        setAuthError(err instanceof Error ? err.message : 'Unable to authenticate');
+        setAuthError(
+          err instanceof Error ? err.message : 'Unable to authenticate with Headlamp',
+        );
         setLoadingMe(false);
       });
   }, []);
 
   if (loadingMe) {
     return (
-      <main className="hl-main">
-        <p className="hl-secondary">Loading Headlamp...</p>
+      <main
+        style={{
+          width: '100%',
+          minHeight: '100dvh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 10,
+          color: 'var(--ap-text-secondary)',
+        }}
+      >
+        <HeadlampMark size={20} />
+        <span>Loading Headlamp...</span>
       </main>
     );
   }
 
   if (authError || !me) {
     return (
-      <main className="hl-main">
-        <section className="hl-section">
-          <h1>Headlamp</h1>
-          <p className="hl-status-text hl-status-danger">
-            {authError || 'Authentication required'}
-          </p>
+      <main
+        style={{
+          width: '100%',
+          minHeight: '100dvh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: 24,
+        }}
+      >
+        <section className="ap-card ap-card-body" style={{ maxWidth: 460, width: '100%' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+            <HeadlampMark size={22} />
+            <h1 style={{ fontSize: 18, fontWeight: 650 }}>Headlamp</h1>
+          </div>
+          <div className="ap-alert ap-alert--danger">
+            <AlertIcon style={{ flexShrink: 0, marginTop: 1 }} />
+            <span>{authError || 'Tailnet authentication required.'}</span>
+          </div>
         </section>
       </main>
     );
   }
 
-  const goRouting = (next: Omit<RoutingFocusState, 'nonce'>) => {
-    setActiveTab('routing');
-    setRoutingFocus({ ...next, nonce: Date.now() });
+  const toggleGroup = (key: keyof typeof openGroups) => {
+    setOpenGroups((prev) => ({ ...prev, [key]: !prev[key] }));
   };
 
-  const goBudgets = (next: Omit<BudgetsFocusState, 'nonce'>) => {
-    setActiveTab('budgets');
-    setBudgetsFocus({ ...next, nonce: Date.now() });
+  const navigate = (next: NavKey) => {
+    setActiveNav(next);
+    setMobileSidebarOpen(false);
+    if (typeof window !== 'undefined') {
+      window.scrollTo(0, 0);
+    }
+    if (next === 'providers') {
+      setRoutingFocus({ section: 'all', nonce: Date.now() });
+    } else if (next === 'routes') {
+      setRoutingFocus({ section: 'routes', nonce: Date.now() });
+    } else if (next === 'guardrails') {
+      setSecurityFocus({ section: 'all', nonce: Date.now() });
+    } else if (next === 'webhooks') {
+      setSecurityFocus({ section: 'webhooks', nonce: Date.now() });
+    }
   };
 
-  const goLogs = (next: Omit<LogsFocusState, 'nonce'>) => {
-    setActiveTab('logs');
-    setLogsFocus({ ...next, nonce: Date.now() });
+  const openPricingDrawer = () => {
+    setActiveNav('providers');
+    setMobileSidebarOpen(false);
+    setRoutingFocus({ section: 'routes', modal: 'pricing', nonce: Date.now() });
   };
 
-  const goSecurity = (next: Omit<SecurityFocusState, 'nonce'>) => {
-    setActiveTab('security');
-    setSecurityFocus({ ...next, nonce: Date.now() });
+  const jumpToLogs = (filter: Omit<LogsFocusState, 'nonce'>) => {
+    setActiveNav('logs');
+    setLogsFocus({ ...filter, nonce: Date.now() });
   };
+
+  const displayName = me.principal.display_name || me.principal.subject;
+  const nodeSubtitle = me.principal.node_name
+    ? `${me.principal.node_name}${me.principal.node_ip ? ` · ${me.principal.node_ip}` : ''}`
+    : me.principal.node_ip || me.principal.auth_source;
+
+  const isQuickstartView = !me.is_admin || activeNav === 'quickstart';
 
   return (
-    <>
-      <header className="hl-header">
-        <div className="hl-header-inner">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 32 }}>
-            <button
-              type="button"
-              className="hl-brand"
-              onClick={() => setActiveTab(me.is_admin ? 'overview' : 'personal')}
-            >
-              <Icon icon={Sparkles} color="#0071E3" />
-              <span>Headlamp</span>
-            </button>
+    <div className="ap-shell">
+      {mobileSidebarOpen && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 65,
+            background: 'rgba(18, 18, 16, 0.28)',
+          }}
+          onClick={() => setMobileSidebarOpen(false)}
+        />
+      )}
 
-            {me.is_admin && (
-              <nav className="hl-nav" aria-label="Primary navigation">
-                <CascadeMenu
-                  label="Overview"
-                  current={activeTab === 'overview'}
-                  onPrimaryClick={() => setActiveTab('overview')}
-                  items={[
-                    {
-                      id: 'ov-window',
-                      label: 'Time Window',
-                      children: [
-                        {
-                          id: 'w-24h',
-                          label: 'Last 24 Hours',
-                          selected: overviewWindow === '24h',
-                          onSelect: () => {
-                            setActiveTab('overview');
-                            setOverviewWindow('24h');
-                          },
-                        },
-                        {
-                          id: 'w-7d',
-                          label: 'Last 7 Days',
-                          selected: overviewWindow === '7d',
-                          onSelect: () => {
-                            setActiveTab('overview');
-                            setOverviewWindow('7d');
-                          },
-                        },
-                        {
-                          id: 'w-30d',
-                          label: 'Last 30 Days',
-                          selected: overviewWindow === '30d',
-                          onSelect: () => {
-                            setActiveTab('overview');
-                            setOverviewWindow('30d');
-                          },
-                        },
-                      ],
-                    },
-                  ]}
-                />
+      <aside
+        className="ap-sidebar"
+        data-mobile-open={mobileSidebarOpen}
+        aria-label="Primary navigation"
+      >
+        <div className="ap-sidebar-brand">
+          <button
+            type="button"
+            className="ap-brand-btn"
+            onClick={() => navigate(me.is_admin ? 'overview' : 'quickstart')}
+          >
+            <HeadlampMark size={22} />
+            <span className="ap-brand-wordmark">headlamp</span>
+          </button>
+          <span className="ap-brand-tag">{me.is_admin ? 'admin' : 'tailnet'}</span>
+        </div>
 
-                <CascadeMenu
-                  label="Routing"
-                  current={activeTab === 'routing'}
-                  onPrimaryClick={() => goRouting({ providerType: 'all', routeFilter: 'all' })}
-                  items={[
-                    {
-                      id: 'nav-providers',
-                      label: 'Providers',
-                      children: [
-                        {
-                          id: 'p-all',
-                          label: 'All Providers',
-                          onSelect: () => goRouting({ providerType: 'all' }),
-                        },
-                        {
-                          id: 'p-openai',
-                          label: 'OpenAI',
-                          onSelect: () => goRouting({ providerType: 'openai' }),
-                        },
-                        {
-                          id: 'p-anthropic',
-                          label: 'Anthropic',
-                          onSelect: () => goRouting({ providerType: 'anthropic' }),
-                        },
-                        {
-                          id: 'p-gemini',
-                          label: 'Gemini',
-                          onSelect: () => goRouting({ providerType: 'gemini' }),
-                        },
-                        {
-                          id: 'p-ollama',
-                          label: 'Ollama',
-                          onSelect: () => goRouting({ providerType: 'ollama' }),
-                        },
-                        {
-                          id: 'p-new',
-                          label: 'Add Provider',
-                          onSelect: () => goRouting({ modal: 'provider' }),
-                        },
-                      ],
-                    },
-                    {
-                      id: 'nav-routes',
-                      label: 'Model Routes',
-                      children: [
-                        {
-                          id: 'r-all',
-                          label: 'All Routes',
-                          onSelect: () => goRouting({ routeFilter: 'all' }),
-                        },
-                        {
-                          id: 'r-fb',
-                          label: 'With Fallbacks',
-                          onSelect: () => goRouting({ routeFilter: 'fallbacks' }),
-                        },
-                        {
-                          id: 'r-custom',
-                          label: 'Custom Pricing',
-                          onSelect: () => goRouting({ routeFilter: 'custom_pricing' }),
-                        },
-                        {
-                          id: 'r-new',
-                          label: 'Add Route',
-                          onSelect: () => goRouting({ modal: 'route' }),
-                        },
-                      ],
-                    },
-                    {
-                      id: 'nav-pricing',
-                      label: 'Pricing Table',
-                      onSelect: () => goRouting({ modal: 'pricing' }),
-                    },
-                  ]}
-                />
+        <nav className="ap-sidebar-scroll">
+          {me.is_admin ? (
+            <>
+              {/* Telemetry / Usage & Adoption */}
+              <div className="ap-nav-group">
+                <button
+                  type="button"
+                  className="ap-nav-group-btn"
+                  onClick={() => toggleGroup('telemetry')}
+                  aria-expanded={openGroups.telemetry}
+                >
+                  <span className="ap-nav-group-label">
+                    <ChartBarIcon size={16} />
+                    <span>Usage & Adoption</span>
+                  </span>
+                  <span className="ap-nav-group-chevron">
+                    {openGroups.telemetry ? <ChevronDownIcon /> : <ChevronRightIcon />}
+                  </span>
+                </button>
+                {openGroups.telemetry && (
+                  <div className="ap-nav-items">
+                    <button
+                      type="button"
+                      className="ap-nav-item"
+                      data-active={activeNav === 'overview'}
+                      onClick={() => navigate('overview')}
+                    >
+                      <span>Usage Overview</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="ap-nav-item"
+                      data-active={activeNav === 'quickstart'}
+                      onClick={() => navigate('quickstart')}
+                    >
+                      <span>My Usage & SDKs</span>
+                    </button>
+                  </div>
+                )}
+              </div>
 
-                <CascadeMenu
-                  label="Budgets"
-                  current={activeTab === 'budgets'}
-                  onPrimaryClick={() => goBudgets({ scopeFilter: 'all' })}
-                  items={[
-                    {
-                      id: 'b-scopes',
-                      label: 'Scopes',
-                      children: [
-                        {
-                          id: 'b-all',
-                          label: 'All Scopes',
-                          onSelect: () => goBudgets({ scopeFilter: 'all' }),
-                        },
-                        {
-                          id: 'b-global',
-                          label: 'Global (*)',
-                          onSelect: () => goBudgets({ scopeFilter: 'global' }),
-                        },
-                        {
-                          id: 'b-tag',
-                          label: 'Node Tags',
-                          onSelect: () => goBudgets({ scopeFilter: 'tag' }),
-                        },
-                        {
-                          id: 'b-user',
-                          label: 'Users',
-                          onSelect: () => goBudgets({ scopeFilter: 'user' }),
-                        },
-                      ],
-                    },
-                    {
-                      id: 'b-new',
-                      label: 'Add Budget',
-                      onSelect: () => goBudgets({ openCreate: true }),
-                    },
-                  ]}
-                />
+              {/* Security */}
+              <div className="ap-nav-group">
+                <button
+                  type="button"
+                  className="ap-nav-group-btn"
+                  onClick={() => toggleGroup('security')}
+                  aria-expanded={openGroups.security}
+                >
+                  <span className="ap-nav-group-label">
+                    <ShieldIcon size={16} />
+                    <span>Security</span>
+                  </span>
+                  <span className="ap-nav-group-chevron">
+                    {openGroups.security ? <ChevronDownIcon /> : <ChevronRightIcon />}
+                  </span>
+                </button>
+                {openGroups.security && (
+                  <div className="ap-nav-items">
+                    <button
+                      type="button"
+                      className="ap-nav-item"
+                      data-active={activeNav === 'logs'}
+                      onClick={() => navigate('logs')}
+                    >
+                      <span>Activity Logs</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="ap-nav-item"
+                      data-active={activeNav === 'guardrails'}
+                      onClick={() => navigate('guardrails')}
+                    >
+                      <span>Guardrails</span>
+                      {counts.rules > 0 && (
+                        <span className="ap-nav-count">{counts.rules}</span>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      className="ap-nav-item"
+                      data-active={activeNav === 'webhooks'}
+                      onClick={() => navigate('webhooks')}
+                    >
+                      <span>Webhooks</span>
+                      {counts.webhooks > 0 && (
+                        <span className="ap-nav-count">{counts.webhooks}</span>
+                      )}
+                    </button>
+                  </div>
+                )}
+              </div>
 
-                <CascadeMenu
-                  label="Audit Logs"
-                  current={activeTab === 'logs'}
-                  onPrimaryClick={() => goLogs({})}
-                  items={[
-                    {
-                      id: 'l-status',
-                      label: 'Filter by Status',
-                      children: [
-                        {
-                          id: 'l-all',
-                          label: 'All Requests',
-                          onSelect: () => goLogs({}),
-                        },
-                        {
-                          id: 'l-200',
-                          label: '200 OK',
-                          onSelect: () => goLogs({ status: '200' }),
-                        },
-                        {
-                          id: 'l-429',
-                          label: '429 Rate Limited',
-                          onSelect: () => goLogs({ status: '429' }),
-                        },
-                        {
-                          id: 'l-500',
-                          label: '500 Error',
-                          onSelect: () => goLogs({ status: '500' }),
-                        },
-                      ],
-                    },
-                    {
-                      id: 'l-guardrail',
-                      label: 'Guardrail Hits',
-                      onSelect: () => goLogs({ guardrail_only: true }),
-                    },
-                    {
-                      id: 'l-settings',
-                      label: 'Audit Settings',
-                      onSelect: () => goLogs({ openSettings: true }),
-                    },
-                  ]}
-                />
+              {/* Administration */}
+              <div className="ap-nav-group">
+                <button
+                  type="button"
+                  className="ap-nav-group-btn"
+                  onClick={() => toggleGroup('admin')}
+                  aria-expanded={openGroups.admin}
+                >
+                  <span className="ap-nav-group-label">
+                    <GearIcon size={16} />
+                    <span>Administration</span>
+                  </span>
+                  <span className="ap-nav-group-chevron">
+                    {openGroups.admin ? <ChevronDownIcon /> : <ChevronRightIcon />}
+                  </span>
+                </button>
+                {openGroups.admin && (
+                  <div className="ap-nav-items">
+                    <button
+                      type="button"
+                      className="ap-nav-item"
+                      data-active={activeNav === 'providers'}
+                      onClick={() => navigate('providers')}
+                    >
+                      <span>Providers</span>
+                      {counts.providers > 0 && (
+                        <span className="ap-nav-count">{counts.providers}</span>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      className="ap-nav-item"
+                      data-active={activeNav === 'routes'}
+                      onClick={() => navigate('routes')}
+                    >
+                      <span>Model Routing</span>
+                      {counts.routes > 0 && (
+                        <span className="ap-nav-count">{counts.routes}</span>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      className="ap-nav-item"
+                      data-active={activeNav === 'budgets'}
+                      onClick={() => navigate('budgets')}
+                    >
+                      <span>Quotas & Grants</span>
+                      {counts.budgets > 0 && (
+                        <span className="ap-nav-count">{counts.budgets}</span>
+                      )}
+                    </button>
+                  </div>
+                )}
+              </div>
 
-                <CascadeMenu
-                  label="Security"
-                  current={activeTab === 'security'}
-                  onPrimaryClick={() => goSecurity({ category: 'all', webhookType: 'all' })}
-                  items={[
-                    {
-                      id: 's-guardrails',
-                      label: 'Guardrails',
-                      children: [
-                        {
-                          id: 'sg-all',
-                          label: 'All Rules',
-                          onSelect: () => goSecurity({ category: 'all' }),
-                        },
-                        {
-                          id: 'sg-secret',
-                          label: 'Secret Detectors',
-                          onSelect: () => goSecurity({ category: 'secret' }),
-                        },
-                        {
-                          id: 'sg-pii',
-                          label: 'PII Detectors',
-                          onSelect: () => goSecurity({ category: 'pii' }),
-                        },
-                        {
-                          id: 'sg-new',
-                          label: 'Add Rule',
-                          onSelect: () => goSecurity({ modal: 'guardrail' }),
-                        },
-                      ],
-                    },
-                    {
-                      id: 's-webhooks',
-                      label: 'Webhooks',
-                      children: [
-                        {
-                          id: 'sw-all',
-                          label: 'All Webhooks',
-                          onSelect: () => goSecurity({ webhookType: 'all' }),
-                        },
-                        {
-                          id: 'sw-sync',
-                          label: 'Sync Review',
-                          onSelect: () => goSecurity({ webhookType: 'sync_review' }),
-                        },
-                        {
-                          id: 'sw-async',
-                          label: 'Async Event',
-                          onSelect: () => goSecurity({ webhookType: 'async_event' }),
-                        },
-                        {
-                          id: 'sw-new',
-                          label: 'Add Webhook',
-                          onSelect: () => goSecurity({ modal: 'webhook' }),
-                        },
-                      ],
-                    },
-                  ]}
-                />
-              </nav>
-            )}
-          </div>
-
-          <div className="hl-principal-bar">
-            <span>{me.principal.display_name || me.principal.subject}</span>
-            {me.is_admin && (
+              {/* Reference */}
+              <div className="ap-nav-group">
+                <button
+                  type="button"
+                  className="ap-nav-group-btn"
+                  onClick={() => toggleGroup('developer')}
+                  aria-expanded={openGroups.developer}
+                >
+                  <span className="ap-nav-group-label">
+                    <BookIcon size={16} />
+                    <span>Reference</span>
+                  </span>
+                  <span className="ap-nav-group-chevron">
+                    {openGroups.developer ? <ChevronDownIcon /> : <ChevronRightIcon />}
+                  </span>
+                </button>
+                {openGroups.developer && (
+                  <div className="ap-nav-items">
+                    <button
+                      type="button"
+                      className="ap-nav-item"
+                      data-active={false}
+                      onClick={openPricingDrawer}
+                    >
+                      <span>Model Pricing</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <div className="ap-nav-group">
               <button
                 type="button"
-                className="hl-btn hl-btn-ghost"
-                data-active={activeTab === 'personal'}
+                className="ap-nav-item ap-nav-item--top"
+                data-active={true}
+                onClick={() => navigate('quickstart')}
+              >
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 9 }}>
+                  <TerminalIcon size={16} />
+                  <span>Quickstart & My Usage</span>
+                </span>
+              </button>
+            </div>
+          )}
+        </nav>
+
+        <div className="ap-sidebar-footer">
+          {me.is_admin && (
+            <div className="ap-mode-switch-wrap">
+              <button
+                type="button"
+                className="ap-mode-switch-btn"
                 onClick={() =>
-                  setActiveTab((prev) => (prev === 'personal' ? 'overview' : 'personal'))
+                  navigate(isQuickstartView ? 'overview' : 'quickstart')
                 }
               >
-                <Icon icon={User} />
-                <span>{activeTab === 'personal' ? 'Admin' : 'My Usage'}</span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 9 }}>
+                  {isQuickstartView ? (
+                    <>
+                      <GearIcon size={16} />
+                      <span>Admin console</span>
+                    </>
+                  ) : (
+                    <>
+                      <TerminalIcon size={16} />
+                      <span>Quickstart & SDKs</span>
+                    </>
+                  )}
+                </span>
+                <ChevronRightIcon size={13} />
               </button>
-            )}
+            </div>
+          )}
+
+          <div className="ap-identity-bar">
+            <div className="ap-identity-user">
+              <span className="ap-avatar">
+                {initialsFromPrincipal(displayName)}
+              </span>
+              <div className="ap-identity-meta">
+                <span className="ap-identity-name" title={displayName}>
+                  {displayName}
+                </span>
+                <span className="ap-identity-node" title={nodeSubtitle}>
+                  {nodeSubtitle}
+                </span>
+              </div>
+            </div>
+            <span
+              className="ap-identity-chip"
+              title={`Tailnet identity (${me.principal.auth_source}) · Role: ${
+                me.is_admin ? 'admin' : 'user'
+              }`}
+            >
+              <TailnetMeshGlyph size={14} />
+            </span>
           </div>
         </div>
-      </header>
+      </aside>
 
-      <main className="hl-main">
-        {!me.is_admin || activeTab === 'personal' ? (
-          <PersonalView me={me} />
-        ) : activeTab === 'overview' ? (
-          <OverviewView
-            windowRange={overviewWindow}
-            onWindowChange={setOverviewWindow}
-            onJumpToLogs={(filter) => goLogs(filter)}
-          />
-        ) : activeTab === 'routing' ? (
-          <RoutingView focus={routingFocus} />
-        ) : activeTab === 'budgets' ? (
-          <BudgetsAccessView focus={budgetsFocus} />
-        ) : activeTab === 'logs' ? (
-          <AuditLogsView focus={logsFocus} />
-        ) : (
-          <SecurityView focus={securityFocus} />
+      <div className="ap-main-col">
+        <div className="ap-mobile-bar">
+          <button
+            type="button"
+            className="ap-btn ap-btn-ghost"
+            onClick={() => setMobileSidebarOpen(true)}
+            aria-label="Open navigation"
+          >
+            <SidebarToggleIcon />
+            <span style={{ fontWeight: 650 }}>headlamp</span>
+          </button>
+          <span className="ap-badge ap-mono">{displayName}</span>
+        </div>
+
+        {me.is_admin && !bannerDismissed && (
+          <div className="ap-info-banner">
+            <div className="ap-info-banner-body">
+              <SparkleIcon size={15} />
+              <span>
+                <strong>Keyless Tailnet AI Gateway is active.</strong> Connect Claude Code, Codex, Gemini CLI, and Cursor using your node identity in{' '}
+                <button
+                  type="button"
+                  className="ap-info-banner-link"
+                  onClick={() => navigate('quickstart')}
+                >
+                  Quickstart & SDKs
+                </button>
+                , or inspect capability rules in{' '}
+                <button
+                  type="button"
+                  className="ap-info-banner-link"
+                  onClick={() => {
+                    setActiveNav('budgets');
+                    setBudgetsFocus({ scopeFilter: 'all', nonce: Date.now() });
+                  }}
+                >
+                  Quotas & Grants
+                </button>
+                .
+              </span>
+            </div>
+            <button
+              type="button"
+              className="ap-btn ap-btn-ghost ap-btn-sm"
+              onClick={() => setBannerDismissed(true)}
+              aria-label="Dismiss banner"
+            >
+              <CloseIcon size={14} />
+            </button>
+          </div>
         )}
-      </main>
-    </>
+
+        <main style={{ flex: 1, minWidth: 0 }}>
+          {isQuickstartView ? (
+            <PersonalView me={me} />
+          ) : activeNav === 'overview' ? (
+            <OverviewView
+              windowRange={overviewWindow}
+              onWindowChange={setOverviewWindow}
+              onJumpToLogs={jumpToLogs}
+            />
+          ) : activeNav === 'providers' || activeNav === 'routes' ? (
+            <RoutingView
+              focus={routingFocus}
+              onCountsChange={({ providers, routes }) =>
+                setCounts((prev) => ({ ...prev, providers, routes }))
+              }
+            />
+          ) : activeNav === 'budgets' ? (
+            <BudgetsAccessView
+              focus={budgetsFocus}
+              onCountChange={(budgets) =>
+                setCounts((prev) => ({ ...prev, budgets }))
+              }
+            />
+          ) : activeNav === 'logs' ? (
+            <AuditLogsView focus={logsFocus} />
+          ) : (
+            <SecurityView
+              focus={securityFocus}
+              onCountsChange={({ rules, webhooks }) =>
+                setCounts((prev) => ({ ...prev, rules, webhooks }))
+              }
+            />
+          )}
+        </main>
+      </div>
+    </div>
   );
 }

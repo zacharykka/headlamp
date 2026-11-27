@@ -1,12 +1,20 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
-import { Add, Edit, Play, ShieldCheck, Trash } from 'reicon-react';
 import { api } from '../api/client';
-import { Icon } from '../components/Icon';
+import {
+  AlertIcon,
+  EditIcon,
+  PlayIcon,
+  PlusIcon,
+  ShieldIcon,
+  TrashIcon,
+} from '../components/ApertureIcons';
 import {
   CodeBlock,
   Modal,
   SegmentedControl,
+  SourceBadge,
   Toggle,
+  YAML_LOCK_TOOLTIP,
 } from '../components/Primitives';
 import { formatLatency } from '../lib/format';
 import type {
@@ -27,7 +35,23 @@ const WEBHOOK_EVENTS = [
   'upstream.error',
 ];
 
+const PLAYGROUND_PRESETS = [
+  {
+    label: 'Secret + Email PII',
+    text: 'Deploy with OPENAI_API_KEY=sk-proj-9f8e7d6c5b4a32109876543210abcdef and notify ops-lead@acme.internal.',
+  },
+  {
+    label: 'AWS Access Key',
+    text: 'aws_access_key_id = AKIAIOSFODNN7EXAMPLE\nssn = 123-45-6789',
+  },
+  {
+    label: 'Clean Prompt',
+    text: 'Summarize Kubernetes pod restart causes in three concise bullet points.',
+  },
+];
+
 export interface SecurityFocusState {
+  section?: 'all' | 'guardrails' | 'webhooks';
   category?: string;
   webhookType?: string;
   modal?: 'guardrail' | 'webhook' | null;
@@ -36,29 +60,31 @@ export interface SecurityFocusState {
 
 interface SecurityViewProps {
   focus?: SecurityFocusState;
+  onCountsChange?: (counts: { rules: number; webhooks: number }) => void;
 }
 
-export function SecurityView({ focus }: SecurityViewProps) {
+export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
   const [rules, setRules] = useState<GuardrailRule[]>([]);
   const [webhooks, setWebhooks] = useState<WebhookItem[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [pageError, setPageError] = useState<string | null>(null);
 
+  const [sectionMode, setSectionMode] = useState<'all' | 'guardrails' | 'webhooks'>('all');
   const [categoryFilter, setCategoryFilter] = useState<'all' | 'secret' | 'pii' | 'custom'>('all');
   const [webhookFilter, setWebhookFilter] = useState<'all' | 'sync_review' | 'async_event'>('all');
 
-  // Guardrail Live Tester
-  const [sampleText, setSampleText] = useState(
-    'Authorization: Bearer sk-proj-9f8e7d6c5b4a32109876543210abcdef',
-  );
+  // Interactive Live Guardrail Playground
+  const [sampleText, setSampleText] = useState(PLAYGROUND_PRESETS[0].text);
   const [testResult, setTestResult] = useState<GuardrailTestResponse | null>(null);
   const [testingGuardrail, setTestingGuardrail] = useState(false);
+  const [playgroundError, setPlaygroundError] = useState<string | null>(null);
 
-  // Guardrail Modal
+  // Guardrail Rule Modal
   const [ruleModalOpen, setRuleModalOpen] = useState(false);
+  const [ruleModalError, setRuleModalError] = useState<string | null>(null);
   const [editingRule, setEditingRule] = useState<GuardrailRule | null>(null);
   const [ruleId, setRuleId] = useState('');
   const [ruleName, setRuleName] = useState('');
-  const [ruleCategory, setRuleCategory] = useState('secret');
+  const [ruleCategory, setRuleCategory] = useState('custom');
   const [rulePattern, setRulePattern] = useState('');
   const [ruleAction, setRuleAction] = useState('redact');
   const [ruleEnabled, setRuleEnabled] = useState(true);
@@ -66,6 +92,7 @@ export function SecurityView({ focus }: SecurityViewProps) {
 
   // Webhook Modal
   const [whModalOpen, setWhModalOpen] = useState(false);
+  const [whModalError, setWhModalError] = useState<string | null>(null);
   const [editingWebhook, setEditingWebhook] = useState<WebhookItem | null>(null);
   const [whId, setWhId] = useState('');
   const [whName, setWhName] = useState('');
@@ -83,7 +110,7 @@ export function SecurityView({ focus }: SecurityViewProps) {
   const [testingWebhookId, setTestingWebhookId] = useState<string | null>(null);
 
   const loadAll = async () => {
-    setError(null);
+    setPageError(null);
     try {
       const [ruleList, webhookList] = await Promise.all([
         api.listGuardrails(),
@@ -91,8 +118,11 @@ export function SecurityView({ focus }: SecurityViewProps) {
       ]);
       setRules(ruleList);
       setWebhooks(webhookList);
+      onCountsChange?.({ rules: ruleList.length, webhooks: webhookList.length });
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to load security configuration');
+      setPageError(
+        err instanceof Error ? err.message : 'Failed to load guardrails and webhooks',
+      );
     }
   };
 
@@ -102,6 +132,7 @@ export function SecurityView({ focus }: SecurityViewProps) {
 
   useEffect(() => {
     if (!focus) return;
+    if (focus.section) setSectionMode(focus.section);
     if (
       focus.category === 'all' ||
       focus.category === 'secret' ||
@@ -123,6 +154,7 @@ export function SecurityView({ focus }: SecurityViewProps) {
 
   const openCreateRule = () => {
     setEditingRule(null);
+    setRuleModalError(null);
     setRuleId('');
     setRuleName('');
     setRuleCategory('custom');
@@ -133,7 +165,9 @@ export function SecurityView({ focus }: SecurityViewProps) {
   };
 
   const openEditRule = (item: GuardrailRule) => {
+    if (item.source === 'config') return;
     setEditingRule(item);
+    setRuleModalError(null);
     setRuleId(item.id);
     setRuleName(item.name);
     setRuleCategory(item.category);
@@ -145,17 +179,48 @@ export function SecurityView({ focus }: SecurityViewProps) {
 
   const handleSaveRule = async (event: FormEvent) => {
     event.preventDefault();
-    setSavingRule(true);
-    setError(null);
+    setRuleModalError(null);
 
-    const payload: GuardrailUpsertPayload = {
-      id: ruleId.trim(),
-      name: ruleName.trim(),
-      category: ruleCategory,
-      pattern: rulePattern,
-      action: ruleAction,
-      enabled: ruleEnabled,
-    };
+    const trimmedId = ruleId.trim();
+    if (trimmedId.includes('/')) {
+      setRuleModalError('Rule ID must not contain "/".');
+      return;
+    }
+    if (trimmedId.toLowerCase() === 'test') {
+      setRuleModalError('Rule ID "test" is reserved by the playground endpoint.');
+      return;
+    }
+
+    const isBuiltinPreset = Boolean(editingRule?.builtin);
+    if (!isBuiltinPreset) {
+      if (!ruleName.trim()) {
+        setRuleModalError('Display name is required.');
+        return;
+      }
+      if (!rulePattern.trim()) {
+        setRuleModalError('Regular expression pattern is required.');
+        return;
+      }
+    }
+
+    setSavingRule(true);
+    const payload: GuardrailUpsertPayload = isBuiltinPreset && editingRule
+      ? {
+          id: editingRule.id,
+          name: editingRule.name,
+          category: editingRule.category,
+          pattern: editingRule.pattern,
+          action: ruleAction,
+          enabled: ruleEnabled,
+        }
+      : {
+          id: trimmedId,
+          name: ruleName.trim(),
+          category: ruleCategory,
+          pattern: rulePattern,
+          action: ruleAction,
+          enabled: ruleEnabled,
+        };
 
     try {
       if (editingRule) {
@@ -166,15 +231,19 @@ export function SecurityView({ focus }: SecurityViewProps) {
       setRuleModalOpen(false);
       await loadAll();
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to save guardrail rule');
+      setRuleModalError(
+        err instanceof Error ? err.message : 'Failed to save guardrail rule',
+      );
     } finally {
       setSavingRule(false);
     }
   };
 
   const handleToggleRule = async (item: GuardrailRule, next: boolean) => {
+    if (item.source === 'config') return;
+    setPageError(null);
     try {
-      await api.updateGuardrail(item.id, {
+      const updated = await api.updateGuardrail(item.id, {
         id: item.id,
         name: item.name,
         category: item.category,
@@ -182,39 +251,46 @@ export function SecurityView({ focus }: SecurityViewProps) {
         action: item.action,
         enabled: next,
       });
-      setRules((prev) =>
-        prev.map((r) => (r.id === item.id ? { ...r, enabled: next } : r)),
-      );
+      setRules((prev) => prev.map((r) => (r.id === item.id ? updated : r)));
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to update rule');
+      setPageError(err instanceof Error ? err.message : 'Failed to toggle guardrail rule');
     }
   };
 
-  const handleDeleteRule = async (id: string) => {
+  const handleDeleteRule = async (item: GuardrailRule) => {
+    if (item.source === 'config' || item.builtin) return;
+    setPageError(null);
     try {
-      await api.deleteGuardrail(id);
+      await api.deleteGuardrail(item.id);
       await loadAll();
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to delete rule');
+      setPageError(err instanceof Error ? err.message : 'Failed to delete guardrail rule');
     }
   };
 
-  const handleRunTest = async (event: FormEvent) => {
-    event.preventDefault();
+  const runPlayground = async (textToTest: string) => {
     setTestingGuardrail(true);
-    setError(null);
+    setPlaygroundError(null);
     try {
-      const res = await api.testGuardrails(sampleText);
+      const res = await api.testGuardrails(textToTest);
       setTestResult(res);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Guardrail evaluation failed');
+      setPlaygroundError(
+        err instanceof Error ? err.message : 'Guardrail evaluation failed',
+      );
     } finally {
       setTestingGuardrail(false);
     }
   };
 
+  const handleRunTest = (event: FormEvent) => {
+    event.preventDefault();
+    void runPlayground(sampleText);
+  };
+
   const openCreateWebhook = () => {
     setEditingWebhook(null);
+    setWhModalError(null);
     setWhId('');
     setWhName('');
     setWhUrl('');
@@ -229,7 +305,9 @@ export function SecurityView({ focus }: SecurityViewProps) {
   };
 
   const openEditWebhook = (item: WebhookItem) => {
+    if (item.source === 'config') return;
     setEditingWebhook(item);
+    setWhModalError(null);
     setWhId(item.id);
     setWhName(item.name);
     setWhUrl(item.url);
@@ -245,16 +323,34 @@ export function SecurityView({ focus }: SecurityViewProps) {
 
   const handleSaveWebhook = async (event: FormEvent) => {
     event.preventDefault();
-    setSavingWebhook(true);
-    setError(null);
+    setWhModalError(null);
 
+    if (whId.trim().includes('/')) {
+      setWhModalError('Webhook ID must not contain "/".');
+      return;
+    }
+    if (!whName.trim()) {
+      setWhModalError('Webhook name is required.');
+      return;
+    }
+    if (!whUrl.trim()) {
+      setWhModalError('Target HTTP/HTTPS URL is required.');
+      return;
+    }
+    const parsedTimeout = Number(whTimeout);
+    if (!Number.isFinite(parsedTimeout) || parsedTimeout <= 0) {
+      setWhModalError('Timeout (ms) must be a positive number.');
+      return;
+    }
+
+    setSavingWebhook(true);
     const payload: WebhookUpsertPayload = {
       id: whId.trim(),
       name: whName.trim(),
       url: whUrl.trim(),
       type: whType,
       events: whType === 'async_event' ? whEvents : [],
-      timeout_ms: Math.max(100, Number(whTimeout) || 2000),
+      timeout_ms: Math.floor(parsedTimeout),
       fail_open: whFailOpen,
       enabled: whEnabled,
     };
@@ -274,13 +370,15 @@ export function SecurityView({ focus }: SecurityViewProps) {
       setWhModalOpen(false);
       await loadAll();
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to save webhook');
+      setWhModalError(err instanceof Error ? err.message : 'Failed to save webhook');
     } finally {
       setSavingWebhook(false);
     }
   };
 
   const handleToggleWebhook = async (item: WebhookItem, next: boolean) => {
+    if (item.source === 'config') return;
+    setPageError(null);
     try {
       await api.updateWebhook(item.id, {
         id: item.id,
@@ -296,16 +394,18 @@ export function SecurityView({ focus }: SecurityViewProps) {
         prev.map((w) => (w.id === item.id ? { ...w, enabled: next } : w)),
       );
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to update webhook');
+      setPageError(err instanceof Error ? err.message : 'Failed to update webhook');
     }
   };
 
-  const handleDeleteWebhook = async (id: string) => {
+  const handleDeleteWebhook = async (item: WebhookItem) => {
+    if (item.source === 'config') return;
+    setPageError(null);
     try {
-      await api.deleteWebhook(id);
+      await api.deleteWebhook(item.id);
       await loadAll();
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to delete webhook');
+      setPageError(err instanceof Error ? err.message : 'Failed to delete webhook');
     }
   };
 
@@ -345,200 +445,348 @@ export function SecurityView({ focus }: SecurityViewProps) {
     return webhooks.filter((w) => w.type === webhookFilter);
   }, [webhooks, webhookFilter]);
 
+  const showGuardrails = sectionMode === 'all' || sectionMode === 'guardrails';
+  const showWebhooks = sectionMode === 'all' || sectionMode === 'webhooks';
+
+  const verdictAction = (testResult?.action || 'allow').toLowerCase();
+
   return (
-    <>
-      <section className="hl-section">
-        <div className="hl-section-bar">
-          <h1>Guardrails</h1>
-          <div className="hl-toolbar">
+    <div className="ap-page">
+      <header className="ap-page-header">
+        <div className="ap-page-title-row">
+          <div>
+            <h1 className="ap-page-title">
+              {sectionMode === 'guardrails'
+                ? 'Guardrails & DLP'
+                : sectionMode === 'webhooks'
+                  ? 'Webhooks & Event Hooks'
+                  : 'Guardrails & Webhooks'}
+            </h1>
+            <p className="ap-page-subtitle">
+              Inspect prompts for secrets and PII before upstream dispatch, test live redactions, and wire HMAC-signed review or event webhooks.
+            </p>
+          </div>
+        </div>
+
+        <div className="ap-filter-bar">
+          <div className="ap-filter-group">
             <SegmentedControl
-              ariaLabel="Guardrail category"
-              value={categoryFilter}
-              onChange={setCategoryFilter}
+              ariaLabel="Security section"
+              value={sectionMode}
+              onChange={setSectionMode}
               options={[
                 { value: 'all', label: 'All' },
-                { value: 'secret', label: 'Secrets' },
-                { value: 'pii', label: 'PII' },
-                { value: 'custom', label: 'Custom' },
+                { value: 'guardrails', label: `Guardrails (${rules.length})` },
+                { value: 'webhooks', label: `Webhooks (${webhooks.length})` },
               ]}
             />
+          </div>
+
+          <div className="ap-filter-group">
+            <button type="button" className="ap-btn" onClick={openCreateWebhook}>
+              <PlusIcon />
+              <span>Add Webhook</span>
+            </button>
             <button
               type="button"
-              className="hl-btn hl-btn-primary"
+              className="ap-btn ap-btn-primary"
               onClick={openCreateRule}
             >
-              <Icon icon={Add} />
-              <span>Add Rule</span>
+              <PlusIcon />
+              <span>Add Guardrail Rule</span>
             </button>
           </div>
         </div>
+      </header>
 
-        {error && <p className="hl-status-text hl-status-danger">{error}</p>}
+      {pageError && (
+        <div className="ap-alert ap-alert--danger" role="alert">
+          <AlertIcon style={{ flexShrink: 0, marginTop: 1 }} />
+          <span>{pageError}</span>
+        </div>
+      )}
 
-        <div className="hl-table-wrap">
-          <table className="hl-table">
-            <thead>
-              <tr>
-                <th>Rule</th>
-                <th>Category</th>
-                <th>Pattern</th>
-                <th>Action</th>
-                <th>Origin</th>
-                <th>Enabled</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {filteredRules.length === 0 ? (
-                <tr>
-                  <td colSpan={7} className="hl-secondary">
-                    No guardrail rules
-                  </td>
-                </tr>
-              ) : (
-                filteredRules.map((rule) => (
-                  <tr key={rule.id} className="hl-row">
-                    <td style={{ fontWeight: 500 }}>{rule.name}</td>
-                    <td className="hl-secondary">{rule.category}</td>
-                    <td
-                      className="hl-mono hl-secondary"
-                      style={{
-                        maxWidth: 320,
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
+      {showGuardrails && (
+        <>
+          {/* Live Guardrail Playground inside Aperture Double-Bezel Tray */}
+          <section className="ap-bezel-tray" aria-label="Live Guardrail Playground">
+            <div className="ap-card">
+              <div className="ap-card-header">
+                <div>
+                  <h2 className="ap-card-title">Live Guardrail Playground</h2>
+                  <p className="ap-card-subtitle">
+                    Paste a sample prompt or JSON body to simulate active detectors and preview `[REDACTED:...]` output.
+                  </p>
+                </div>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  {PLAYGROUND_PRESETS.map((preset) => (
+                    <button
+                      key={preset.label}
+                      type="button"
+                      className="ap-btn ap-btn-sm"
+                      onClick={() => {
+                        setSampleText(preset.text);
+                        void runPlayground(preset.text);
                       }}
                     >
-                      {rule.pattern}
-                    </td>
-                    <td
-                      className={
-                        rule.action === 'block'
-                          ? 'hl-status-danger'
-                          : rule.action === 'redact'
-                            ? 'hl-status-accent'
-                            : 'hl-secondary'
-                      }
-                      style={{ fontWeight: 500 }}
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <form onSubmit={handleRunTest} className="ap-card-body ap-split-2">
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  <textarea
+                    className="ap-textarea ap-mono"
+                    style={{ minHeight: 118 }}
+                    value={sampleText}
+                    onChange={(e) => setSampleText(e.target.value)}
+                    placeholder="Paste sample prompt or JSON request..."
+                    aria-label="Sample prompt to evaluate against guardrails"
+                  />
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+                    <span className="ap-hint">
+                      Evaluates against all currently enabled rules in SQLite & YAML.
+                    </span>
+                    <button
+                      type="submit"
+                      className="ap-btn ap-btn-primary"
+                      disabled={testingGuardrail || !sampleText.trim()}
                     >
-                      {rule.action}
-                    </td>
-                    <td className="hl-secondary">
-                      {rule.builtin ? 'Built-in' : 'Custom'}
-                    </td>
-                    <td>
-                      <Toggle
-                        checked={rule.enabled}
-                        onChange={(next) => handleToggleRule(rule, next)}
-                        label={`Enable ${rule.name}`}
-                      />
-                    </td>
-                    <td>
-                      <div className="hl-row-actions">
-                        <button
-                          type="button"
-                          className="hl-btn hl-btn-ghost"
-                          onClick={() => openEditRule(rule)}
+                      <ShieldIcon size={15} />
+                      <span>{testingGuardrail ? 'Evaluating...' : 'Evaluate Sample'}</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10, minWidth: 0 }}>
+                  {playgroundError && (
+                    <div className="ap-alert ap-alert--danger">
+                      <AlertIcon style={{ flexShrink: 0, marginTop: 1 }} />
+                      <span>{playgroundError}</span>
+                    </div>
+                  )}
+
+                  {testResult ? (
+                    <>
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 8,
+                          flexWrap: 'wrap',
+                        }}
+                      >
+                        <span
+                          className={`ap-badge ${
+                            verdictAction === 'block'
+                              ? 'ap-badge--red'
+                              : verdictAction === 'redact'
+                                ? 'ap-badge--amber'
+                                : 'ap-badge--green'
+                          }`}
                         >
-                          <Icon icon={Edit} />
-                          <span>Edit</span>
-                        </button>
-                        {!rule.builtin && (
-                          <button
-                            type="button"
-                            className="hl-btn hl-btn-ghost hl-btn-danger"
-                            onClick={() => handleDeleteRule(rule.id)}
-                          >
-                            <Icon icon={Trash} />
-                            <span>Delete</span>
-                          </button>
+                          Verdict: {verdictAction.toUpperCase()}
+                        </span>
+                        {(testResult.matches ?? []).length > 0 ? (
+                          (testResult.matches ?? []).map((m) => (
+                            <span key={m.rule_id} className="ap-badge ap-mono">
+                              {m.rule_name} ({m.action})
+                            </span>
+                          ))
+                        ) : (
+                          <span style={{ color: 'var(--ap-text-secondary)', fontSize: 12 }}>
+                            No rules matched — request allowed unchanged.
+                          </span>
                         )}
                       </div>
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <section className="hl-section">
-        <div className="hl-section-bar">
-          <h2>Guardrail Tester</h2>
-        </div>
-
-        <form onSubmit={handleRunTest} className="hl-split-2">
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            <textarea
-              className="hl-textarea hl-mono"
-              value={sampleText}
-              onChange={(e) => setSampleText(e.target.value)}
-              placeholder="Paste sample prompt to inspect redaction or blocking..."
-            />
-            <div>
-              <button
-                type="submit"
-                className="hl-btn hl-btn-primary"
-                disabled={testingGuardrail || !sampleText.trim()}
-              >
-                <Icon icon={ShieldCheck} />
-                <span>{testingGuardrail ? 'Checking' : 'Test Sample'}</span>
-              </button>
-            </div>
-          </div>
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {testResult ? (
-              <>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 24, fontSize: 14 }}>
-                  <span>
-                    <span className="hl-secondary">Action </span>
-                    <strong
-                      className={
-                        testResult.action === 'block'
-                          ? 'hl-status-danger'
-                          : testResult.action === 'redact'
-                            ? 'hl-status-accent'
-                            : ''
-                      }
+                      <CodeBlock
+                        label="Evaluated / Redacted Output"
+                        code={testResult.redacted_text}
+                        highlightRedactions
+                      />
+                    </>
+                  ) : (
+                    <div
+                      style={{
+                        flex: 1,
+                        minHeight: 118,
+                        borderRadius: 'var(--ap-radius-md)',
+                        border: '1px dashed var(--ap-border-strong)',
+                        background: 'var(--ap-subcard-bg)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        padding: 16,
+                        color: 'var(--ap-text-secondary)',
+                        fontSize: 12.5,
+                        textAlign: 'center',
+                      }}
                     >
-                      {testResult.action || 'allow'}
-                    </strong>
-                  </span>
-                  <span className="hl-secondary">
-                    {(testResult.matches ?? []).length > 0
-                      ? `Matched: ${(testResult.matches ?? [])
-                          .map((m) => m.rule_name)
-                          .join(', ')}`
-                      : 'No rules triggered'}
-                  </span>
+                      Click &ldquo;Evaluate Sample&rdquo; or pick a preset above to inspect rule hits and redactions.
+                    </div>
+                  )}
                 </div>
-                <CodeBlock code={testResult.redacted_text} />
-              </>
-            ) : (
-              <div
-                className="hl-surface"
-                style={{
-                  minHeight: 96,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                }}
-              >
-                <span className="hl-secondary">Run a sample to view output</span>
-              </div>
-            )}
-          </div>
-        </form>
-      </section>
+              </form>
+            </div>
+          </section>
 
-      <section className="hl-section">
-        <div className="hl-section-bar">
-          <h2>Webhooks</h2>
-          <div className="hl-toolbar">
+          {/* Guardrail Rules Inventory */}
+          <section className="ap-card" aria-label="Guardrail rules">
+            <div className="ap-card-header">
+              <div>
+                <h2 className="ap-card-title">Detector Rules ({filteredRules.length})</h2>
+                <p className="ap-card-subtitle">
+                  Built-in presets allow toggling Enabled and Action; YAML-defined rules remain locked to headlamp.yaml.
+                </p>
+              </div>
+              <SegmentedControl
+                ariaLabel="Guardrail category filter"
+                value={categoryFilter}
+                onChange={setCategoryFilter}
+                options={[
+                  { value: 'all', label: 'All' },
+                  { value: 'secret', label: 'Secrets' },
+                  { value: 'pii', label: 'PII' },
+                  { value: 'custom', label: 'Custom' },
+                ]}
+              />
+            </div>
+
+            <div className="ap-table-wrap">
+              <table className="ap-table">
+                <thead>
+                  <tr>
+                    <th>Rule</th>
+                    <th>Origin</th>
+                    <th>Category</th>
+                    <th>Regex Pattern</th>
+                    <th>Action</th>
+                    <th>Enabled</th>
+                    <th style={{ textAlign: 'right' }}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredRules.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} style={{ color: 'var(--ap-text-muted)', padding: '26px 14px', textAlign: 'center' }}>
+                        No guardrail rules in this category.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredRules.map((rule) => {
+                      const isYaml = rule.source === 'config';
+                      const canDelete = !isYaml && !rule.builtin;
+
+                      return (
+                        <tr key={rule.id} className="ap-row">
+                          <td>
+                            <div style={{ fontWeight: 560 }}>{rule.name}</div>
+                            <div className="ap-mono" style={{ fontSize: 11, color: 'var(--ap-text-muted)' }}>
+                              {rule.id}
+                            </div>
+                          </td>
+                          <td>
+                            <SourceBadge source={rule.source} builtin={rule.builtin} />
+                          </td>
+                          <td style={{ textTransform: 'uppercase', fontSize: 11.5, color: 'var(--ap-text-secondary)', fontWeight: 550 }}>
+                            {rule.category}
+                          </td>
+                          <td style={{ maxWidth: 230 }}>
+                            <span
+                              className="ap-mono ap-truncate"
+                              style={{ display: 'block', fontSize: 12, color: 'var(--ap-text-secondary)' }}
+                              title={rule.pattern}
+                            >
+                              {rule.pattern}
+                            </span>
+                          </td>
+                          <td>
+                            <span
+                              className={`ap-badge ${
+                                rule.action === 'block'
+                                  ? 'ap-badge--red'
+                                  : rule.action === 'redact'
+                                    ? 'ap-badge--amber'
+                                    : ''
+                              }`}
+                            >
+                              {rule.action}
+                            </span>
+                          </td>
+                          <td>
+                            <Toggle
+                              checked={rule.enabled}
+                              disabled={isYaml}
+                              title={isYaml ? YAML_LOCK_TOOLTIP : undefined}
+                              onChange={(next) => handleToggleRule(rule, next)}
+                              label={`Enable ${rule.name}`}
+                            />
+                          </td>
+                          <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                            <div className="ap-row-actions">
+                              <button
+                                type="button"
+                                className="ap-btn ap-btn-ghost ap-btn-sm"
+                                disabled={isYaml}
+                                title={
+                                  isYaml
+                                    ? YAML_LOCK_TOOLTIP
+                                    : rule.builtin
+                                      ? 'Edit action or enabled state'
+                                      : `Edit ${rule.name}`
+                                }
+                                onClick={() => openEditRule(rule)}
+                              >
+                                <EditIcon />
+                                <span>Edit</span>
+                              </button>
+                              {canDelete && (
+                                <button
+                                  type="button"
+                                  className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm"
+                                  onClick={() => handleDeleteRule(rule)}
+                                >
+                                  <TrashIcon />
+                                  <span>Delete</span>
+                                </button>
+                              )}
+                              {isYaml && !rule.builtin && (
+                                <button
+                                  type="button"
+                                  className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm"
+                                  disabled
+                                  title={YAML_LOCK_TOOLTIP}
+                                >
+                                  <TrashIcon />
+                                  <span>Delete</span>
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </>
+      )}
+
+      {showWebhooks && (
+        <section className="ap-card" aria-label="Sync review and async event webhooks">
+          <div className="ap-card-header">
+            <div>
+              <h2 className="ap-card-title">Webhooks ({filteredWebhooks.length})</h2>
+              <p className="ap-card-subtitle">
+                Sync Review webhooks gate requests inline before upstream execution; Async Event webhooks stream telemetry & alerts.
+              </p>
+            </div>
             <SegmentedControl
-              ariaLabel="Webhook mode"
+              ariaLabel="Webhook mode filter"
               value={webhookFilter}
               onChange={setWebhookFilter}
               options={[
@@ -547,162 +795,197 @@ export function SecurityView({ focus }: SecurityViewProps) {
                 { value: 'async_event', label: 'Async Event' },
               ]}
             />
-            <button
-              type="button"
-              className="hl-btn hl-btn-primary"
-              onClick={openCreateWebhook}
-            >
-              <Icon icon={Add} />
-              <span>Add Webhook</span>
-            </button>
           </div>
-        </div>
 
-        <div className="hl-table-wrap">
-          <table className="hl-table">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Mode</th>
-                <th>Endpoint</th>
-                <th>Events / Policy</th>
-                <th>HMAC</th>
-                <th>Enabled</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {filteredWebhooks.length === 0 ? (
+          <div className="ap-table-wrap">
+            <table className="ap-table">
+              <thead>
                 <tr>
-                  <td colSpan={7} className="hl-secondary">
-                    No webhooks configured
-                  </td>
+                  <th>Webhook</th>
+                  <th>Origin</th>
+                  <th>Mode</th>
+                  <th>Endpoint & Policy</th>
+                  <th>HMAC</th>
+                  <th>Enabled</th>
+                  <th style={{ textAlign: 'right' }}>Actions</th>
                 </tr>
-              ) : (
-                filteredWebhooks.map((wh) => {
-                  const ping = webhookTests[wh.id];
-                  const isPinging = testingWebhookId === wh.id;
-                  return (
-                    <tr key={wh.id} className="hl-row">
-                      <td style={{ fontWeight: 500 }}>{wh.name}</td>
-                      <td className="hl-secondary">{wh.type}</td>
-                      <td className="hl-mono hl-secondary">{wh.url}</td>
-                      <td className="hl-secondary">
-                        {wh.type === 'sync_review'
-                          ? `${wh.timeout_ms} ms · ${
-                              wh.fail_open ? 'fail_open' : 'fail_closed'
-                            }`
-                          : (wh.events ?? []).includes('*')
-                            ? 'All events'
-                            : (wh.events ?? []).length > 0
-                              ? (wh.events ?? []).join(', ')
-                              : 'None'}
-                      </td>
-                      <td className="hl-secondary">
-                        {wh.has_secret ? 'Signed' : 'Unsigned'}
-                      </td>
-                      <td>
-                        <Toggle
-                          checked={wh.enabled}
-                          onChange={(next) => handleToggleWebhook(wh, next)}
-                          label={`Enable ${wh.name}`}
-                        />
-                      </td>
-                      <td>
-                        <div
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'flex-end',
-                            gap: 12,
-                          }}
-                        >
-                          {ping && (
-                            <span
-                              className={
-                                ping.ok
-                                  ? 'hl-status-text hl-status-accent'
-                                  : 'hl-status-text hl-status-danger'
-                              }
-                            >
-                              {ping.ok
-                                ? `${ping.status_code} · ${formatLatency(ping.latency_ms)}`
-                                : ping.message}
-                            </span>
-                          )}
-                          <div className="hl-row-actions" data-visible={isPinging}>
+              </thead>
+              <tbody>
+                {filteredWebhooks.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} style={{ color: 'var(--ap-text-muted)', padding: '26px 14px', textAlign: 'center' }}>
+                      No webhooks configured.
+                    </td>
+                  </tr>
+                ) : (
+                  filteredWebhooks.map((wh) => {
+                    const isYaml = wh.source === 'config';
+                    const ping = webhookTests[wh.id];
+                    const isPinging = testingWebhookId === wh.id;
+
+                    return (
+                      <tr key={wh.id} className="ap-row">
+                        <td>
+                          <div style={{ fontWeight: 560 }}>{wh.name}</div>
+                          <div className="ap-mono" style={{ fontSize: 11, color: 'var(--ap-text-muted)' }}>
+                            {wh.id}
+                          </div>
+                        </td>
+                        <td>
+                          <SourceBadge source={wh.source} />
+                        </td>
+                        <td>
+                          <span
+                            className={`ap-badge ${
+                              wh.type === 'sync_review' ? 'ap-badge--purple' : 'ap-badge--blue'
+                            }`}
+                          >
+                            {wh.type === 'sync_review' ? 'Sync Review' : 'Async Event'}
+                          </span>
+                        </td>
+                        <td style={{ maxWidth: 230 }}>
+                          <div
+                            className="ap-mono ap-truncate"
+                            style={{ fontSize: 12, color: 'var(--ap-text-secondary)' }}
+                            title={wh.url}
+                          >
+                            {wh.url}
+                          </div>
+                          <div
+                            className="ap-truncate"
+                            style={{ fontSize: 11.5, color: 'var(--ap-text-muted)', marginTop: 2 }}
+                          >
+                            {wh.type === 'sync_review'
+                              ? `${wh.timeout_ms} ms timeout · ${
+                                  wh.fail_open ? 'fail_open' : 'fail_closed'
+                                }`
+                              : (wh.events ?? []).includes('*')
+                                ? 'All events (*)'
+                                : (wh.events ?? []).join(', ') || 'No events'}
+                          </div>
+                        </td>
+                        <td>
+                          <span
+                            className={`ap-badge ${
+                              wh.has_secret ? 'ap-badge--green' : ''
+                            }`}
+                          >
+                            {wh.has_secret ? 'HMAC Signed' : 'Unsigned'}
+                          </span>
+                        </td>
+                        <td>
+                          <Toggle
+                            checked={wh.enabled}
+                            disabled={isYaml}
+                            title={isYaml ? YAML_LOCK_TOOLTIP : undefined}
+                            onChange={(next) => handleToggleWebhook(wh, next)}
+                            label={`Enable ${wh.name}`}
+                          />
+                        </td>
+                        <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                          <div className="ap-row-actions">
+                            {ping && (
+                              <span
+                                className={`ap-badge ap-tabular ${
+                                  ping.ok ? 'ap-badge--green' : 'ap-badge--red'
+                                }`}
+                                title={ping.message}
+                              >
+                                {ping.ok
+                                  ? `${ping.status_code} · ${formatLatency(ping.latency_ms)}`
+                                  : ping.message.slice(0, 26)}
+                              </span>
+                            )}
                             <button
                               type="button"
-                              className="hl-btn hl-btn-ghost"
+                              className="ap-btn ap-btn-ghost ap-btn-sm"
                               disabled={isPinging}
                               onClick={() => handleTestWebhook(wh.id)}
                             >
-                              <Icon icon={Play} />
-                              <span>{isPinging ? 'Testing' : 'Test'}</span>
+                              <PlayIcon />
+                              <span>{isPinging ? 'Pinging' : 'Test Ping'}</span>
                             </button>
                             <button
                               type="button"
-                              className="hl-btn hl-btn-ghost"
+                              className="ap-btn ap-btn-ghost ap-btn-sm"
+                              disabled={isYaml}
+                              title={isYaml ? YAML_LOCK_TOOLTIP : `Edit ${wh.name}`}
                               onClick={() => openEditWebhook(wh)}
                             >
-                              <Icon icon={Edit} />
+                              <EditIcon />
                               <span>Edit</span>
                             </button>
                             <button
                               type="button"
-                              className="hl-btn hl-btn-ghost hl-btn-danger"
-                              onClick={() => handleDeleteWebhook(wh.id)}
+                              className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm"
+                              disabled={isYaml}
+                              title={isYaml ? YAML_LOCK_TOOLTIP : `Delete ${wh.name}`}
+                              onClick={() => handleDeleteWebhook(wh)}
                             >
-                              <Icon icon={Trash} />
+                              <TrashIcon />
                               <span>Delete</span>
                             </button>
                           </div>
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-      </section>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
 
+      {/* Guardrail Rule Modal */}
       <Modal
         open={ruleModalOpen}
-        title={editingRule ? `Edit ${editingRule.name}` : 'Add Guardrail Rule'}
+        title={editingRule ? `Edit Guardrail (${editingRule.name})` : 'Add Guardrail Rule'}
         onClose={() => setRuleModalOpen(false)}
+        error={ruleModalError}
       >
-        <form onSubmit={handleSaveRule} style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-          <div className="hl-form-grid">
-            <label className="hl-field">
-              <span className="hl-label">Rule ID</span>
+        <form
+          onSubmit={handleSaveRule}
+          style={{ display: 'flex', flexDirection: 'column', gap: 14 }}
+        >
+          {editingRule?.builtin && (
+            <div className="ap-alert ap-alert--info">
+              <AlertIcon style={{ flexShrink: 0, marginTop: 1 }} />
+              <span>
+                Built-in detector presets keep Name, Category, and Regex read-only. You can customize Action and Enabled state below.
+              </span>
+            </div>
+          )}
+
+          <div className="ap-form-grid">
+            <label className="ap-field">
+              <span className="ap-label">Rule ID</span>
               <input
-                className="hl-input hl-mono"
+                className="ap-input ap-mono"
                 disabled={Boolean(editingRule)}
                 value={ruleId}
                 onChange={(e) => setRuleId(e.target.value)}
                 placeholder="Auto-generated if blank"
               />
             </label>
-            <label className="hl-field">
-              <span className="hl-label">Display Name</span>
+            <label className="ap-field">
+              <span className="ap-label">Display Name</span>
               <input
-                className="hl-input"
-                required
+                className="ap-input"
+                required={!editingRule?.builtin}
                 disabled={Boolean(editingRule?.builtin)}
                 value={ruleName}
                 onChange={(e) => setRuleName(e.target.value)}
-                placeholder="Internal Token"
+                placeholder="Internal Deploy Token"
               />
             </label>
           </div>
 
-          <div className="hl-form-grid">
-            <label className="hl-field">
-              <span className="hl-label">Category</span>
+          <div className="ap-form-grid">
+            <label className="ap-field">
+              <span className="ap-label">Category</span>
               <select
-                className="hl-select"
+                className="ap-select"
                 disabled={Boolean(editingRule?.builtin)}
                 value={ruleCategory}
                 onChange={(e) => setRuleCategory(e.target.value)}
@@ -712,25 +995,25 @@ export function SecurityView({ focus }: SecurityViewProps) {
                 <option value="custom">custom</option>
               </select>
             </label>
-            <label className="hl-field">
-              <span className="hl-label">Action</span>
+            <label className="ap-field">
+              <span className="ap-label">Action on Match</span>
               <select
-                className="hl-select"
+                className="ap-select"
                 value={ruleAction}
                 onChange={(e) => setRuleAction(e.target.value)}
               >
-                <option value="redact">redact</option>
-                <option value="block">block</option>
-                <option value="log_only">log_only</option>
+                <option value="redact">redact (mask matched value)</option>
+                <option value="block">block (HTTP 400 reject)</option>
+                <option value="log_only">log_only (audit without modifying)</option>
               </select>
             </label>
           </div>
 
-          <label className="hl-field">
-            <span className="hl-label">Regular Expression</span>
+          <label className="ap-field">
+            <span className="ap-label">Go Regular Expression (RE2)</span>
             <input
-              className="hl-input hl-mono"
-              required
+              className="ap-input ap-mono"
+              required={!editingRule?.builtin}
               disabled={Boolean(editingRule?.builtin)}
               value={rulePattern}
               onChange={(e) => setRulePattern(e.target.value)}
@@ -739,7 +1022,7 @@ export function SecurityView({ focus }: SecurityViewProps) {
           </label>
 
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <span className="hl-label">Enabled</span>
+            <span className="ap-label">Enabled</span>
             <Toggle
               checked={ruleEnabled}
               onChange={setRuleEnabled}
@@ -747,46 +1030,52 @@ export function SecurityView({ focus }: SecurityViewProps) {
             />
           </div>
 
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, paddingTop: 8 }}>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, paddingTop: 6 }}>
             <button
               type="button"
-              className="hl-btn"
+              className="ap-btn"
               onClick={() => setRuleModalOpen(false)}
             >
               Cancel
             </button>
             <button
               type="submit"
-              className="hl-btn hl-btn-primary"
+              className="ap-btn ap-btn-primary"
               disabled={savingRule}
             >
-              {savingRule ? 'Saving' : 'Save Rule'}
+              {savingRule ? 'Saving...' : 'Save Rule'}
             </button>
           </div>
         </form>
       </Modal>
 
+      {/* Webhook Modal */}
       <Modal
         open={whModalOpen}
-        title={editingWebhook ? `Edit ${editingWebhook.name}` : 'Add Webhook'}
+        title={editingWebhook ? `Edit Webhook (${editingWebhook.name})` : 'Add Webhook'}
         onClose={() => setWhModalOpen(false)}
+        maxWidth={600}
+        error={whModalError}
       >
-        <form onSubmit={handleSaveWebhook} style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-          <div className="hl-form-grid">
-            <label className="hl-field">
-              <span className="hl-label">Webhook ID</span>
+        <form
+          onSubmit={handleSaveWebhook}
+          style={{ display: 'flex', flexDirection: 'column', gap: 14 }}
+        >
+          <div className="ap-form-grid">
+            <label className="ap-field">
+              <span className="ap-label">Webhook ID</span>
               <input
-                className="hl-input hl-mono"
+                className="ap-input ap-mono"
                 disabled={Boolean(editingWebhook)}
                 value={whId}
                 onChange={(e) => setWhId(e.target.value)}
                 placeholder="Auto-generated if blank"
               />
             </label>
-            <label className="hl-field">
-              <span className="hl-label">Name</span>
+            <label className="ap-field">
+              <span className="ap-label">Display Name</span>
               <input
-                className="hl-input"
+                className="ap-input"
                 required
                 value={whName}
                 onChange={(e) => setWhName(e.target.value)}
@@ -795,47 +1084,46 @@ export function SecurityView({ focus }: SecurityViewProps) {
             </label>
           </div>
 
-          <div className="hl-form-grid">
-            <label className="hl-field">
-              <span className="hl-label">Mode</span>
+          <div className="ap-form-grid">
+            <label className="ap-field">
+              <span className="ap-label">Mode</span>
               <select
-                className="hl-select"
+                className="ap-select"
                 value={whType}
                 onChange={(e) => setWhType(e.target.value)}
               >
-                <option value="async_event">async_event</option>
-                <option value="sync_review">sync_review</option>
+                <option value="async_event">async_event (non-blocking notifications)</option>
+                <option value="sync_review">sync_review (pre-request allow/block)</option>
               </select>
             </label>
-            <label className="hl-field">
-              <span className="hl-label">Timeout (ms)</span>
+            <label className="ap-field">
+              <span className="ap-label">Timeout (ms)</span>
               <input
                 type="number"
                 min={100}
-                className="hl-input"
+                className="ap-input ap-tabular"
                 value={whTimeout}
                 onChange={(e) => setWhTimeout(e.target.value)}
               />
             </label>
           </div>
 
-          <label className="hl-field">
-            <span className="hl-label">Target URL</span>
+          <label className="ap-field">
+            <span className="ap-label">Target Endpoint URL</span>
             <input
-              type="url"
-              className="hl-input hl-mono"
+              className="ap-input ap-mono"
               required
               value={whUrl}
               onChange={(e) => setWhUrl(e.target.value)}
-              placeholder="https://hooks.internal/headlamp"
+              placeholder="https://secops.internal/hooks/headlamp"
             />
           </label>
 
-          <label className="hl-field">
-            <span className="hl-label">HMAC Secret</span>
+          <label className="ap-field">
+            <span className="ap-label">HMAC-SHA256 Signing Secret (optional)</span>
             <input
               type="password"
-              className="hl-input hl-mono"
+              className="ap-input ap-mono"
               value={whSecret}
               onChange={(e) => {
                 setWhSecret(e.target.value);
@@ -843,15 +1131,15 @@ export function SecurityView({ focus }: SecurityViewProps) {
               }}
               placeholder={
                 editingWebhook?.has_secret
-                  ? 'Leave blank to keep stored secret'
-                  : 'Optional signing key'
+                  ? 'Signed — leave blank to keep current secret'
+                  : 'whsec_...'
               }
             />
           </label>
 
           {editingWebhook?.has_secret && (
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <span className="hl-label">Clear stored HMAC secret</span>
+              <span className="ap-label">Clear stored HMAC secret</span>
               <Toggle
                 checked={whClearSecret}
                 onChange={setWhClearSecret}
@@ -860,18 +1148,19 @@ export function SecurityView({ focus }: SecurityViewProps) {
             </div>
           )}
 
-          {whType === 'async_event' && (
-            <div className="hl-field">
-              <span className="hl-label">Events</span>
+          {whType === 'async_event' ? (
+            <div className="ap-field">
+              <span className="ap-label">Subscribed Events</span>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
                 {WEBHOOK_EVENTS.map((evt) => {
-                  const active = whEvents.includes(evt);
+                  const selected = whEvents.includes(evt);
                   return (
                     <button
                       key={evt}
                       type="button"
-                      className={active ? 'hl-btn hl-btn-primary' : 'hl-btn'}
-                      style={{ height: 32, padding: '0 12px' }}
+                      className={`ap-btn ap-btn-sm ap-mono ${
+                        selected ? 'ap-btn-primary' : ''
+                      }`}
                       onClick={() => toggleWebhookEvent(evt)}
                     >
                       {evt}
@@ -880,19 +1169,22 @@ export function SecurityView({ focus }: SecurityViewProps) {
                 })}
               </div>
             </div>
+          ) : (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div>
+                <div className="ap-label">Fail Open on Webhook Timeout / Error</div>
+                <div className="ap-hint">Allow requests through when the review service is unreachable.</div>
+              </div>
+              <Toggle
+                checked={whFailOpen}
+                onChange={setWhFailOpen}
+                label="Fail Open"
+              />
+            </div>
           )}
 
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <span className="hl-label">Fail Open on Upstream Timeout</span>
-            <Toggle
-              checked={whFailOpen}
-              onChange={setWhFailOpen}
-              label="Fail Open"
-            />
-          </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <span className="hl-label">Enabled</span>
+            <span className="ap-label">Enabled</span>
             <Toggle
               checked={whEnabled}
               onChange={setWhEnabled}
@@ -900,24 +1192,24 @@ export function SecurityView({ focus }: SecurityViewProps) {
             />
           </div>
 
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, paddingTop: 8 }}>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, paddingTop: 6 }}>
             <button
               type="button"
-              className="hl-btn"
+              className="ap-btn"
               onClick={() => setWhModalOpen(false)}
             >
               Cancel
             </button>
             <button
               type="submit"
-              className="hl-btn hl-btn-primary"
+              className="ap-btn ap-btn-primary"
               disabled={savingWebhook}
             >
-              {savingWebhook ? 'Saving' : 'Save Webhook'}
+              {savingWebhook ? 'Saving...' : 'Save Webhook'}
             </button>
           </div>
         </form>
       </Modal>
-    </>
+    </div>
   );
 }
