@@ -6,10 +6,23 @@ import type {
   AuditSettings,
   BudgetItem,
   BudgetUpsertPayload,
+  ChatMCPServerOption,
+  ChatMessage,
+  ChatModelOption,
+  ChatSendMessagePayload,
+  ChatSession,
+  ChatSessionCreatePayload,
+  ChatSessionDetailResponse,
+  ChatSessionUpdatePayload,
   GrantsGuideResponse,
   GuardrailRule,
   GuardrailTestResponse,
   GuardrailUpsertPayload,
+  MCPAuditFilter,
+  MCPAuditLog,
+  MCPServerItem,
+  MCPServerTestResult,
+  MCPServerUpsertPayload,
   MeResponse,
   MeUsageResponse,
   ModelRouteItem,
@@ -23,6 +36,28 @@ import type {
   WebhookTestResult,
   WebhookUpsertPayload,
 } from '../types/api';
+import { consumeSSEStream } from '../lib/sse';
+
+export interface ChatStreamCallbacks {
+  onMessageStart?: (data: { user_message: ChatMessage; session: ChatSession }) => void;
+  onDelta?: (data: { text: string }) => void;
+  onToolStart?: (data: {
+    id: string;
+    server: string;
+    tool: string;
+    arguments?: unknown;
+  }) => void;
+  onToolResult?: (data: {
+    id: string;
+    server: string;
+    tool: string;
+    result: string;
+    is_error: boolean;
+    duration_ms: number;
+  }) => void;
+  onMessageDone?: (data: { assistant_message: ChatMessage }) => void;
+  onError?: (data: { type?: string; message: string }) => void;
+}
 
 export class ApiError extends Error {
   readonly status: number;
@@ -338,5 +373,228 @@ export const api = {
       `/api/v1/admin/webhooks/${encodeURIComponent(id)}/test`,
       { method: 'POST' },
     );
+  },
+
+  /* ==================== M3: TEAM CHAT ==================== */
+
+  async listChatModels(opts?: RequestOptions): Promise<ChatModelOption[]> {
+    const res = await requestJson<{ models?: ChatModelOption[] | null }>(
+      '/api/v1/chat/models',
+      { signal: opts?.signal },
+    );
+    return res.models ?? [];
+  },
+
+  async listChatMCPServers(opts?: RequestOptions): Promise<ChatMCPServerOption[]> {
+    const res = await requestJson<{ servers?: ChatMCPServerOption[] | null }>(
+      '/api/v1/chat/mcp-servers',
+      { signal: opts?.signal },
+    );
+    return res.servers ?? [];
+  },
+
+  async listChatSessions(
+    limit = 50,
+    opts?: RequestOptions,
+  ): Promise<ChatSession[]> {
+    const params = new URLSearchParams({ limit: String(limit) });
+    const res = await requestJson<{ sessions?: ChatSession[] | null }>(
+      `/api/v1/chat/sessions?${params.toString()}`,
+      { signal: opts?.signal },
+    );
+    return res.sessions ?? [];
+  },
+
+  createChatSession(payload: ChatSessionCreatePayload): Promise<ChatSession> {
+    return requestJson<ChatSession>('/api/v1/chat/sessions', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  getChatSession(
+    id: string,
+    opts?: RequestOptions,
+  ): Promise<ChatSessionDetailResponse> {
+    return requestJson<ChatSessionDetailResponse>(
+      `/api/v1/chat/sessions/${encodeURIComponent(id)}`,
+      { signal: opts?.signal },
+    );
+  },
+
+  updateChatSession(
+    id: string,
+    payload: ChatSessionUpdatePayload,
+  ): Promise<ChatSession> {
+    return requestJson<ChatSession>(
+      `/api/v1/chat/sessions/${encodeURIComponent(id)}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify(payload),
+      },
+    );
+  },
+
+  deleteChatSession(id: string): Promise<void> {
+    return requestJson<void>(`/api/v1/chat/sessions/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    });
+  },
+
+  async streamChatMessage(
+    sessionId: string,
+    payload: ChatSendMessagePayload,
+    callbacks: ChatStreamCallbacks,
+    opts?: RequestOptions,
+  ): Promise<void> {
+    const response = await fetch(
+      `/api/v1/chat/sessions/${encodeURIComponent(sessionId)}/messages`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+        },
+        body: JSON.stringify(payload),
+        credentials: 'same-origin',
+        signal: opts?.signal,
+      },
+    );
+
+    if (!response.ok) {
+      let message = `HTTP ${response.status}`;
+      try {
+        const data = await response.json();
+        if (typeof data?.error === 'string' && data.error) {
+          message = data.error;
+        } else if (
+          typeof data?.error?.message === 'string' &&
+          data.error.message
+        ) {
+          message = data.error.message;
+        } else if (typeof data?.message === 'string' && data.message) {
+          message = data.message;
+        }
+      } catch {
+        // Fall back to HTTP status string when error body is not JSON.
+      }
+      throw new ApiError(response.status, message);
+    }
+
+    if (!response.body) {
+      throw new Error('Streaming response body unavailable');
+    }
+
+    await consumeSSEStream(response.body, (frame) => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(frame.data);
+      } catch {
+        return;
+      }
+
+      switch (frame.event) {
+        case 'message_start':
+          callbacks.onMessageStart?.(
+            parsed as { user_message: ChatMessage; session: ChatSession },
+          );
+          break;
+        case 'delta':
+          callbacks.onDelta?.(parsed as { text: string });
+          break;
+        case 'tool_start':
+          callbacks.onToolStart?.(
+            parsed as {
+              id: string;
+              server: string;
+              tool: string;
+              arguments?: unknown;
+            },
+          );
+          break;
+        case 'tool_result':
+          callbacks.onToolResult?.(
+            parsed as {
+              id: string;
+              server: string;
+              tool: string;
+              result: string;
+              is_error: boolean;
+              duration_ms: number;
+            },
+          );
+          break;
+        case 'message_done':
+          callbacks.onMessageDone?.(
+            parsed as { assistant_message: ChatMessage },
+          );
+          break;
+        case 'error':
+          callbacks.onError?.(parsed as { type?: string; message: string });
+          break;
+      }
+    });
+  },
+
+  /* ==================== M3: ADMIN MCP GATEWAY ==================== */
+
+  async listAdminMCPServers(opts?: RequestOptions): Promise<MCPServerItem[]> {
+    const res = await requestJson<{ servers?: MCPServerItem[] | null }>(
+      '/api/v1/admin/mcp/servers',
+      { signal: opts?.signal },
+    );
+    return res.servers ?? [];
+  },
+
+  createAdminMCPServer(payload: MCPServerUpsertPayload): Promise<MCPServerItem> {
+    return requestJson<MCPServerItem>('/api/v1/admin/mcp/servers', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  updateAdminMCPServer(
+    name: string,
+    payload: MCPServerUpsertPayload,
+  ): Promise<MCPServerItem> {
+    return requestJson<MCPServerItem>(
+      `/api/v1/admin/mcp/servers/${encodeURIComponent(name)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      },
+    );
+  },
+
+  deleteAdminMCPServer(name: string): Promise<void> {
+    return requestJson<void>(
+      `/api/v1/admin/mcp/servers/${encodeURIComponent(name)}`,
+      { method: 'DELETE' },
+    );
+  },
+
+  testAdminMCPServer(name: string): Promise<MCPServerTestResult> {
+    return requestJson<MCPServerTestResult>(
+      `/api/v1/admin/mcp/servers/${encodeURIComponent(name)}/test`,
+      { method: 'POST' },
+    );
+  },
+
+  async listAdminMCPLogs(
+    filter: MCPAuditFilter,
+    opts?: RequestOptions,
+  ): Promise<MCPAuditLog[]> {
+    const params = new URLSearchParams();
+    if (filter.server) params.set('server', filter.server);
+    if (filter.subject) params.set('subject', filter.subject);
+    if (filter.tool) params.set('tool', filter.tool);
+    if (filter.status) params.set('status', filter.status);
+    params.set('limit', String(filter.limit ?? 50));
+    params.set('offset', String(filter.offset ?? 0));
+    const res = await requestJson<{ logs?: MCPAuditLog[] | null }>(
+      `/api/v1/admin/mcp/logs?${params.toString()}`,
+      { signal: opts?.signal },
+    );
+    return res.logs ?? [];
   },
 };

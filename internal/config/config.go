@@ -51,19 +51,28 @@ const (
 	WebhookEventGuardrailTriggered = "guardrail.triggered"
 	WebhookEventUpstreamFallback   = "upstream.fallback"
 	WebhookEventUpstreamError      = "upstream.error"
+
+	MCPTransportStreamableHTTP = "streamable_http"
+	MCPTransportSSE            = "sse"
+
+	MCPAuthNone   = "none"
+	MCPAuthBearer = "bearer"
+	MCPAuthHeader = "header"
+	MCPAuthBasic  = "basic"
 )
 
 // Config holds the full Headlamp gateway configuration.
 // Authorization is driven purely by Tailnet/Headscale grants (or synthesized grants for static API tokens and dev mode).
 type Config struct {
-	Server     ServerConfig     `yaml:"server"`
-	Storage    StorageConfig    `yaml:"storage"`
-	Providers  []ProviderConfig `yaml:"providers"`
-	Routes     []RouteConfig    `yaml:"routes"`
-	Budgets    []BudgetConfig   `yaml:"budgets"`
-	Guardrails GuardrailsConfig `yaml:"guardrails"`
-	Webhooks   []WebhookConfig  `yaml:"webhooks"`
-	Audit      AuditConfig      `yaml:"audit"`
+	Server     ServerConfig      `yaml:"server"`
+	Storage    StorageConfig     `yaml:"storage"`
+	Providers  []ProviderConfig  `yaml:"providers"`
+	Routes     []RouteConfig     `yaml:"routes"`
+	Budgets    []BudgetConfig    `yaml:"budgets"`
+	Guardrails GuardrailsConfig  `yaml:"guardrails"`
+	Webhooks   []WebhookConfig   `yaml:"webhooks"`
+	MCPServers []MCPServerConfig `yaml:"mcp_servers"`
+	Audit      AuditConfig       `yaml:"audit"`
 
 	// MasterKey is populated exclusively from HEADLAMP_MASTER_KEY (never from YAML).
 	MasterKey string `yaml:"-"`
@@ -252,6 +261,25 @@ func (w WebhookConfig) IsEnabled() bool {
 		return true
 	}
 	return *w.Enabled
+}
+
+// MCPServerConfig defines an upstream remote MCP server proxied by Headlamp.
+type MCPServerConfig struct {
+	Name       string `yaml:"name"`
+	URL        string `yaml:"url"`
+	Transport  string `yaml:"transport"` // streamable_http | sse
+	AuthType   string `yaml:"auth_type"` // none | bearer | header | basic
+	AuthHeader string `yaml:"auth_header"`
+	AuthToken  string `yaml:"auth_token"`
+	Enabled    *bool  `yaml:"enabled,omitempty"`
+}
+
+// IsEnabled reports whether the MCP server is enabled (defaults to true when omitted in YAML).
+func (m MCPServerConfig) IsEnabled() bool {
+	if m.Enabled == nil {
+		return true
+	}
+	return *m.Enabled
 }
 
 // AuditConfig configures optional request/response body storage and retention.
@@ -494,6 +522,7 @@ func expandBracedEnv(s string, lookupEnv func(string) (string, bool)) string {
 func expandSecrets(cfg *Config, lookupEnv func(string) (string, bool)) {
 	cfg.Server.TSNet.AuthKey = expandBracedEnv(cfg.Server.TSNet.AuthKey, lookupEnv)
 	cfg.Server.TLS.DNSAPIToken = expandBracedEnv(cfg.Server.TLS.DNSAPIToken, lookupEnv)
+	cfg.Storage.DSN = expandBracedEnv(cfg.Storage.DSN, lookupEnv)
 	for i := range cfg.Server.APITokens {
 		cfg.Server.APITokens[i].Token = expandBracedEnv(cfg.Server.APITokens[i].Token, lookupEnv)
 	}
@@ -502,6 +531,9 @@ func expandSecrets(cfg *Config, lookupEnv func(string) (string, bool)) {
 	}
 	for i := range cfg.Webhooks {
 		cfg.Webhooks[i].Secret = expandBracedEnv(cfg.Webhooks[i].Secret, lookupEnv)
+	}
+	for i := range cfg.MCPServers {
+		cfg.MCPServers[i].AuthToken = expandBracedEnv(cfg.MCPServers[i].AuthToken, lookupEnv)
 	}
 }
 
@@ -578,6 +610,19 @@ func applyDerivedDefaults(cfg *Config) {
 		for j := range cfg.Webhooks[i].Events {
 			cfg.Webhooks[i].Events[j] = strings.ToLower(strings.TrimSpace(cfg.Webhooks[i].Events[j]))
 		}
+	}
+	for i := range cfg.MCPServers {
+		cfg.MCPServers[i].Name = strings.TrimSpace(cfg.MCPServers[i].Name)
+		cfg.MCPServers[i].URL = strings.TrimSpace(cfg.MCPServers[i].URL)
+		cfg.MCPServers[i].Transport = strings.ToLower(strings.TrimSpace(cfg.MCPServers[i].Transport))
+		if cfg.MCPServers[i].Transport == "" {
+			cfg.MCPServers[i].Transport = MCPTransportStreamableHTTP
+		}
+		cfg.MCPServers[i].AuthType = strings.ToLower(strings.TrimSpace(cfg.MCPServers[i].AuthType))
+		if cfg.MCPServers[i].AuthType == "" {
+			cfg.MCPServers[i].AuthType = MCPAuthNone
+		}
+		cfg.MCPServers[i].AuthHeader = strings.TrimSpace(cfg.MCPServers[i].AuthHeader)
 	}
 }
 
@@ -841,6 +886,38 @@ func (c *Config) Validate() error {
 			if !IsValidWebhookEvent(ev) {
 				errs = append(errs, fmt.Sprintf("webhooks[%d].events contains unknown event %q", i, ev))
 			}
+		}
+	}
+
+	seenMCPServers := make(map[string]struct{}, len(c.MCPServers))
+	for i, m := range c.MCPServers {
+		if m.Name == "" {
+			errs = append(errs, fmt.Sprintf("mcp_servers[%d].name is required", i))
+		} else {
+			if strings.Contains(m.Name, "/") {
+				errs = append(errs, fmt.Sprintf("mcp_servers[%d].name %q must not contain '/'", i, m.Name))
+			}
+			if _, dup := seenMCPServers[m.Name]; dup {
+				errs = append(errs, fmt.Sprintf("mcp_servers[%d].name %q is duplicated", i, m.Name))
+			}
+			seenMCPServers[m.Name] = struct{}{}
+		}
+		if err := validateHTTPURL(m.URL); err != nil {
+			errs = append(errs, fmt.Sprintf("mcp_servers[%d].url: %v", i, err))
+		}
+		switch m.Transport {
+		case MCPTransportStreamableHTTP, MCPTransportSSE:
+		default:
+			errs = append(errs, fmt.Sprintf("mcp_servers[%d].transport %q must be streamable_http or sse", i, m.Transport))
+		}
+		switch m.AuthType {
+		case MCPAuthNone, MCPAuthBearer, MCPAuthBasic:
+		case MCPAuthHeader:
+			if m.AuthHeader == "" {
+				errs = append(errs, fmt.Sprintf("mcp_servers[%d].auth_header is required when auth_type is header", i))
+			}
+		default:
+			errs = append(errs, fmt.Sprintf("mcp_servers[%d].auth_type %q must be none, bearer, header, or basic", i, m.AuthType))
 		}
 	}
 

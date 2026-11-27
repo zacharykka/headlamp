@@ -104,6 +104,48 @@ type WebhookTester interface {
 	PingWebhook(ctx context.Context, wh store.Webhook) (*WebhookTestResult, error)
 }
 
+// MCPToolInfo describes one discovered tool on an upstream MCP server.
+type MCPToolInfo struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+// MCPTester discovers available tools on a configured remote MCP server.
+type MCPTester interface {
+	DiscoverTools(ctx context.Context, srv store.MCPServer) ([]MCPToolInfo, int64, error)
+}
+
+// ChatModelItem describes a model or virtual route alias selectable in Team Web Chat.
+type ChatModelItem struct {
+	ID           string `json:"id"`
+	Provider     string `json:"provider"`
+	ProviderType string `json:"provider_type"`
+	IsAlias      bool   `json:"is_alias"`
+}
+
+// ChatMCPServerItem describes an enabled MCP server and its caller-authorized tools for Team Web Chat.
+type ChatMCPServerItem struct {
+	Name      string        `json:"name"`
+	Transport string        `json:"transport"`
+	Enabled   bool          `json:"enabled"`
+	Tools     []MCPToolInfo `json:"tools"`
+	Error     string        `json:"error,omitempty"`
+}
+
+// ChatSendMessageRequest is the payload for POST /api/v1/chat/sessions/{id}/messages.
+type ChatSendMessageRequest struct {
+	Content    string   `json:"content"`
+	Model      string   `json:"model,omitempty"`
+	MCPServers []string `json:"mcp_servers,omitempty"`
+}
+
+// ChatHandler serves model/tool discovery and SSE streaming turns for Team Web Chat.
+type ChatHandler interface {
+	ListModels(ctx context.Context, p *auth.Principal) ([]ChatModelItem, error)
+	ListMCPServers(ctx context.Context, p *auth.Principal) ([]ChatMCPServerItem, error)
+	StreamMessage(ctx context.Context, w http.ResponseWriter, p *auth.Principal, sessionID string, req ChatSendMessageRequest) error
+}
+
 // Config configures the Headlamp Admin & User REST API handler and optional embedded SPA.
 type Config struct {
 	Store           store.Store
@@ -113,6 +155,8 @@ type Config struct {
 	BudgetReporter  BudgetReporter
 	GuardrailTester GuardrailTester
 	WebhookTester   WebhookTester
+	MCPTester       MCPTester
+	ChatHandler     ChatHandler
 	StaticFS        fs.FS
 	HTTPClient      *http.Client
 }
@@ -126,6 +170,8 @@ type Handler struct {
 	budgetReporter  BudgetReporter
 	guardrailTester GuardrailTester
 	webhookTester   WebhookTester
+	mcpTester       MCPTester
+	chatHandler     ChatHandler
 	staticFS        fs.FS
 	httpClient      *http.Client
 }
@@ -160,18 +206,20 @@ func NewHandler(cfg Config) (*Handler, error) {
 		budgetReporter:  cfg.BudgetReporter,
 		guardrailTester: cfg.GuardrailTester,
 		webhookTester:   cfg.WebhookTester,
+		mcpTester:       cfg.MCPTester,
+		chatHandler:     cfg.ChatHandler,
 		staticFS:        cfg.StaticFS,
 		httpClient:      client,
 	}, nil
 }
 
-// IsGatewayReservedPath reports whether reqPath belongs to Headlamp's LLM proxy or health/whoami
-// endpoints so the embedded SPA never shadows them.
+// IsGatewayReservedPath reports whether reqPath belongs to Headlamp's LLM proxy, MCP gateway,
+// or health/whoami endpoints so the embedded SPA never shadows them.
 func IsGatewayReservedPath(reqPath string) bool {
 	if reqPath == "/healthz" || reqPath == "/whoami" {
 		return true
 	}
-	for _, prefix := range []string{"/v1", "/openai", "/anthropic", "/gemini"} {
+	for _, prefix := range []string{"/v1", "/openai", "/anthropic", "/gemini", "/mcp"} {
 		if reqPath == prefix || strings.HasPrefix(reqPath, prefix+"/") {
 			return true
 		}
@@ -234,6 +282,12 @@ func (h *Handler) serveAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleMeUsage(w, r, p)
+		return
+	}
+
+	// Authenticated Team Web Chat endpoints (available to both admins and non-admins).
+	if strings.HasPrefix(pPath, "/api/v1/chat/") || pPath == "/api/v1/chat" {
+		h.serveChat(w, r, p)
 		return
 	}
 
@@ -460,8 +514,116 @@ func (h *Handler) serveAdmin(w http.ResponseWriter, r *http.Request, p *auth.Pri
 			writeMethodNotAllowed(w, http.MethodPut, http.MethodDelete)
 		}
 
+	case sub == "/mcp/servers":
+		switch r.Method {
+		case http.MethodGet:
+			h.handleAdminListMCPServers(w, r)
+		case http.MethodPost:
+			h.handleAdminCreateMCPServer(w, r)
+		default:
+			writeMethodNotAllowed(w, http.MethodGet, http.MethodPost)
+		}
+
+	case strings.HasPrefix(sub, "/mcp/servers/"):
+		rest := strings.TrimPrefix(sub, "/mcp/servers/")
+		if strings.HasSuffix(rest, "/test") {
+			name := strings.TrimSuffix(rest, "/test")
+			if name == "" || strings.Contains(name, "/") {
+				writeError(w, http.StatusNotFound, "not_found", "mcp server name required")
+				return
+			}
+			if r.Method != http.MethodPost {
+				writeMethodNotAllowed(w, http.MethodPost)
+				return
+			}
+			h.handleAdminTestMCPServer(w, r, name)
+			return
+		}
+		if rest == "" || strings.Contains(rest, "/") {
+			writeError(w, http.StatusNotFound, "not_found", "admin endpoint not found")
+			return
+		}
+		switch r.Method {
+		case http.MethodPut:
+			h.handleAdminUpdateMCPServer(w, r, rest)
+		case http.MethodDelete:
+			h.handleAdminDeleteMCPServer(w, r, rest)
+		default:
+			writeMethodNotAllowed(w, http.MethodPut, http.MethodDelete)
+		}
+
+	case sub == "/mcp/logs":
+		if r.Method != http.MethodGet {
+			writeMethodNotAllowed(w, http.MethodGet)
+			return
+		}
+		h.handleAdminMCPAuditLogs(w, r)
+
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "admin endpoint not found")
+	}
+}
+
+func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request, p *auth.Principal) {
+	sub := strings.TrimPrefix(r.URL.Path, "/api/v1/chat")
+
+	switch {
+	case sub == "/models":
+		if r.Method != http.MethodGet {
+			writeMethodNotAllowed(w, http.MethodGet)
+			return
+		}
+		h.handleChatModels(w, r, p)
+
+	case sub == "/mcp-servers":
+		if r.Method != http.MethodGet {
+			writeMethodNotAllowed(w, http.MethodGet)
+			return
+		}
+		h.handleChatMCPServers(w, r, p)
+
+	case sub == "/sessions":
+		switch r.Method {
+		case http.MethodGet:
+			h.handleChatListSessions(w, r, p)
+		case http.MethodPost:
+			h.handleChatCreateSession(w, r, p)
+		default:
+			writeMethodNotAllowed(w, http.MethodGet, http.MethodPost)
+		}
+
+	case strings.HasPrefix(sub, "/sessions/"):
+		rest := strings.TrimPrefix(sub, "/sessions/")
+		if strings.HasSuffix(rest, "/messages") {
+			id := strings.TrimSuffix(rest, "/messages")
+			if id == "" || strings.Contains(id, "/") {
+				writeError(w, http.StatusNotFound, "not_found", "chat session id required")
+				return
+			}
+			if r.Method != http.MethodPost {
+				writeMethodNotAllowed(w, http.MethodPost)
+				return
+			}
+			h.handleChatSendMessage(w, r, p, id)
+			return
+		}
+		if rest == "" || strings.Contains(rest, "/") {
+			writeError(w, http.StatusNotFound, "not_found", "chat endpoint not found")
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			h.handleChatGetSession(w, r, p, rest)
+		case http.MethodPatch:
+			h.handleChatUpdateSession(w, r, p, rest)
+		case http.MethodDelete:
+			h.handleChatDeleteSession(w, r, p, rest)
+		default:
+			writeMethodNotAllowed(w, http.MethodGet, http.MethodPatch, http.MethodDelete)
+		}
+
+	default:
+		writeError(w, http.StatusNotFound, "not_found", "chat endpoint not found")
 	}
 }
 

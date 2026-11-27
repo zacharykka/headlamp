@@ -4,14 +4,16 @@ Headlamp is a self-hosted, single-binary private AI gateway built in Go that joi
 
 ## Key Capabilities
 
-- **Zero-Key Tailnet Identity & Grants Authorization**: Joins Headscale v0.29+ (or Tailscale) directly via `tsnet`, identifies callers via `WhoIs`, and enforces pure **grants-only** authorization (`headlamp.dev/cap/gateway`, plus `tailscale.com/cap/aperture` on official Tailscale SaaS) with **Explicit Deny Wins**.
-- **Embedded Admin Dashboard & Personal Usage UI**: Ships a single-binary React + TypeScript + Vite SPA (Geist typography & Reicon icons) embedded directly via `go:embed` (`web/dist`), authenticated automatically via Tailnet WhoIs SSO. Admins manage providers, virtual routes, budgets, guardrails, webhooks, usage analytics, audit logs, and grants snippets at `/`; standard users see their personal usage, budgets, and SDK setup snippets.
+- **Zero-Key Tailnet Identity & Grants Authorization**: Joins Headscale v0.29+ (or Tailscale) directly via `tsnet`, identifies callers via `WhoIs`, and enforces pure **grants-only** authorization (`headlamp.dev/cap/gateway`, plus `tailscale.com/cap/aperture` on official Tailscale SaaS) with **Explicit Deny Wins** for both LLM models (`models` / `deny_models`) and MCP tools (`mcp_tools` / `deny_mcp_tools`).
+- **Team Web Chat with MCP Tool Calling**: Built-in browser chat workspace accessible to every authenticated tailnet user (with strict per-user session isolation). Streams responses through Headlamp's own proxy pipeline (full policy, guardrails, quotas, and metering with zero bypass), renders XSS-safe Markdown, and executes authorized remote MCP tool calls mid-conversation.
+- **Remote MCP Proxy Gateway (`/mcp/<server>`)**: Proxies Streamable HTTP and SSE remote MCP servers with server-side encrypted credentials (`bearer`, custom `header`, `basic`), per-caller `tools/list` filtering, `tools/call` policy enforcement and argument guardrail inspection, and a dedicated `mcp_audit_logs` audit trail.
+- **Embedded Admin Dashboard & Personal Usage UI**: Ships a single-binary React + TypeScript + Vite SPA (Geist typography, zero external CDN requests) embedded directly via `go:embed` (`web/dist`), authenticated automatically via Tailnet WhoIs SSO. Admins manage providers, virtual routes, MCP servers, budgets, guardrails, webhooks, usage analytics, audit logs, and grants snippets at `/`; standard users access Team Chat, personal usage, budgets, and SDK/MCP setup snippets.
 - **Multi-Protocol Routing & Accounting**: Supports OpenAI (`/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`), Anthropic (`/anthropic/v1/messages`), Google Gemini (`/gemini/v1beta/...`), and Ollama providers, virtual model alias routing with automatic fallbacks, bidirectional OpenAI <-> Anthropic translation, streaming SSE token/cost usage logs, and opt-in audit payloads with TTL retention purge.
 - **Budgets, Rate Limits & Quotas**: Enforces per-scope (`*`, `tag:<name>`, user subject) RPM, TPM, max concurrency, and UTC daily/monthly USD spend caps (`429` with `Retry-After`) plus configurable soft-alert threshold notifications. Pair `tpm` and `daily_usd`/`monthly_usd` with `max_concurrent` to bound burst overspend while in-flight streaming responses finalize their token and USD totals.
 - **Guardrails & Signed Webhooks**: Built-in zero-latency regex detectors (OpenAI, Anthropic, AWS, GitHub, and GCP secrets, PEM private keys, JWTs, credit cards, emails, and phone numbers) with `log_only`, `redact`, or `block` actions, custom regex rules, synchronous pre-request review webhooks (`sync_review`), and HMAC-SHA256 signed asynchronous event alerts (`guardrail.triggered`, `budget.threshold`, `budget.exceeded`, `upstream.fallback`, `upstream.error`).
 - **Automated ACME DNS-01 HTTPS**: Supports automated TLS certificate issuance and renewal on private Headscale domains via Cloudflare API or custom DNS-01 webhook solvers (`server.tls.mode: acme_dns01`), alongside `static` cert/key and plaintext Tailnet HTTP (`none`).
-- **Encrypted Credential Store & Zero-CGO Storage**: Upstream provider API keys and webhook secrets are encrypted at rest with AES-256-GCM (`HEADLAMP_MASTER_KEY`, or an auto-generated `0600` key file in `state_dir`), stored in pure-Go SQLite (`modernc.org/sqlite`) in WAL mode with embedded SQL migrations.
-- **Local Dev & Static Fallback Tokens**: Supports an optional local HTTP listener with loopback-restricted `dev_mode` and static fallback API tokens (with inline `allow_models` / `deny_models` grant scopes) for non-Tailnet callers such as CI runners.
+- **Encrypted Credential Store & Zero-CGO Storage (SQLite + PostgreSQL)**: Upstream provider API keys, webhook secrets, and MCP auth tokens are encrypted at rest with AES-256-GCM (`HEADLAMP_MASTER_KEY`, or an auto-generated `0600` key file in `state_dir`), backed by either pure-Go SQLite (`modernc.org/sqlite`, WAL mode) or pure-Go PostgreSQL (`pgx/v5`) for multi-replica HA deployments.
+- **Local Dev, Static Fallback Tokens & Release Automation**: Supports an optional local HTTP listener with loopback-restricted `dev_mode` and static fallback API tokens for CI runners, plus GitHub Actions CI, multi-arch `CGO_ENABLED=0` GitHub Releases, and GHCR Docker images.
 
 ## Configuration
 
@@ -63,7 +65,12 @@ export OPENAI_API_KEY="headlamp"
 # Google Gemini CLI / GenAI SDK
 export GEMINI_API_BASE="http://headlamp/gemini"
 export GEMINI_API_KEY="headlamp"
+
+# Claude Code Remote MCP Server
+claude mcp add --transport http headlamp-docs http://headlamp/mcp/docs
 ```
+
+See [`docs/clients.md`](docs/clients.md) for full copy-pasteable setup recipes (Claude Code, Codex CLI, Gemini CLI, Cursor, Python/Node SDKs, Remote MCP Clients, and PostgreSQL HA deployments).
 
 ## Headscale v0.29.7 `grants` Example
 
@@ -113,21 +120,24 @@ npm --prefix web run dev
 
 ```text
 headlamp/
+├── .github/workflows/  # CI (web + Go race tests) and multi-arch binary/GHCR release pipeline
 ├── cmd/headlamp/       # CLI entrypoint (serve, init, usage, version) and runtime wiring
 ├── internal/
-│   ├── api/            # Admin & User REST API (/api/v1/*), RBAC, CSRF, embedded SPA serving
+│   ├── api/            # Admin, User, Chat & MCP REST/SSE API (/api/v1/*), RBAC, CSRF, SPA serving
 │   ├── auth/           # Principal model, context helpers, dev & static token auth
+│   ├── chat/           # Team Web Chat orchestration, streaming SSE & multi-round MCP tool calling
 │   ├── config/         # YAML loader, env overrides, validation
 │   ├── crypto/         # AES-256-GCM encryption and master key management
 │   ├── guardrail/      # Local regex detectors, sync review & signed async webhooks
+│   ├── mcp/            # Remote MCP proxy (/mcp/*), tool filtering, guardrails & discovery client
 │   ├── metering/       # Streaming SSE usage parser, pricing table, async persistence
 │   ├── netts/          # tsnet node lifecycle, Headscale connection, ACME DNS-01 & TLS
 │   ├── policy/         # Pure grants-only policy evaluator (Explicit Deny Wins)
 │   ├── proxy/          # Native-first multi-protocol LLM reverse proxy
 │   ├── quota/          # Per-scope RPM/TPM/concurrency & USD spend budget enforcement
-│   ├── store/          # Store interface, pure-Go SQLite implementation, SQL migrations
+│   ├── store/          # Store interface, pure-Go SQLite & PostgreSQL (pgx/v5) drivers + migrations
 │   └── translate/      # On-demand cross-protocol request & SSE translation
-├── web/                # Embedded React + TypeScript + Vite Admin & User dashboard
+├── web/                # Embedded React + TypeScript + Vite dashboard & Team Web Chat SPA
 ├── deploy/             # Multi-stage static Dockerfile (Node web build + Go binary)
-└── docs/               # Headscale v0.29.7 setup guide and protocol specs
+└── docs/               # Client recipes (docs/clients.md), Headscale v0.29.7 guide & specs
 ```

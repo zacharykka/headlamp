@@ -2,10 +2,14 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/zacharykka/headlamp/internal/config"
+	"github.com/zacharykka/headlamp/internal/crypto"
 )
 
 const (
@@ -213,6 +217,102 @@ type AuditPayload struct {
 	Redacted        bool              `json:"redacted"`
 }
 
+// MCPServer represents an upstream remote MCP server registered in Headlamp.
+// AuthToken is held in plaintext in memory and always stored encrypted at rest.
+type MCPServer struct {
+	Name       string    `json:"name"`
+	URL        string    `json:"url"`
+	Transport  string    `json:"transport"` // streamable_http | sse
+	AuthType   string    `json:"auth_type"` // none | bearer | header | basic
+	AuthHeader string    `json:"auth_header"`
+	AuthToken  string    `json:"-"`
+	Enabled    bool      `json:"enabled"`
+	Source     string    `json:"source"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// MCPAuditLog records a single proxied or chat-triggered MCP tool or method invocation.
+type MCPAuditLog struct {
+	ID               string    `json:"id"`
+	CreatedAt        time.Time `json:"created_at"`
+	RequestID        string    `json:"request_id"`
+	Subject          string    `json:"subject"`
+	DisplayName      string    `json:"display_name"`
+	NodeName         string    `json:"node_name"`
+	NodeIP           string    `json:"node_ip"`
+	Tags             []string  `json:"tags"`
+	AuthSource       string    `json:"auth_source"`
+	ServerName       string    `json:"server_name"`
+	Method           string    `json:"method"`
+	ToolName         string    `json:"tool_name"`
+	Status           string    `json:"status"` // ok | denied | blocked | error
+	LatencyMS        int64     `json:"latency_ms"`
+	ErrorMessage     string    `json:"error_message"`
+	ArgumentsPreview string    `json:"arguments_preview"`
+}
+
+// MCPAuditFilter scopes MCP audit log queries.
+type MCPAuditFilter struct {
+	ServerName string
+	Subject    string
+	ToolName   string
+	Status     string
+	Since      time.Time
+	Until      time.Time
+	Limit      int
+	Offset     int
+}
+
+// ChatToolEvent records one MCP tool invocation performed during an assistant turn.
+type ChatToolEvent struct {
+	ID         string          `json:"id"`
+	Server     string          `json:"server"`
+	Tool       string          `json:"tool"`
+	Arguments  json.RawMessage `json:"arguments"`
+	Result     string          `json:"result"`
+	IsError    bool            `json:"is_error"`
+	DurationMS int64           `json:"duration_ms"`
+}
+
+// ChatSession represents a user-owned conversation in Team Web Chat.
+type ChatSession struct {
+	ID           string    `json:"id"`
+	Subject      string    `json:"subject"`
+	Title        string    `json:"title"`
+	Model        string    `json:"model"`
+	MCPServers   []string  `json:"mcp_servers"`
+	SystemPrompt string    `json:"system_prompt"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// ChatMessage stores a single turn within a ChatSession.
+type ChatMessage struct {
+	ID           string          `json:"id"`
+	SessionID    string          `json:"session_id"`
+	Role         string          `json:"role"` // user | assistant | system | tool
+	Content      string          `json:"content"`
+	ToolEvents   []ChatToolEvent `json:"tool_events"`
+	Model        string          `json:"model"`
+	InputTokens  int64           `json:"input_tokens"`
+	OutputTokens int64           `json:"output_tokens"`
+	CostUSD      float64         `json:"cost_usd"`
+	CreatedAt    time.Time       `json:"created_at"`
+}
+
+// NewStore opens a SQLite or PostgreSQL Store according to storageCfg.Driver.
+func NewStore(ctx context.Context, storageCfg config.StorageConfig, cipher *crypto.Cipher) (Store, error) {
+	switch strings.ToLower(strings.TrimSpace(storageCfg.Driver)) {
+	case "", config.StorageDriverSQLite:
+		return NewSQLiteStore(ctx, storageCfg.DSN, cipher)
+	case config.StorageDriverPostgres:
+		return NewPostgresStore(ctx, storageCfg.DSN, cipher)
+	default:
+		return nil, fmt.Errorf("store: unsupported storage driver %q (expected sqlite or postgres)", storageCfg.Driver)
+	}
+}
+
 // Store defines Headlamp's persistence interface.
 type Store interface {
 	Close() error
@@ -248,6 +348,25 @@ type Store interface {
 	GetWebhook(ctx context.Context, id string) (*Webhook, error)
 	ListWebhooks(ctx context.Context) ([]Webhook, error)
 	DeleteWebhook(ctx context.Context, id string) error
+
+	// MCP servers
+	UpsertMCPServer(ctx context.Context, srv MCPServer) error
+	GetMCPServer(ctx context.Context, name string) (*MCPServer, error)
+	ListMCPServers(ctx context.Context) ([]MCPServer, error)
+	DeleteMCPServer(ctx context.Context, name string) error
+
+	// MCP audit logs
+	InsertMCPAuditLog(ctx context.Context, log MCPAuditLog) error
+	QueryMCPAuditLogs(ctx context.Context, filter MCPAuditFilter) ([]MCPAuditLog, error)
+
+	// Chat sessions & messages (strict per-subject ownership enforcement)
+	CreateChatSession(ctx context.Context, session ChatSession) (*ChatSession, error)
+	GetChatSession(ctx context.Context, subject, id string) (*ChatSession, error)
+	ListChatSessions(ctx context.Context, subject string, limit, offset int) ([]ChatSession, error)
+	UpdateChatSession(ctx context.Context, subject string, session ChatSession) (*ChatSession, error)
+	DeleteChatSession(ctx context.Context, subject, id string) error
+	InsertChatMessage(ctx context.Context, subject string, msg ChatMessage) (*ChatMessage, error)
+	ListChatMessages(ctx context.Context, subject, sessionID string) ([]ChatMessage, error)
 
 	// Runtime settings
 	GetAuditSettings(ctx context.Context) (*AuditSettings, error)

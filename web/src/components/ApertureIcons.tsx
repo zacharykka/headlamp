@@ -323,6 +323,54 @@ export function SidebarToggleIcon({ size = 16, ...props }: SvgIconProps) {
   );
 }
 
+export function ChatBubbleIcon({ size = 16, ...props }: SvgIconProps) {
+  return (
+    <svg {...baseProps(size, props)}>
+      <path d="M3.2 10c0-3.5 3-6.2 6.8-6.2s6.8 2.7 6.8 6.2-3 6.2-6.8 6.2c-1.1 0-2.2-.2-3.1-.7L3.4 16.5l.9-3.1C3.6 12.4 3.2 11.2 3.2 10Z" />
+    </svg>
+  );
+}
+
+export function PlugIcon({ size = 16, ...props }: SvgIconProps) {
+  return (
+    <svg {...baseProps(size, props)}>
+      <path d="M7.2 3.2v3.6M12.8 3.2v3.6M5.2 6.8h9.6v2.6a4.8 4.8 0 0 1-9.6 0V6.8ZM10 14.2v3" />
+    </svg>
+  );
+}
+
+export function WrenchIcon({ size = 15, ...props }: SvgIconProps) {
+  return (
+    <svg {...baseProps(size, props)}>
+      <path d="M12.3 3.4a3.8 3.8 0 0 0-3.4 5.4l-5.2 5.2a1.4 1.4 0 0 0 2 2l5.2-5.2a3.8 3.8 0 0 0 5.4-3.4l-2.3 2.3-1.9-.5-.5-1.9 2.3-2.3a3.8 3.8 0 0 0-1.6-.6Z" />
+    </svg>
+  );
+}
+
+export function ArrowUpIcon({ size = 15, ...props }: SvgIconProps) {
+  return (
+    <svg {...baseProps(size, props)}>
+      <path d="M10 15.8V4.4M5.4 8.8 10 4.2l4.6 4.6" />
+    </svg>
+  );
+}
+
+export function StopSquareIcon({ size = 13, ...props }: SvgIconProps) {
+  return (
+    <svg {...baseProps(size, props)}>
+      <rect x="4.5" y="4.5" width="11" height="11" rx="2" fill="currentColor" />
+    </svg>
+  );
+}
+
+export function SlidersIcon({ size = 15, ...props }: SvgIconProps) {
+  return (
+    <svg {...baseProps(size, props)}>
+      <path d="M3.2 6h8M14 6h2.8M12.6 4.2v3.6M3.2 14h3.6M9.6 14h7.2M8.2 12.2v3.6" />
+    </svg>
+  );
+}
+
 export function resolveProviderFamily(
   typeOrName: string,
 ): 'anthropic' | 'openai' | 'gemini' | 'ollama' | 'other' {

@@ -386,6 +386,66 @@ server:
 `,
 			wantSub: "typo_field",
 		},
+		{
+			name: "mcp server slash in name",
+			yaml: `
+mcp_servers:
+  - name: team/docs
+    url: https://mcp.example.com/mcp
+`,
+			wantSub: "must not contain '/'",
+		},
+		{
+			name: "mcp server duplicate name",
+			yaml: `
+mcp_servers:
+  - name: docs
+    url: https://mcp1.example.com/mcp
+  - name: docs
+    url: https://mcp2.example.com/mcp
+`,
+			wantSub: "duplicated",
+		},
+		{
+			name: "mcp server invalid transport",
+			yaml: `
+mcp_servers:
+  - name: docs
+    url: https://mcp.example.com/mcp
+    transport: stdio
+`,
+			wantSub: "streamable_http or sse",
+		},
+		{
+			name: "mcp server invalid auth_type",
+			yaml: `
+mcp_servers:
+  - name: docs
+    url: https://mcp.example.com/mcp
+    auth_type: oauth2
+`,
+			wantSub: "none, bearer, header, or basic",
+		},
+		{
+			name: "mcp server header auth requires auth_header",
+			yaml: `
+mcp_servers:
+  - name: docs
+    url: https://mcp.example.com/mcp
+    auth_type: header
+    auth_token: secret
+`,
+			wantSub: "auth_header is required",
+		},
+		{
+			name: "mcp server invalid url",
+			yaml: `
+mcp_servers:
+  - name: docs
+    url: ftp://mcp.example.com/mcp
+`,
+			wantSub: "http or https",
+		},
 	}
 
 	for _, tc := range tests {
@@ -414,5 +474,43 @@ server:
 	}
 	if cfg.Server.TSNet.ListenPort != 443 {
 		t.Fatalf("listen_port = %d, want 443 when TLS is enabled", cfg.Server.TSNet.ListenPort)
+	}
+}
+
+func TestMCPServersConfigDefaultsAndExpansion(t *testing.T) {
+	t.Setenv("TEST_MCP_TOKEN", "mcp-secret-999")
+	t.Setenv("TEST_PG_PASS", "pg-secret-42")
+
+	cfg, err := LoadFromBytes([]byte(`
+storage:
+  driver: postgres
+  dsn: "postgres://headlamp:${TEST_PG_PASS}@127.0.0.1:5432/headlamp?sslmode=disable"
+mcp_servers:
+  - name: docs
+    url: "https://mcp-docs.internal/mcp"
+  - name: github
+    url: "https://mcp-github.internal/sse"
+    transport: sse
+    auth_type: header
+    auth_header: "X-API-Key"
+    auth_token: "${TEST_MCP_TOKEN}"
+    enabled: false
+`))
+	if err != nil {
+		t.Fatalf("LoadFromBytes: %v", err)
+	}
+	if cfg.Storage.Driver != StorageDriverPostgres || cfg.Storage.DSN != "postgres://headlamp:pg-secret-42@127.0.0.1:5432/headlamp?sslmode=disable" {
+		t.Fatalf("unexpected storage config: %+v", cfg.Storage)
+	}
+	if len(cfg.MCPServers) != 2 {
+		t.Fatalf("len(MCPServers) = %d, want 2", len(cfg.MCPServers))
+	}
+	docs := cfg.MCPServers[0]
+	if docs.Transport != MCPTransportStreamableHTTP || docs.AuthType != MCPAuthNone || !docs.IsEnabled() {
+		t.Fatalf("unexpected docs defaults: %+v", docs)
+	}
+	gh := cfg.MCPServers[1]
+	if gh.Transport != MCPTransportSSE || gh.AuthType != MCPAuthHeader || gh.AuthHeader != "X-API-Key" || gh.AuthToken != "mcp-secret-999" || gh.IsEnabled() {
+		t.Fatalf("unexpected github mcp server: %+v", gh)
 	}
 }

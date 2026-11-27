@@ -20,9 +20,11 @@ import (
 	"time"
 
 	"github.com/zacharykka/headlamp/internal/api"
+	"github.com/zacharykka/headlamp/internal/chat"
 	"github.com/zacharykka/headlamp/internal/config"
 	"github.com/zacharykka/headlamp/internal/crypto"
 	"github.com/zacharykka/headlamp/internal/guardrail"
+	"github.com/zacharykka/headlamp/internal/mcp"
 	"github.com/zacharykka/headlamp/internal/metering"
 	"github.com/zacharykka/headlamp/internal/netts"
 	"github.com/zacharykka/headlamp/internal/policy"
@@ -307,8 +309,8 @@ audit:
 	}
 
 	// P0-2 listener isolation: separate tailnetHandler (TSNet ONLY) vs localHandler (tokens + dev_mock).
-	tailnetHandler := buildHandler(gw, nil, eval, netts.NewTSNetAuthenticator(whoIs))
-	localHandler := buildHandler(gw, nil, eval, buildLocalAuthChain(cfg.Server))
+	tailnetHandler := buildHandler(gw, nil, nil, eval, netts.NewTSNetAuthenticator(whoIs))
+	localHandler := buildHandler(gw, nil, nil, eval, buildLocalAuthChain(cfg.Server))
 
 	doReq := func(h http.Handler, remoteAddr, method, target, body string, headers map[string]string) *httptest.ResponseRecorder {
 		t.Helper()
@@ -803,7 +805,7 @@ audit:
 		},
 	}
 
-	handler := buildHandler(gw, apiHandler, eval, netts.NewTSNetAuthenticator(whoIs))
+	handler := buildHandler(gw, nil, apiHandler, eval, netts.NewTSNetAuthenticator(whoIs))
 
 	doReq := func(remoteAddr, method, target, body string, headers map[string]string) *httptest.ResponseRecorder {
 		t.Helper()
@@ -1084,5 +1086,411 @@ func TestResolveStartupTimeout(t *testing.T) {
 	t.Setenv("HEADLAMP_STARTUP_TIMEOUT", "not-a-duration")
 	if _, err := resolveStartupTimeout(&config.Config{}); err == nil {
 		t.Fatal("expected error for malformed HEADLAMP_STARTUP_TIMEOUT")
+	}
+}
+
+func TestM3FullStackMCPAndChat(t *testing.T) {
+	// 1. Mock Streamable HTTP MCP server ("docs") exposing "search" and "delete".
+	var (
+		mcpMu         sync.Mutex
+		gotMCPAuth    string
+		gotMCPCalls   []string
+		gotSearchArgs string
+	)
+	mcpUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var rpc struct {
+			JSONRPC string          `json:"jsonrpc"`
+			ID      json.RawMessage `json:"id"`
+			Method  string          `json:"method"`
+			Params  json.RawMessage `json:"params"`
+		}
+		_ = json.Unmarshal(body, &rpc)
+
+		mcpMu.Lock()
+		gotMCPAuth = r.Header.Get("Authorization")
+		mcpMu.Unlock()
+
+		w.Header().Set("Mcp-Session-Id", "mcp-sess-docs-1")
+		switch rpc.Method {
+		case "initialize":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":`+string(rpc.ID)+`,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"docs-mock","version":"1.0"}}}`)
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":`+string(rpc.ID)+`,"result":{"tools":[{"name":"search","description":"Search internal docs","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},{"name":"delete","description":"Delete docs","inputSchema":{"type":"object","properties":{"id":{"type":"string"}}}}]}}`)
+		case "tools/call":
+			var params struct {
+				Name      string          `json:"name"`
+				Arguments json.RawMessage `json:"arguments"`
+			}
+			_ = json.Unmarshal(rpc.Params, &params)
+			mcpMu.Lock()
+			gotMCPCalls = append(gotMCPCalls, params.Name)
+			if params.Name == "search" {
+				gotSearchArgs = string(params.Arguments)
+			}
+			mcpMu.Unlock()
+
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":`+string(rpc.ID)+`,"result":{"content":[{"type":"text","text":"Use headlamp.dev/cap/gateway on Headscale v0.29.7."}],"isError":false}}`)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer mcpUpstream.Close()
+
+	// 2. Mock OpenAI upstream: Turn 1 requests the attached MCP tool; Turn 2 streams final answer.
+	openAIUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content any    `json:"content"`
+			} `json:"messages"`
+			Tools []struct {
+				Function struct {
+					Name string `json:"name"`
+				} `json:"function"`
+			} `json:"tools"`
+		}
+		_ = json.Unmarshal(body, &req)
+
+		hasToolResult := false
+		for _, m := range req.Messages {
+			if m.Role == "tool" {
+				hasToolResult = true
+				break
+			}
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+
+		if !hasToolResult && len(req.Tools) > 0 {
+			toolFnName := req.Tools[0].Function.Name
+			chunks := []string{
+				fmt.Sprintf(`data: {"id":"chatcmpl-t1","object":"chat.completion.chunk","model":"gpt-5","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_docs_1","type":"function","function":{"name":%q,"arguments":"{\"query\":\"headscale grants\"}"}}]},"finish_reason":null}]}`, toolFnName) + "\n\n",
+				`data: {"id":"chatcmpl-t1","object":"chat.completion.chunk","model":"gpt-5","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n",
+				`data: {"id":"chatcmpl-t1","object":"chat.completion.chunk","model":"gpt-5","choices":[],"usage":{"prompt_tokens":300,"completion_tokens":40,"total_tokens":340}}` + "\n\n",
+				"data: [DONE]\n\n",
+			}
+			for _, ch := range chunks {
+				_, _ = io.WriteString(w, ch)
+				flusher.Flush()
+			}
+			return
+		}
+
+		chunks := []string{
+			`data: {"id":"chatcmpl-t2","object":"chat.completion.chunk","model":"gpt-5","choices":[{"index":0,"delta":{"role":"assistant","content":"According to docs: "},"finish_reason":null}]}` + "\n\n",
+			`data: {"id":"chatcmpl-t2","object":"chat.completion.chunk","model":"gpt-5","choices":[{"index":0,"delta":{"content":"use headlamp.dev/cap/gateway."},"finish_reason":null}]}` + "\n\n",
+			`data: {"id":"chatcmpl-t2","object":"chat.completion.chunk","model":"gpt-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n",
+			`data: {"id":"chatcmpl-t2","object":"chat.completion.chunk","model":"gpt-5","choices":[],"usage":{"prompt_tokens":420,"completion_tokens":80,"total_tokens":500}}` + "\n\n",
+			"data: [DONE]\n\n",
+		}
+		for _, ch := range chunks {
+			_, _ = io.WriteString(w, ch)
+			flusher.Flush()
+		}
+	}))
+	defer openAIUpstream.Close()
+
+	// 3. Assemble complete M3 stack via store.NewStore + mcp.NewGateway + chat.NewService + api.NewHandler.
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "headlamp.db")
+	cfgPath := filepath.Join(tmpDir, "headlamp.yaml")
+
+	masterKeyBytes, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	t.Setenv("HEADLAMP_MASTER_KEY", hex.EncodeToString(masterKeyBytes))
+
+	yamlCfg := fmt.Sprintf(`
+server:
+  tsnet:
+    enabled: false
+    state_dir: %q
+  local_listen: "127.0.0.1:0"
+  dev_mode: true
+storage:
+  driver: sqlite
+  dsn: %q
+providers:
+  - name: openai
+    type: openai
+    base_url: %q
+    api_key: "sk-openai-m3"
+    models: ["gpt-5"]
+mcp_servers:
+  - name: docs
+    url: %q
+    transport: streamable_http
+    auth_type: bearer
+    auth_token: "mcp-docs-secret-xyz"
+guardrails:
+  builtin_defaults: true
+audit:
+  store_payloads: false
+  retention_days: 7
+`, tmpDir, dbPath, openAIUpstream.URL, mcpUpstream.URL)
+
+	if err := os.WriteFile(cfgPath, []byte(yamlCfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+
+	ctx := context.Background()
+	st, _, _, err := openStore(ctx, cfg)
+	if err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.SyncConfig(ctx, cfg); err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+
+	pricing, err := metering.LoadDefault()
+	if err != nil {
+		t.Fatalf("LoadDefault: %v", err)
+	}
+	grEngine, err := guardrail.NewEngine(guardrail.EngineConfig{Store: st})
+	if err != nil {
+		t.Fatalf("guardrail.NewEngine: %v", err)
+	}
+	defer func() { _ = grEngine.Close(ctx) }()
+
+	quotaMgr := quota.NewManager(st)
+	recorder := metering.NewRecorder(st, cfg.Audit, pricing, metering.RecorderOptions{
+		DisableAutoPurge: true,
+		OnRecorded:       quotaMgr.OnUsageRecorded,
+	})
+	eval := policy.NewEvaluator()
+
+	gw, err := proxy.NewGateway(proxy.GatewayConfig{
+		Store:      st,
+		Authorizer: eval,
+		Telemetry:  &telemetryAdapter{recorder: recorder},
+		Quota:      &quotaLimiterAdapter{mgr: quotaMgr},
+		Guardrails: &guardrailInspectorAdapter{engine: grEngine},
+		Events:     grEngine,
+	})
+	if err != nil {
+		t.Fatalf("proxy.NewGateway: %v", err)
+	}
+
+	mcpGw, err := mcp.NewGateway(mcp.GatewayConfig{
+		Store:      st,
+		Authorizer: eval,
+		Guardrails: &mcpGuardrailAdapter{engine: grEngine},
+	})
+	if err != nil {
+		t.Fatalf("mcp.NewGateway: %v", err)
+	}
+
+	chatSvc, err := chat.NewService(chat.Config{
+		Store:      st,
+		Authorizer: eval,
+		Pricing:    pricing,
+		Gateway:    gw,
+		MCP:        &chatMCPAdapter{gw: mcpGw},
+	})
+	if err != nil {
+		t.Fatalf("chat.NewService: %v", err)
+	}
+
+	staticFS, err := web.DistFS()
+	if err != nil {
+		t.Fatalf("web.DistFS: %v", err)
+	}
+	apiHandler, err := api.NewHandler(api.Config{
+		Store:           st,
+		Policy:          eval,
+		Pricing:         pricing,
+		AuditController: recorder,
+		BudgetReporter:  &budgetReporterAdapter{mgr: quotaMgr},
+		GuardrailTester: &guardrailTesterAdapter{engine: grEngine},
+		WebhookTester:   &webhookTesterAdapter{engine: grEngine},
+		MCPTester:       &mcpTesterAdapter{gw: mcpGw},
+		ChatHandler:     &chatHandlerAdapter{svc: chatSvc},
+		StaticFS:        staticFS,
+	})
+	if err != nil {
+		t.Fatalf("api.NewHandler: %v", err)
+	}
+
+	whoIs := &fakeWhoIsClient{
+		peers: map[string]*apitype.WhoIsResponse{
+			"100.64.0.1": {
+				Node: &tailcfg.Node{
+					ComputedName: "admin-mac",
+					Addresses:    []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+				},
+				UserProfile: &tailcfg.UserProfile{LoginName: "admin@example.com", DisplayName: "Admin"},
+				CapMap: tailcfg.PeerCapMap{
+					policy.CapHeadlampGateway: []tailcfg.RawMessage{
+						`{"role":"admin","models":["**"],"mcp_tools":["**"]}`,
+					},
+				},
+			},
+			"100.64.0.10": {
+				Node: &tailcfg.Node{
+					ComputedName: "alice-laptop",
+					Addresses:    []netip.Prefix{netip.MustParsePrefix("100.64.0.10/32")},
+				},
+				UserProfile: &tailcfg.UserProfile{LoginName: "alice@example.com", DisplayName: "Alice"},
+				CapMap: tailcfg.PeerCapMap{
+					policy.CapHeadlampGateway: []tailcfg.RawMessage{
+						`{"role":"user","models":["openai/*"],"mcp_tools":["docs/search"]}`,
+					},
+				},
+			},
+		},
+	}
+
+	handler := buildHandler(gw, mcpGw, apiHandler, eval, netts.NewTSNetAuthenticator(whoIs))
+	sameOrigin := map[string]string{"Sec-Fetch-Site": "same-origin"}
+
+	doReq := func(remoteAddr, method, target, body string, headers map[string]string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, target, strings.NewReader(body))
+		req.RemoteAddr = remoteAddr
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// (a) Direct MCP Proxy (/mcp/docs): tools/list hides unauthorized "delete", keeps "search".
+	recList := doReq("100.64.0.10:51001", http.MethodPost, "/mcp/docs",
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`, nil)
+	if recList.Code != http.StatusOK || !strings.Contains(recList.Body.String(), `"search"`) || strings.Contains(recList.Body.String(), `"delete"`) {
+		t.Fatalf("/mcp/docs tools/list (alice) = %d: %s", recList.Code, recList.Body.String())
+	}
+	mcpMu.Lock()
+	if gotMCPAuth != "Bearer mcp-docs-secret-xyz" {
+		mcpMu.Unlock()
+		t.Fatalf("MCP upstream did not receive injected bearer token, got %q", gotMCPAuth)
+	}
+	mcpMu.Unlock()
+
+	// (b) Direct MCP Proxy: tools/call on denied "delete" -> JSON-RPC -32003, upstream never called, audited as denied.
+	recDeny := doReq("100.64.0.10:51001", http.MethodPost, "/mcp/docs",
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete","arguments":{"id":"1"}}}`, nil)
+	if recDeny.Code != http.StatusOK || !strings.Contains(recDeny.Body.String(), "-32003") {
+		t.Fatalf("/mcp/docs denied tools/call = %d: %s", recDeny.Code, recDeny.Body.String())
+	}
+
+	// (c) Direct MCP Proxy: tools/call on allowed "search" with AWS key -> guardrail redacts BEFORE upstream!
+	recCall := doReq("100.64.0.10:51001", http.MethodPost, "/mcp/docs",
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"query":"key AKIAIOSFODNN7EXAMPLE"}}}`, nil)
+	if recCall.Code != http.StatusOK || !strings.Contains(recCall.Body.String(), "headlamp.dev/cap/gateway") {
+		t.Fatalf("/mcp/docs allowed tools/call = %d: %s", recCall.Code, recCall.Body.String())
+	}
+	mcpMu.Lock()
+	if slices.Contains(gotMCPCalls, "delete") {
+		mcpMu.Unlock()
+		t.Fatalf("denied MCP tool 'delete' reached upstream: %v", gotMCPCalls)
+	}
+	if strings.Contains(gotSearchArgs, "AKIAIOSFODNN7EXAMPLE") || !strings.Contains(gotSearchArgs, "[REDACTED") {
+		mcpMu.Unlock()
+		t.Fatalf("MCP tool arguments were not redacted before upstream: %s", gotSearchArgs)
+	}
+	mcpMu.Unlock()
+
+	// (d) Admin MCP Gateway REST API: YAML source=config 409 lock, /test discovery, and /logs.
+	if r := doReq("100.64.0.1:51002", http.MethodPut, "/api/v1/admin/mcp/servers/docs", `{"enabled":false}`, sameOrigin); r.Code != http.StatusConflict {
+		t.Fatalf("PUT yaml mcp server = %d, want 409: %s", r.Code, r.Body.String())
+	}
+	if r := doReq("100.64.0.1:51002", http.MethodPost, "/api/v1/admin/mcp/servers/docs/test", `{}`, sameOrigin); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"ok":true`) || !strings.Contains(r.Body.String(), `"search"`) || !strings.Contains(r.Body.String(), `"delete"`) {
+		t.Fatalf("POST /api/v1/admin/mcp/servers/docs/test = %d: %s", r.Code, r.Body.String())
+	}
+	if r := doReq("100.64.0.1:51002", http.MethodGet, "/api/v1/admin/mcp/logs?server=docs", "", nil); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"denied"`) || !strings.Contains(r.Body.String(), `"ok"`) {
+		t.Fatalf("GET /api/v1/admin/mcp/logs = %d: %s", r.Code, r.Body.String())
+	}
+
+	// (e) Team Web Chat E2E: discovery -> session create -> cross-user 404 -> SSE streaming with live MCP tool call!
+	if r := doReq("100.64.0.10:51001", http.MethodGet, "/api/v1/chat/models", "", nil); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"openai/gpt-5"`) {
+		t.Fatalf("GET /api/v1/chat/models = %d: %s", r.Code, r.Body.String())
+	}
+	if r := doReq("100.64.0.10:51001", http.MethodGet, "/api/v1/chat/mcp-servers", "", nil); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"search"`) || strings.Contains(r.Body.String(), `"delete"`) {
+		t.Fatalf("GET /api/v1/chat/mcp-servers (alice) = %d: %s", r.Code, r.Body.String())
+	}
+
+	recSess := doReq("100.64.0.10:51001", http.MethodPost, "/api/v1/chat/sessions",
+		`{"title":"New Chat","model":"openai/gpt-5","mcp_servers":["docs"]}`, sameOrigin)
+	if recSess.Code != http.StatusCreated {
+		t.Fatalf("POST /api/v1/chat/sessions = %d: %s", recSess.Code, recSess.Body.String())
+	}
+	var sess store.ChatSession
+	if err := json.Unmarshal(recSess.Body.Bytes(), &sess); err != nil || sess.ID == "" {
+		t.Fatalf("decode chat session: err=%v body=%s", err, recSess.Body.String())
+	}
+
+	// Strict per-subject isolation: even Admin gets 404 on Alice's session.
+	if r := doReq("100.64.0.1:51002", http.MethodGet, "/api/v1/chat/sessions/"+sess.ID, "", nil); r.Code != http.StatusNotFound {
+		t.Fatalf("Admin GET Alice chat session = %d, want 404", r.Code)
+	}
+
+	// Stream live SSE turn through proxy.Gateway + MCP tool loop.
+	recStream := doReq("100.64.0.10:51001", http.MethodPost, "/api/v1/chat/sessions/"+sess.ID+"/messages",
+		`{"content":"How do Headscale grants work?"}`, sameOrigin)
+	if recStream.Code != http.StatusOK || !strings.Contains(recStream.Header().Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("POST chat message SSE = %d ct=%q body=%s", recStream.Code, recStream.Header().Get("Content-Type"), recStream.Body.String())
+	}
+	sseBody := recStream.Body.String()
+	for _, wantEvt := range []string{
+		"event: message_start",
+		"event: tool_start",
+		"event: tool_result",
+		"event: delta",
+		"event: message_done",
+		"use headlamp.dev/cap/gateway.",
+	} {
+		if !strings.Contains(sseBody, wantEvt) {
+			t.Fatalf("Chat SSE stream missing %q:\n%s", wantEvt, sseBody)
+		}
+	}
+
+	// Verify persisted chat messages & tool events via GET /api/v1/chat/sessions/{id}.
+	recDetail := doReq("100.64.0.10:51001", http.MethodGet, "/api/v1/chat/sessions/"+sess.ID, "", nil)
+	if recDetail.Code != http.StatusOK {
+		t.Fatalf("GET chat session detail = %d: %s", recDetail.Code, recDetail.Body.String())
+	}
+	var detail struct {
+		Session  store.ChatSession   `json:"session"`
+		Messages []store.ChatMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(recDetail.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("decode chat session detail: %v", err)
+	}
+	if len(detail.Messages) != 2 || detail.Messages[0].Role != "user" || detail.Messages[1].Role != "assistant" ||
+		len(detail.Messages[1].ToolEvents) != 1 || detail.Messages[1].ToolEvents[0].Tool != "search" ||
+		detail.Messages[1].CostUSD <= 0 {
+		t.Fatalf("unexpected persisted chat messages: %+v", detail.Messages)
+	}
+
+	// Flush metering and confirm zero-bypass LLM usage logging (2 turns) + MCP audit logging (3 calls: 1 denied + 2 ok).
+	if err := recorder.Close(ctx); err != nil {
+		t.Fatalf("recorder.Close: %v", err)
+	}
+	usageLogs, err := st.QueryUsageLogs(ctx, store.UsageFilter{Subject: "alice@example.com"})
+	if err != nil || len(usageLogs) != 2 {
+		t.Fatalf("expected 2 usage_logs from zero-bypass Web Chat turns, got (%d, %v)", len(usageLogs), err)
+	}
+	mcpAudit, err := st.QueryMCPAuditLogs(ctx, store.MCPAuditFilter{ServerName: "docs"})
+	if err != nil || len(mcpAudit) != 3 {
+		t.Fatalf("expected 3 mcp_audit_logs (1 denied + 1 direct search + 1 chat search), got (%d, %v)", len(mcpAudit), err)
 	}
 }

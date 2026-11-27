@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"math"
 	"os"
@@ -82,13 +83,13 @@ func TestSQLitePragmasPermissionsAndIdempotentMigration(t *testing.T) {
 		t.Fatalf("foreign_keys = %d, want 1", foreignKeys)
 	}
 
-	// Verify both migrations 1 and 2 are recorded.
+	// Verify migrations 1, 2, and 3 are recorded.
 	var migCount int
 	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&migCount); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if migCount != 2 {
-		t.Fatalf("schema_migrations count = %d, want 2", migCount)
+	if migCount != 3 {
+		t.Fatalf("schema_migrations count = %d, want 3", migCount)
 	}
 
 	// Re-running Migrate must be a clean no-op.
@@ -823,5 +824,236 @@ guardrails:
 	restored, err := st.GetGuardrailRule(ctx, "builtin-email")
 	if err != nil || !restored.Builtin || restored.Source != SourceBuiltin || restored.Action != config.GuardrailActionLogOnly || restored.Enabled {
 		t.Fatalf("expected default builtin-email restored with source=builtin, got (%+v, %v)", restored, err)
+	}
+}
+
+func TestM3MCPServersEncryptionSyncAuditAndChatIsolation(t *testing.T) {
+	st, _ := newTestStore(t, ":memory:")
+	ctx := context.Background()
+
+	// 1. Verify migration 0003 applied cleanly.
+	var maxVer int
+	if err := st.DB().QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&maxVer); err != nil {
+		t.Fatalf("query schema_migrations: %v", err)
+	}
+	if maxVer < 3 {
+		t.Fatalf("expected migration >= 3, got %d", maxVer)
+	}
+
+	// 2. MCPServer CRUD, AES-256-GCM encryption at rest, snapshot cache, and SyncConfig reconciliation.
+	if err := st.UpsertMCPServer(ctx, MCPServer{
+		Name:      "local-tools",
+		URL:       "https://local-mcp.internal/mcp",
+		Transport: config.MCPTransportStreamableHTTP,
+		AuthType:  config.MCPAuthBearer,
+		AuthToken: "mcp_local_secret_token",
+		Enabled:   true,
+		Source:    SourceLocal,
+	}); err != nil {
+		t.Fatalf("UpsertMCPServer(local-tools): %v", err)
+	}
+
+	var rawEnc string
+	if err := st.DB().QueryRowContext(ctx, `SELECT auth_token_enc FROM mcp_servers WHERE name = ?`, "local-tools").Scan(&rawEnc); err != nil {
+		t.Fatalf("query raw auth_token_enc: %v", err)
+	}
+	if rawEnc == "" || strings.Contains(rawEnc, "mcp_local_secret_token") {
+		t.Fatalf("auth_token was not encrypted at rest: %q", rawEnc)
+	}
+
+	gotLocal, err := st.GetMCPServer(ctx, "local-tools")
+	if err != nil || gotLocal.AuthToken != "mcp_local_secret_token" || gotLocal.Source != SourceLocal {
+		t.Fatalf("GetMCPServer(local-tools) = (%+v, %v)", gotLocal, err)
+	}
+
+	// SyncConfig with two YAML servers, then second SyncConfig omitting auth_token on docs and removing github.
+	cfg1, err := config.LoadFromBytes([]byte(`
+mcp_servers:
+  - name: docs
+    url: "https://docs.internal/mcp"
+    transport: streamable_http
+    auth_type: bearer
+    auth_token: "docs-yaml-secret"
+  - name: github
+    url: "https://github.internal/sse"
+    transport: sse
+    auth_type: header
+    auth_header: "X-API-Key"
+    auth_token: "gh-yaml-secret"
+`))
+	if err != nil {
+		t.Fatalf("LoadFromBytes cfg1: %v", err)
+	}
+	if err := st.SyncConfig(ctx, cfg1); err != nil {
+		t.Fatalf("SyncConfig cfg1: %v", err)
+	}
+
+	// Snapshot cache hit check on repeated reads.
+	beforeLoads := st.cacheLoads.Load()
+	if list, err := st.ListMCPServers(ctx); err != nil || len(list) != 3 {
+		t.Fatalf("ListMCPServers = (%d, %v), want 3", len(list), err)
+	}
+	if _, err := st.GetMCPServer(ctx, "docs"); err != nil {
+		t.Fatalf("GetMCPServer(docs): %v", err)
+	}
+	if st.cacheLoads.Load() != beforeLoads+1 {
+		t.Fatalf("expected 1 snapshot load across List+Get, got %d", st.cacheLoads.Load()-beforeLoads)
+	}
+
+	cfg2, err := config.LoadFromBytes([]byte(`
+mcp_servers:
+  - name: docs
+    url: "https://docs-v2.internal/mcp"
+    transport: streamable_http
+    auth_type: bearer
+`))
+	if err != nil {
+		t.Fatalf("LoadFromBytes cfg2: %v", err)
+	}
+	if err := st.SyncConfig(ctx, cfg2); err != nil {
+		t.Fatalf("SyncConfig cfg2: %v", err)
+	}
+
+	docs, err := st.GetMCPServer(ctx, "docs")
+	if err != nil || docs.URL != "https://docs-v2.internal/mcp" || docs.AuthToken != "docs-yaml-secret" || docs.Source != SourceConfig {
+		t.Fatalf("SyncConfig did not preserve docs token or update URL: (%+v, %v)", docs, err)
+	}
+	if _, err := st.GetMCPServer(ctx, "github"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected removed YAML mcp server github pruned, got %v", err)
+	}
+	if _, err := st.GetMCPServer(ctx, "local-tools"); err != nil {
+		t.Fatalf("expected SourceLocal mcp server preserved, got %v", err)
+	}
+	if err := st.DeleteMCPServer(ctx, "local-tools"); err != nil {
+		t.Fatalf("DeleteMCPServer: %v", err)
+	}
+
+	// 3. MCP Audit Logs insert & filtered queries.
+	base := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	mcpLogs := []MCPAuditLog{
+		{ID: "m1", CreatedAt: base, RequestID: "req-1", Subject: "alice@example.com", DisplayName: "Alice", NodeName: "alice-mac", NodeIP: "100.64.0.10", Tags: []string{"tag:eng"}, AuthSource: "tsnet", ServerName: "docs", Method: "tools/call", ToolName: "search", Status: "ok", LatencyMS: 42, ArgumentsPreview: `{"q":"tsnet"}`},
+		{ID: "m2", CreatedAt: base.Add(time.Minute), RequestID: "req-2", Subject: "bob@example.com", DisplayName: "Bob", NodeName: "bob-mac", NodeIP: "100.64.0.11", Tags: []string{"tag:ops"}, AuthSource: "tsnet", ServerName: "github", Method: "tools/call", ToolName: "delete_repo", Status: "denied", LatencyMS: 3, ErrorMessage: "denied by grant"},
+		{ID: "m3", CreatedAt: base.Add(2 * time.Minute), RequestID: "req-3", Subject: "alice@example.com", DisplayName: "Alice", NodeName: "alice-mac", NodeIP: "100.64.0.10", Tags: []string{"tag:eng"}, AuthSource: "tsnet", ServerName: "docs", Method: "tools/call", ToolName: "read_page", Status: "blocked", LatencyMS: 5, ErrorMessage: "pem key blocked"},
+	}
+	for _, ml := range mcpLogs {
+		if err := st.InsertMCPAuditLog(ctx, ml); err != nil {
+			t.Fatalf("InsertMCPAuditLog(%s): %v", ml.ID, err)
+		}
+	}
+	byServer, err := st.QueryMCPAuditLogs(ctx, MCPAuditFilter{ServerName: "docs"})
+	if err != nil || len(byServer) != 2 || byServer[0].ID != "m3" {
+		t.Fatalf("QueryMCPAuditLogs(docs) = (%+v, %v)", byServer, err)
+	}
+	byStatus, err := st.QueryMCPAuditLogs(ctx, MCPAuditFilter{Status: "denied", ToolName: "delete_repo"})
+	if err != nil || len(byStatus) != 1 || byStatus[0].ID != "m2" {
+		t.Fatalf("QueryMCPAuditLogs(denied) = (%+v, %v)", byStatus, err)
+	}
+	byLimit, err := st.QueryMCPAuditLogs(ctx, MCPAuditFilter{Limit: 1, Offset: 1})
+	if err != nil || len(byLimit) != 1 || byLimit[0].ID != "m2" {
+		t.Fatalf("QueryMCPAuditLogs(limit=1,offset=1) = (%+v, %v)", byLimit, err)
+	}
+
+	// 4. Chat Sessions & Messages with strict per-subject ownership isolation and cascade delete.
+	sAlice, err := st.CreateChatSession(ctx, ChatSession{
+		Subject:      "alice@example.com",
+		Title:        "Debug Headscale",
+		Model:        "team/coding",
+		MCPServers:   []string{"docs"},
+		SystemPrompt: "Be concise.",
+	})
+	if err != nil || sAlice.ID == "" || sAlice.Title != "Debug Headscale" || len(sAlice.MCPServers) != 1 {
+		t.Fatalf("CreateChatSession(alice) = (%+v, %v)", sAlice, err)
+	}
+	sBob, err := st.CreateChatSession(ctx, ChatSession{
+		Subject: "bob@example.com",
+		Title:   "Bob Private Chat",
+		Model:   "gpt-5",
+	})
+	if err != nil {
+		t.Fatalf("CreateChatSession(bob): %v", err)
+	}
+
+	// Bob MUST NOT read, update, insert into, list messages of, or delete Alice's session.
+	if _, err := st.GetChatSession(ctx, "bob@example.com", sAlice.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Bob GetChatSession(alice) = %v, want ErrNotFound", err)
+	}
+	if _, err := st.UpdateChatSession(ctx, "bob@example.com", ChatSession{ID: sAlice.ID, Title: "Hijacked"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Bob UpdateChatSession(alice) = %v, want ErrNotFound", err)
+	}
+	if _, err := st.InsertChatMessage(ctx, "bob@example.com", ChatMessage{SessionID: sAlice.ID, Role: "user", Content: "spoof"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Bob InsertChatMessage(alice) = %v, want ErrNotFound", err)
+	}
+	if _, err := st.ListChatMessages(ctx, "bob@example.com", sAlice.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Bob ListChatMessages(alice) = %v, want ErrNotFound", err)
+	}
+	if err := st.DeleteChatSession(ctx, "bob@example.com", sAlice.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Bob DeleteChatSession(alice) = %v, want ErrNotFound", err)
+	}
+
+	// Alice updates her session and inserts user + assistant messages with tool events.
+	updatedAlice, err := st.UpdateChatSession(ctx, "alice@example.com", ChatSession{
+		ID:           sAlice.ID,
+		Title:        "Debug Headscale Grants",
+		Model:        "anthropic/claude-sonnet-4-6",
+		MCPServers:   []string{"docs"},
+		SystemPrompt: "Be super concise.",
+	})
+	if err != nil || updatedAlice.Title != "Debug Headscale Grants" {
+		t.Fatalf("UpdateChatSession(alice) = (%+v, %v)", updatedAlice, err)
+	}
+
+	if _, err := st.InsertChatMessage(ctx, "alice@example.com", ChatMessage{
+		SessionID: sAlice.ID,
+		Role:      "user",
+		Content:   "Check docs for grants",
+	}); err != nil {
+		t.Fatalf("InsertChatMessage(user): %v", err)
+	}
+	if _, err := st.InsertChatMessage(ctx, "alice@example.com", ChatMessage{
+		SessionID: sAlice.ID,
+		Role:      "assistant",
+		Content:   "Use headlamp.dev/cap/gateway.",
+		Model:     "claude-sonnet-4-6",
+		ToolEvents: []ChatToolEvent{{
+			ID:         "tc-1",
+			Server:     "docs",
+			Tool:       "search",
+			Arguments:  json.RawMessage(`{"q":"grants"}`),
+			Result:     "Found 1 result",
+			IsError:    false,
+			DurationMS: 38,
+		}},
+		InputTokens:  120,
+		OutputTokens: 45,
+		CostUSD:      0.0012,
+	}); err != nil {
+		t.Fatalf("InsertChatMessage(assistant): %v", err)
+	}
+
+	msgs, err := st.ListChatMessages(ctx, "alice@example.com", sAlice.ID)
+	if err != nil || len(msgs) != 2 || msgs[0].Role != "user" || msgs[1].Role != "assistant" ||
+		len(msgs[1].ToolEvents) != 1 || msgs[1].ToolEvents[0].Tool != "search" || string(msgs[1].ToolEvents[0].Arguments) != `{"q":"grants"}` {
+		t.Fatalf("ListChatMessages(alice) = (%+v, %v)", msgs, err)
+	}
+
+	aliceList, err := st.ListChatSessions(ctx, "alice@example.com", 20, 0)
+	if err != nil || len(aliceList) != 1 || aliceList[0].ID != sAlice.ID {
+		t.Fatalf("ListChatSessions(alice) = (%+v, %v)", aliceList, err)
+	}
+	bobList, err := st.ListChatSessions(ctx, "bob@example.com", 20, 0)
+	if err != nil || len(bobList) != 1 || bobList[0].ID != sBob.ID {
+		t.Fatalf("ListChatSessions(bob) = (%+v, %v)", bobList, err)
+	}
+
+	// Delete Alice's session -> chat_messages cascade deleted.
+	if err := st.DeleteChatSession(ctx, "alice@example.com", sAlice.ID); err != nil {
+		t.Fatalf("DeleteChatSession(alice): %v", err)
+	}
+	var orphanMsgs int
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM chat_messages WHERE session_id = ?`, sAlice.ID).Scan(&orphanMsgs); err != nil {
+		t.Fatalf("count orphan chat_messages: %v", err)
+	}
+	if orphanMsgs != 0 {
+		t.Fatalf("expected cascade delete of chat_messages, found %d remaining", orphanMsgs)
 	}
 }

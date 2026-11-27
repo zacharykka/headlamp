@@ -20,9 +20,11 @@ import (
 
 	"github.com/zacharykka/headlamp/internal/api"
 	"github.com/zacharykka/headlamp/internal/auth"
+	"github.com/zacharykka/headlamp/internal/chat"
 	"github.com/zacharykka/headlamp/internal/config"
 	"github.com/zacharykka/headlamp/internal/crypto"
 	"github.com/zacharykka/headlamp/internal/guardrail"
+	"github.com/zacharykka/headlamp/internal/mcp"
 	"github.com/zacharykka/headlamp/internal/metering"
 	"github.com/zacharykka/headlamp/internal/netts"
 	"github.com/zacharykka/headlamp/internal/policy"
@@ -187,6 +189,28 @@ func runServe(args []string, _, stderr io.Writer) error {
 		return fmt.Errorf("init proxy gateway: %w", err)
 	}
 
+	mcpGw, err := mcp.NewGateway(mcp.GatewayConfig{
+		Store:      st,
+		Authorizer: eval,
+		Guardrails: &mcpGuardrailAdapter{engine: grEngine},
+		Logf:       logger.Printf,
+	})
+	if err != nil {
+		return fmt.Errorf("init mcp gateway: %w", err)
+	}
+
+	chatSvc, err := chat.NewService(chat.Config{
+		Store:      st,
+		Authorizer: eval,
+		Pricing:    pricing,
+		Gateway:    gw,
+		MCP:        &chatMCPAdapter{gw: mcpGw},
+		Logf:       logger.Printf,
+	})
+	if err != nil {
+		return fmt.Errorf("init chat service: %w", err)
+	}
+
 	staticFS, err := web.DistFS()
 	if err != nil {
 		return fmt.Errorf("load embedded web assets: %w", err)
@@ -200,6 +224,8 @@ func runServe(args []string, _, stderr io.Writer) error {
 		BudgetReporter:  &budgetReporterAdapter{mgr: quotaMgr},
 		GuardrailTester: &guardrailTesterAdapter{engine: grEngine},
 		WebhookTester:   &webhookTesterAdapter{engine: grEngine},
+		MCPTester:       &mcpTesterAdapter{gw: mcpGw},
+		ChatHandler:     &chatHandlerAdapter{svc: chatSvc},
 		StaticFS:        staticFS,
 	})
 	if err != nil {
@@ -228,10 +254,10 @@ func runServe(args []string, _, stderr io.Writer) error {
 	// - Local listener ONLY uses static API tokens and/or loopback-restricted dev_mock.
 	var tailnetHandler, localHandler http.Handler
 	if cfg.Server.TSNet.Enabled {
-		tailnetHandler = buildHandler(gw, apiHandler, eval, srv.Authenticator())
+		tailnetHandler = buildHandler(gw, mcpGw, apiHandler, eval, srv.Authenticator())
 	}
 	if strings.TrimSpace(cfg.Server.LocalListen) != "" {
-		localHandler = buildHandler(gw, apiHandler, eval, buildLocalAuthChain(cfg.Server))
+		localHandler = buildHandler(gw, mcpGw, apiHandler, eval, buildLocalAuthChain(cfg.Server))
 	}
 
 	if addr := srv.TailnetAddr(); addr != "" {
@@ -376,13 +402,9 @@ func runUsage(args []string, stdout, stderr io.Writer) error {
 }
 
 func openStore(ctx context.Context, cfg *config.Config) (store.Store, bool, string, error) {
-	if cfg.Storage.Driver != config.StorageDriverSQLite {
-		return nil, false, "", fmt.Errorf("storage driver %q is not yet implemented (use sqlite)", cfg.Storage.Driver)
-	}
-
 	stateDir := cfg.Server.TSNet.StateDir
 	if strings.TrimSpace(stateDir) == "" {
-		if cfg.Storage.DSN != "" && cfg.Storage.DSN != ":memory:" && !strings.Contains(cfg.Storage.DSN, "mode=memory") {
+		if cfg.Storage.Driver == config.StorageDriverSQLite && cfg.Storage.DSN != "" && cfg.Storage.DSN != ":memory:" && !strings.Contains(cfg.Storage.DSN, "mode=memory") {
 			stateDir = filepath.Dir(cfg.Storage.DSN)
 		} else {
 			stateDir = "./data"
@@ -394,9 +416,9 @@ func openStore(ctx context.Context, cfg *config.Config) (store.Store, bool, stri
 		return nil, false, "", fmt.Errorf("init master key cipher: %w", err)
 	}
 
-	st, err := store.NewSQLiteStore(ctx, cfg.Storage.DSN, cipher)
+	st, err := store.NewStore(ctx, cfg.Storage, cipher)
 	if err != nil {
-		return nil, generated, keyPath, fmt.Errorf("open sqlite store: %w", err)
+		return nil, generated, keyPath, fmt.Errorf("open %s store: %w", cfg.Storage.Driver, err)
 	}
 	return st, generated, keyPath, nil
 }
@@ -466,7 +488,7 @@ func buildLocalAuthChain(cfg config.ServerConfig) auth.Authenticator {
 	return auth.NewChainAuthenticator(chain...)
 }
 
-func buildHandler(gw http.Handler, apiHandler http.Handler, eval *policy.Evaluator, authenticator auth.Authenticator) http.Handler {
+func buildHandler(gw http.Handler, mcpGw http.Handler, apiHandler http.Handler, eval *policy.Evaluator, authenticator auth.Authenticator) http.Handler {
 	whoami := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -504,6 +526,14 @@ func buildHandler(gw http.Handler, apiHandler http.Handler, eval *policy.Evaluat
 			whoami.ServeHTTP(w, r)
 			return
 		}
+		if r.URL.Path == "/mcp" || strings.HasPrefix(r.URL.Path, "/mcp/") {
+			if mcpGw != nil {
+				mcpGw.ServeHTTP(w, r)
+				return
+			}
+			http.NotFound(w, r)
+			return
+		}
 		if api.IsGatewayReservedPath(r.URL.Path) || apiHandler == nil {
 			gw.ServeHTTP(w, r)
 			return
@@ -529,10 +559,14 @@ var (
 	_ proxy.QuotaLimiter       = (*quotaLimiterAdapter)(nil)
 	_ proxy.GuardrailInspector = (*guardrailInspectorAdapter)(nil)
 	_ proxy.EventDispatcher    = (*guardrail.Engine)(nil)
+	_ mcp.GuardrailInspector   = (*mcpGuardrailAdapter)(nil)
+	_ chat.MCPBridge           = (*chatMCPAdapter)(nil)
 	_ api.AuditController      = (*metering.Recorder)(nil)
 	_ api.BudgetReporter       = (*budgetReporterAdapter)(nil)
 	_ api.GuardrailTester      = (*guardrailTesterAdapter)(nil)
 	_ api.WebhookTester        = (*webhookTesterAdapter)(nil)
+	_ api.MCPTester            = (*mcpTesterAdapter)(nil)
+	_ api.ChatHandler          = (*chatHandlerAdapter)(nil)
 )
 
 // telemetryAdapter bridges *metering.Recorder to proxy.TelemetryFactory.
@@ -748,6 +782,154 @@ func (a *webhookTesterAdapter) PingWebhook(ctx context.Context, wh store.Webhook
 	}, nil
 }
 
+// mcpGuardrailAdapter bridges *guardrail.Engine to mcp.GuardrailInspector.
+type mcpGuardrailAdapter struct {
+	engine *guardrail.Engine
+}
+
+func (a *mcpGuardrailAdapter) Inspect(ctx context.Context, req mcp.GuardrailRequest) (*mcp.GuardrailDecision, error) {
+	in := guardrail.InspectInput{
+		RequestID: req.RequestID,
+		Protocol:  req.Protocol,
+		Model:     req.Model,
+		Body:      req.Body,
+	}
+	if req.Principal != nil {
+		in.Subject = req.Principal.Subject
+		in.NodeName = req.Principal.NodeName
+	}
+	dec, err := a.engine.InspectRequest(ctx, in)
+	if err != nil || dec == nil {
+		return nil, err
+	}
+	return &mcp.GuardrailDecision{
+		Action:       dec.Action,
+		ModifiedBody: dec.ModifiedBody,
+		Hits:         dec.Hits,
+		Reason:       dec.Reason,
+		StatusCode:   dec.StatusCode,
+	}, nil
+}
+
+// chatMCPAdapter bridges *mcp.Gateway to chat.MCPBridge.
+type chatMCPAdapter struct {
+	gw *mcp.Gateway
+}
+
+func (a *chatMCPAdapter) ListAuthorizedTools(ctx context.Context, p *auth.Principal, serverNames []string) ([]chat.ServerTools, error) {
+	servers, err := a.gw.ListAuthorizedToolsForPrincipal(ctx, p, serverNames)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]chat.ServerTools, len(servers))
+	for i, srv := range servers {
+		tools := make([]chat.ToolSpec, len(srv.Tools))
+		for j, tool := range srv.Tools {
+			tools[j] = chat.ToolSpec{
+				Server:      srv.Name,
+				Name:        tool.Name,
+				Description: tool.Description,
+				InputSchema: tool.InputSchema,
+			}
+		}
+		out[i] = chat.ServerTools{
+			Name:      srv.Name,
+			Transport: srv.Transport,
+			Enabled:   srv.Enabled,
+			Tools:     tools,
+			Error:     srv.Error,
+		}
+	}
+	return out, nil
+}
+
+func (a *chatMCPAdapter) CallTool(ctx context.Context, p *auth.Principal, serverName, toolName string, args json.RawMessage) (*chat.ToolResult, error) {
+	res, err := a.gw.CallAuthorizedTool(ctx, p, serverName, toolName, args)
+	if err != nil || res == nil {
+		return nil, err
+	}
+	return &chat.ToolResult{
+		Result:     res.Result,
+		IsError:    res.IsError,
+		DurationMS: res.DurationMS,
+	}, nil
+}
+
+// mcpTesterAdapter bridges *mcp.Gateway to api.MCPTester.
+type mcpTesterAdapter struct {
+	gw *mcp.Gateway
+}
+
+func (a *mcpTesterAdapter) DiscoverTools(ctx context.Context, srv store.MCPServer) ([]api.MCPToolInfo, int64, error) {
+	tools, latencyMS, err := a.gw.DiscoverTools(ctx, srv)
+	if err != nil {
+		return nil, latencyMS, err
+	}
+	out := make([]api.MCPToolInfo, len(tools))
+	for i, t := range tools {
+		out[i] = api.MCPToolInfo{
+			Name:        t.Name,
+			Description: t.Description,
+		}
+	}
+	return out, latencyMS, nil
+}
+
+// chatHandlerAdapter bridges *chat.Service to api.ChatHandler.
+type chatHandlerAdapter struct {
+	svc *chat.Service
+}
+
+func (a *chatHandlerAdapter) ListModels(ctx context.Context, p *auth.Principal) ([]api.ChatModelItem, error) {
+	models, err := a.svc.ListModels(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]api.ChatModelItem, len(models))
+	for i, m := range models {
+		out[i] = api.ChatModelItem{
+			ID:           m.ID,
+			Provider:     m.Provider,
+			ProviderType: m.ProviderType,
+			IsAlias:      m.IsAlias,
+		}
+	}
+	return out, nil
+}
+
+func (a *chatHandlerAdapter) ListMCPServers(ctx context.Context, p *auth.Principal) ([]api.ChatMCPServerItem, error) {
+	servers, err := a.svc.ListMCPServers(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]api.ChatMCPServerItem, len(servers))
+	for i, srv := range servers {
+		tools := make([]api.MCPToolInfo, len(srv.Tools))
+		for j, t := range srv.Tools {
+			tools[j] = api.MCPToolInfo{
+				Name:        t.Name,
+				Description: t.Description,
+			}
+		}
+		out[i] = api.ChatMCPServerItem{
+			Name:      srv.Name,
+			Transport: srv.Transport,
+			Enabled:   srv.Enabled,
+			Tools:     tools,
+			Error:     srv.Error,
+		}
+	}
+	return out, nil
+}
+
+func (a *chatHandlerAdapter) StreamMessage(ctx context.Context, w http.ResponseWriter, p *auth.Principal, sessionID string, req api.ChatSendMessageRequest) error {
+	return a.svc.StreamMessage(ctx, w, p, sessionID, chat.SendMessageRequest{
+		Content:    req.Content,
+		Model:      req.Model,
+		MCPServers: req.MCPServers,
+	})
+}
+
 func flattenHeaders(h http.Header) map[string]string {
 	if len(h) == 0 {
 		return nil
@@ -800,6 +982,9 @@ server:
 storage:
   driver: sqlite
   dsn: "./data/headlamp.db"
+  # For multi-replica PostgreSQL deployments:
+  # driver: postgres
+  # dsn: "postgres://headlamp:${HEADLAMP_PG_PASSWORD}@127.0.0.1:5432/headlamp?sslmode=disable"
 
 providers:
   - name: anthropic
@@ -872,6 +1057,14 @@ guardrails:
 #       - upstream.error
 #     timeout_ms: 2000
 #     fail_open: true
+
+# Optional remote MCP servers proxied at /mcp/<name> and callable from Team Web Chat:
+# mcp_servers:
+#   - name: docs
+#     url: "https://mcp-docs.internal.example.com/mcp"
+#     transport: streamable_http # streamable_http | sse
+#     auth_type: bearer          # none | bearer | header | basic
+#     auth_token: "${DOCS_MCP_TOKEN}"
 
 audit:
   store_payloads: false

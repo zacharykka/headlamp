@@ -43,6 +43,48 @@ func (f *fakeWebhookTester) PingWebhook(_ context.Context, wh store.Webhook) (*W
 	return &WebhookTestResult{OK: true, StatusCode: 200, LatencyMS: 12, Message: "HTTP 200 OK"}, nil
 }
 
+type fakeMCPTester struct {
+	lastToken string
+}
+
+func (f *fakeMCPTester) DiscoverTools(_ context.Context, srv store.MCPServer) ([]MCPToolInfo, int64, error) {
+	f.lastToken = srv.AuthToken
+	return []MCPToolInfo{
+		{Name: "search", Description: "Search internal docs"},
+		{Name: "read_page", Description: "Read a documentation page"},
+	}, 18, nil
+}
+
+type fakeChatHandler struct {
+	lastSessionID string
+	lastReq       ChatSendMessageRequest
+}
+
+func (f *fakeChatHandler) ListModels(_ context.Context, _ *auth.Principal) ([]ChatModelItem, error) {
+	return []ChatModelItem{
+		{ID: "anthropic/claude-sonnet-4-6", Provider: "anthropic", ProviderType: "anthropic", IsAlias: false},
+		{ID: "team/coding", Provider: "anthropic", ProviderType: "anthropic", IsAlias: true},
+	}, nil
+}
+
+func (f *fakeChatHandler) ListMCPServers(_ context.Context, _ *auth.Principal) ([]ChatMCPServerItem, error) {
+	return []ChatMCPServerItem{
+		{Name: "docs", Transport: "streamable_http", Enabled: true, Tools: []MCPToolInfo{{Name: "search", Description: "Search docs"}}},
+	}, nil
+}
+
+func (f *fakeChatHandler) StreamMessage(_ context.Context, w http.ResponseWriter, _ *auth.Principal, sessionID string, req ChatSendMessageRequest) error {
+	f.lastSessionID = sessionID
+	f.lastReq = req
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("event: delta\ndata: {\"text\":\"Hello\"}\n\n"))
+	if fl, ok := w.(http.Flusher); ok {
+		fl.Flush()
+	}
+	return nil
+}
+
 func setupTestAPI(t *testing.T) (*Handler, *store.SQLiteStore, *metering.Recorder, *fakeWebhookTester) {
 	t.Helper()
 	ctx := context.Background()
@@ -82,6 +124,8 @@ func setupTestAPI(t *testing.T) (*Handler, *store.SQLiteStore, *metering.Recorde
 		AuditController: rec,
 		GuardrailTester: fakeGuardrailTester{},
 		WebhookTester:   whTester,
+		MCPTester:       &fakeMCPTester{},
+		ChatHandler:     &fakeChatHandler{},
 		StaticFS:        staticFS,
 	})
 	if err != nil {
@@ -811,4 +855,159 @@ func TestBackendReviewFixRegressions(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestM3ChatAndAdminMCPEndpoints(t *testing.T) {
+	h, st, _, _ := setupTestAPI(t)
+	ctx := context.Background()
+
+	// 1. /mcp and /mcp/* are gateway-reserved paths (never shadowed by SPA fallback).
+	if !IsGatewayReservedPath("/mcp") || !IsGatewayReservedPath("/mcp/docs") || !IsGatewayReservedPath("/mcp/docs/sse") {
+		t.Fatal("IsGatewayReservedPath must reserve /mcp and /mcp/*")
+	}
+	if h.HandlesPath("/mcp/docs") {
+		t.Fatal("HandlesPath must not claim /mcp/docs")
+	}
+
+	// 2. Chat endpoints work for non-admin users (Bob) and enforce strict per-subject isolation vs Alice.
+	if r := doAPIRequest(h, userPrincipal(), http.MethodGet, "/api/v1/chat/models", "", nil); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"team/coding"`) {
+		t.Fatalf("GET /api/v1/chat/models = %d: %s", r.Code, r.Body.String())
+	}
+	if r := doAPIRequest(h, userPrincipal(), http.MethodGet, "/api/v1/chat/mcp-servers", "", nil); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"search"`) {
+		t.Fatalf("GET /api/v1/chat/mcp-servers = %d: %s", r.Code, r.Body.String())
+	}
+	// CSRF enforced on chat POST.
+	if r := doAPIRequest(h, userPrincipal(), http.MethodPost, "/api/v1/chat/sessions", `{"model":"team/coding"}`, map[string]string{"Sec-Fetch-Site": "cross-site"}); r.Code != http.StatusForbidden {
+		t.Fatalf("cross-site POST /api/v1/chat/sessions = %d, want 403", r.Code)
+	}
+	// Model required on session creation.
+	if r := doAPIRequest(h, userPrincipal(), http.MethodPost, "/api/v1/chat/sessions", `{"title":"No Model"}`, nil); r.Code != http.StatusBadRequest {
+		t.Fatalf("POST chat session without model = %d, want 400", r.Code)
+	}
+
+	recCreate := doAPIRequest(h, userPrincipal(), http.MethodPost, "/api/v1/chat/sessions", `{"title":"Bob Debug","model":"team/coding","mcp_servers":["docs"]}`, nil)
+	if recCreate.Code != http.StatusCreated {
+		t.Fatalf("POST /api/v1/chat/sessions = %d: %s", recCreate.Code, recCreate.Body.String())
+	}
+	var bobSess store.ChatSession
+	if err := json.Unmarshal(recCreate.Body.Bytes(), &bobSess); err != nil || bobSess.ID == "" {
+		t.Fatalf("decode created chat session: err=%v body=%s", err, recCreate.Body.String())
+	}
+
+	// Admin Alice MUST still get 404 on Bob's personal chat session (strict per-subject ownership!).
+	if r := doAPIRequest(h, adminPrincipal(), http.MethodGet, "/api/v1/chat/sessions/"+bobSess.ID, "", nil); r.Code != http.StatusNotFound {
+		t.Fatalf("Alice GET Bob session = %d, want 404", r.Code)
+	}
+	if r := doAPIRequest(h, adminPrincipal(), http.MethodPatch, "/api/v1/chat/sessions/"+bobSess.ID, `{"title":"Hijacked"}`, nil); r.Code != http.StatusNotFound {
+		t.Fatalf("Alice PATCH Bob session = %d, want 404", r.Code)
+	}
+	if r := doAPIRequest(h, adminPrincipal(), http.MethodPost, "/api/v1/chat/sessions/"+bobSess.ID+"/messages", `{"content":"sneak"}`, nil); r.Code != http.StatusNotFound {
+		t.Fatalf("Alice POST Bob session message = %d, want 404", r.Code)
+	}
+	if r := doAPIRequest(h, adminPrincipal(), http.MethodDelete, "/api/v1/chat/sessions/"+bobSess.ID, "", nil); r.Code != http.StatusNotFound {
+		t.Fatalf("Alice DELETE Bob session = %d, want 404", r.Code)
+	}
+
+	// Bob lists, gets, patches, streams SSE message, and deletes his session.
+	if r := doAPIRequest(h, userPrincipal(), http.MethodGet, "/api/v1/chat/sessions?limit=50", "", nil); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), bobSess.ID) {
+		t.Fatalf("GET /api/v1/chat/sessions = %d: %s", r.Code, r.Body.String())
+	}
+	if r := doAPIRequest(h, userPrincipal(), http.MethodGet, "/api/v1/chat/sessions/"+bobSess.ID, "", nil); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"messages":[]`) {
+		t.Fatalf("GET /api/v1/chat/sessions/{id} = %d: %s", r.Code, r.Body.String())
+	}
+	if r := doAPIRequest(h, userPrincipal(), http.MethodPatch, "/api/v1/chat/sessions/"+bobSess.ID, `{"title":"Bob Renamed","mcp_servers":[]}`, nil); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"Bob Renamed"`) || !strings.Contains(r.Body.String(), `"mcp_servers":[]`) {
+		t.Fatalf("PATCH /api/v1/chat/sessions/{id} = %d: %s", r.Code, r.Body.String())
+	}
+	if r := doAPIRequest(h, userPrincipal(), http.MethodPost, "/api/v1/chat/sessions/"+bobSess.ID+"/messages", `{"content":"   "}`, nil); r.Code != http.StatusBadRequest {
+		t.Fatalf("POST empty content message = %d, want 400", r.Code)
+	}
+	recSSE := doAPIRequest(h, userPrincipal(), http.MethodPost, "/api/v1/chat/sessions/"+bobSess.ID+"/messages", `{"content":"Hello MCP","model":"team/coding"}`, nil)
+	if recSSE.Code != http.StatusOK || !strings.Contains(recSSE.Header().Get("Content-Type"), "text/event-stream") || !strings.Contains(recSSE.Body.String(), "event: delta") {
+		t.Fatalf("POST chat message SSE = %d ct=%q body=%s", recSSE.Code, recSSE.Header().Get("Content-Type"), recSSE.Body.String())
+	}
+	if r := doAPIRequest(h, userPrincipal(), http.MethodDelete, "/api/v1/chat/sessions/"+bobSess.ID, "", nil); r.Code != http.StatusOK {
+		t.Fatalf("DELETE chat session = %d: %s", r.Code, r.Body.String())
+	}
+
+	// 3. Admin MCP Gateway RBAC (403 for non-admin) & CSRF (403).
+	if r := doAPIRequest(h, userPrincipal(), http.MethodGet, "/api/v1/admin/mcp/servers", "", nil); r.Code != http.StatusForbidden {
+		t.Fatalf("non-admin GET /api/v1/admin/mcp/servers = %d, want 403", r.Code)
+	}
+	if r := doAPIRequest(h, adminPrincipal(), http.MethodPost, "/api/v1/admin/mcp/servers", `{"name":"x","url":"https://x.internal"}`, map[string]string{"Sec-Fetch-Site": "cross-site"}); r.Code != http.StatusForbidden {
+		t.Fatalf("cross-site POST /api/v1/admin/mcp/servers = %d, want 403", r.Code)
+	}
+
+	// 4. GitOps source='config' 409 lock for MCP servers.
+	if err := st.UpsertMCPServer(ctx, store.MCPServer{
+		Name: "yaml-docs", URL: "https://docs.internal/mcp", Transport: config.MCPTransportStreamableHTTP,
+		AuthType: config.MCPAuthBearer, AuthToken: "yaml-secret", Enabled: true, Source: store.SourceConfig,
+	}); err != nil {
+		t.Fatalf("seed yaml mcp server: %v", err)
+	}
+	for _, tc := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodPost, "/api/v1/admin/mcp/servers", `{"name":"yaml-docs","url":"https://docs.internal/mcp"}`},
+		{http.MethodPut, "/api/v1/admin/mcp/servers/yaml-docs", `{"enabled":false}`},
+		{http.MethodDelete, "/api/v1/admin/mcp/servers/yaml-docs", ""},
+	} {
+		if r := doAPIRequest(h, adminPrincipal(), tc.method, tc.path, tc.body, nil); r.Code != http.StatusConflict || !strings.Contains(r.Body.String(), "source=config") {
+			t.Fatalf("%s %s = %d %s, want 409 source=config", tc.method, tc.path, r.Code, r.Body.String())
+		}
+	}
+
+	// 5. Validation + CRUD + secret masking + preserve-on-PUT + clear_auth_token + /test discovery.
+	if r := doAPIRequest(h, adminPrincipal(), http.MethodPost, "/api/v1/admin/mcp/servers", `{"name":"bad/name","url":"https://x.internal"}`, nil); r.Code != http.StatusBadRequest {
+		t.Fatalf("mcp server with '/' = %d, want 400", r.Code)
+	}
+	if r := doAPIRequest(h, adminPrincipal(), http.MethodPost, "/api/v1/admin/mcp/servers", `{"name":"hdr-missing","url":"https://x.internal","auth_type":"header","auth_token":"abc"}`, nil); r.Code != http.StatusBadRequest {
+		t.Fatalf("header auth without auth_header = %d, want 400", r.Code)
+	}
+
+	recMCPCreate := doAPIRequest(h, adminPrincipal(), http.MethodPost, "/api/v1/admin/mcp/servers",
+		`{"name":"github","url":"https://mcp-gh.internal/sse","transport":"sse","auth_type":"header","auth_header":"X-API-Key","auth_token":"ghp_super_secret_token_999"}`,
+		nil,
+	)
+	if recMCPCreate.Code != http.StatusCreated || strings.Contains(recMCPCreate.Body.String(), "ghp_super_secret_token_999") || !strings.Contains(recMCPCreate.Body.String(), `"has_auth_token":true`) || !strings.Contains(recMCPCreate.Body.String(), `"auth_token_preview":"ghp_su...****"`) {
+		t.Fatalf("POST /api/v1/admin/mcp/servers = %d: %s", recMCPCreate.Code, recMCPCreate.Body.String())
+	}
+
+	// PUT without auth_token preserves existing encrypted token.
+	if r := doAPIRequest(h, adminPrincipal(), http.MethodPut, "/api/v1/admin/mcp/servers/github", `{"enabled":false}`, nil); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"has_auth_token":true`) || !strings.Contains(r.Body.String(), `"enabled":false`) {
+		t.Fatalf("PUT preserve auth_token = %d: %s", r.Code, r.Body.String())
+	}
+	storedGH, err := st.GetMCPServer(ctx, "github")
+	if err != nil || storedGH.AuthToken != "ghp_super_secret_token_999" {
+		t.Fatalf("expected preserved MCP AuthToken, got (%+v, %v)", storedGH, err)
+	}
+
+	// POST /test calls MCPTester and returns tools.
+	recMCPTest := doAPIRequest(h, adminPrincipal(), http.MethodPost, "/api/v1/admin/mcp/servers/github/test", "", nil)
+	if recMCPTest.Code != http.StatusOK || !strings.Contains(recMCPTest.Body.String(), `"ok":true`) || !strings.Contains(recMCPTest.Body.String(), `"search"`) {
+		t.Fatalf("POST /api/v1/admin/mcp/servers/github/test = %d: %s", recMCPTest.Code, recMCPTest.Body.String())
+	}
+
+	// PUT with clear_auth_token clears token.
+	if r := doAPIRequest(h, adminPrincipal(), http.MethodPut, "/api/v1/admin/mcp/servers/github", `{"clear_auth_token":true}`, nil); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"has_auth_token":false`) {
+		t.Fatalf("PUT clear_auth_token = %d: %s", r.Code, r.Body.String())
+	}
+
+	if r := doAPIRequest(h, adminPrincipal(), http.MethodGet, "/api/v1/admin/mcp/servers", "", nil); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"yaml-docs"`) || !strings.Contains(r.Body.String(), `"github"`) {
+		t.Fatalf("GET /api/v1/admin/mcp/servers = %d: %s", r.Code, r.Body.String())
+	}
+	if r := doAPIRequest(h, adminPrincipal(), http.MethodDelete, "/api/v1/admin/mcp/servers/github", "", nil); r.Code != http.StatusOK {
+		t.Fatalf("DELETE /api/v1/admin/mcp/servers/github = %d: %s", r.Code, r.Body.String())
+	}
+
+	// 6. Admin MCP audit logs filtering.
+	now := time.Now().UTC()
+	_ = st.InsertMCPAuditLog(ctx, store.MCPAuditLog{ID: "ml-1", CreatedAt: now, Subject: "bob@example.com", ServerName: "yaml-docs", Method: "tools/call", ToolName: "search", Status: "ok", LatencyMS: 22})
+	_ = st.InsertMCPAuditLog(ctx, store.MCPAuditLog{ID: "ml-2", CreatedAt: now.Add(time.Second), Subject: "bob@example.com", ServerName: "yaml-docs", Method: "tools/call", ToolName: "delete", Status: "denied", LatencyMS: 2})
+
+	recLogs := doAPIRequest(h, adminPrincipal(), http.MethodGet, "/api/v1/admin/mcp/logs?server=yaml-docs&status=denied&tool=delete", "", nil)
+	if recLogs.Code != http.StatusOK || !strings.Contains(recLogs.Body.String(), `"ml-2"`) || strings.Contains(recLogs.Body.String(), `"ml-1"`) {
+		t.Fatalf("GET /api/v1/admin/mcp/logs = %d: %s", recLogs.Code, recLogs.Body.String())
+	}
 }

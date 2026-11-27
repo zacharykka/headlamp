@@ -341,3 +341,145 @@ export interface WebhookTestResult {
   latency_ms: number;
   message: string;
 }
+
+/* ==================== M3: TEAM CHAT & MCP GATEWAY ==================== */
+
+export interface MCPToolDescriptor {
+  name: string;
+  description?: string;
+}
+
+export interface ChatModelOption {
+  id: string;
+  provider: string;
+  provider_type: string;
+  is_alias: boolean;
+}
+
+export interface ChatMCPServerOption {
+  name: string;
+  transport: 'streamable_http' | 'sse' | string;
+  enabled: boolean;
+  tools?: MCPToolDescriptor[] | null;
+  error?: string;
+}
+
+export interface ChatSession {
+  id: string;
+  title: string;
+  model: string;
+  mcp_servers?: string[] | null;
+  system_prompt?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChatToolEvent {
+  id: string;
+  server: string;
+  tool: string;
+  arguments?: unknown;
+  result?: string;
+  is_error?: boolean;
+  duration_ms?: number;
+}
+
+export interface ChatMessage {
+  id: string;
+  session_id: string;
+  role: 'user' | 'assistant' | string;
+  content: string;
+  tool_events?: ChatToolEvent[] | null;
+  model?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  cost_usd?: number;
+  created_at: string;
+}
+
+export interface ChatSessionDetailResponse {
+  session: ChatSession;
+  messages?: ChatMessage[] | null;
+}
+
+export interface ChatSessionCreatePayload {
+  title?: string;
+  model: string;
+  mcp_servers?: string[];
+  system_prompt?: string;
+}
+
+export interface ChatSessionUpdatePayload {
+  title?: string;
+  model?: string;
+  mcp_servers?: string[];
+  system_prompt?: string;
+}
+
+export interface ChatSendMessagePayload {
+  content: string;
+  model?: string;
+  mcp_servers?: string[];
+}
+
+export type MCPTransportType = 'streamable_http' | 'sse';
+export type MCPAuthType = 'none' | 'bearer' | 'header' | 'basic';
+
+export interface MCPServerItem {
+  name: string;
+  url: string;
+  transport: MCPTransportType | string;
+  auth_type: MCPAuthType | string;
+  auth_header?: string;
+  has_auth_token: boolean;
+  auth_token_preview?: string;
+  enabled: boolean;
+  source: string;
+  updated_at: string;
+}
+
+export interface MCPServerUpsertPayload {
+  name: string;
+  url: string;
+  transport: MCPTransportType | string;
+  auth_type: MCPAuthType | string;
+  auth_header?: string;
+  auth_token?: string;
+  clear_auth_token?: boolean;
+  enabled: boolean;
+}
+
+export interface MCPServerTestResult {
+  ok: boolean;
+  latency_ms: number;
+  message: string;
+  tools?: MCPToolDescriptor[] | null;
+}
+
+export type MCPAuditStatus = 'ok' | 'denied' | 'blocked' | 'error';
+
+export interface MCPAuditLog {
+  id: string;
+  created_at: string;
+  request_id: string;
+  subject: string;
+  display_name: string;
+  node_name: string;
+  node_ip: string;
+  server_name: string;
+  method: string;
+  tool_name: string;
+  status: MCPAuditStatus | string;
+  latency_ms: number;
+  error_message: string;
+  arguments_preview: string;
+}
+
+export interface MCPAuditFilter {
+  server?: string;
+  subject?: string;
+  tool?: string;
+  status?: string;
+  limit?: number;
+  offset?: number;
+}

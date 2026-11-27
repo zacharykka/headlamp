@@ -71,6 +71,9 @@ storage:
   # Supported drivers: sqlite | postgres
   driver: sqlite
   dsn: "./data/headlamp.db"
+  # For multi-replica HA deployments with PostgreSQL (pure-Go pgx driver, zero CGO):
+  # driver: postgres
+  # dsn: "postgres://headlamp:${HEADLAMP_PG_PASSWORD}@127.0.0.1:5432/headlamp?sslmode=disable"
 
 providers:
   - name: anthropic
@@ -164,6 +167,22 @@ webhooks:
   #     - upstream.error
   #   timeout_ms: 2000
   #   fail_open: true
+
+# Optional remote MCP servers proxied at /mcp/<name> and callable from Team Web Chat.
+# Upstream auth_token is encrypted at rest with AES-256-GCM; callers are authorized via
+# Headscale/Tailscale `mcp_tools` grants ("<server>/<tool>" glob patterns).
+mcp_servers:
+  # - name: docs
+  #   url: "https://mcp-docs.internal.example.com/mcp"
+  #   transport: streamable_http # streamable_http | sse
+  #   auth_type: bearer          # none | bearer | header | basic
+  #   auth_token: "${DOCS_MCP_TOKEN}"
+  # - name: github
+  #   url: "https://mcp-github.internal.example.com/sse"
+  #   transport: sse
+  #   auth_type: header
+  #   auth_header: "X-API-Key"
+  #   auth_token: "${GITHUB_MCP_KEY}"
 
 audit:
   # Privacy-minimal default: metadata in usage_logs only, full payloads disabled.

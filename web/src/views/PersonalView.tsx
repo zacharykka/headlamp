@@ -20,7 +20,7 @@ import {
 } from '../lib/format';
 import type { MeResponse, MeUsageResponse, TimeWindow } from '../types/api';
 
-type ToolTab = 'claude' | 'openai' | 'gemini' | 'cursor';
+type ToolTab = 'claude' | 'openai' | 'gemini' | 'cursor' | 'mcp';
 
 interface PersonalViewProps {
   me: MeResponse;
@@ -50,6 +50,7 @@ export function PersonalView({ me }: PersonalViewProps) {
   const [windowRange, setWindowRange] = useState<TimeWindow>('7d');
   const [metric, setMetric] = useState<ChartMetric>('cost_usd');
   const [usage, setUsage] = useState<MeUsageResponse | null>(null);
+  const [mcpServerName, setMcpServerName] = useState<string>('docs');
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -64,6 +65,14 @@ export function PersonalView({ me }: PersonalViewProps) {
         if (controller.signal.aborted) return;
         setError(err instanceof Error ? err.message : 'Failed to load personal usage');
       });
+    api
+      .listChatMCPServers({ signal: controller.signal })
+      .then((servers) => {
+        if (!controller.signal.aborted && servers[0]?.name) {
+          setMcpServerName(servers[0].name);
+        }
+      })
+      .catch(() => {});
     return () => controller.abort();
   }, [windowRange]);
 
@@ -145,8 +154,33 @@ export function PersonalView({ me }: PersonalViewProps) {
           `}`,
         ].join('\n'),
       },
+      mcp: {
+        label: 'MCP Clients · Claude Code & ~/.cursor/mcp.json',
+        code: [
+          `# Register Headlamp remote MCP proxy in Claude Code`,
+          isStaticToken
+            ? `claude mcp add --transport http ${mcpServerName} "${origin}/mcp/${mcpServerName}" \\`
+            : `claude mcp add --transport http ${mcpServerName} "${origin}/mcp/${mcpServerName}"`,
+          ...(isStaticToken
+            ? [`  --header "Authorization: Bearer ${sampleKey}"`]
+            : []),
+          ``,
+          `# ~/.cursor/mcp.json snippet:`,
+          `{`,
+          `  "mcpServers": {`,
+          `    "${mcpServerName}": {`,
+          `      "url": "${origin}/mcp/${mcpServerName}"${
+            isStaticToken
+              ? `,\n      "headers": { "Authorization": "Bearer ${sampleKey}" }`
+              : ''
+          }`,
+          `    }`,
+          `  }`,
+          `}`,
+        ].join('\n'),
+      },
     };
-  }, [origin, allowModels, isStaticToken, sampleKey]);
+  }, [origin, allowModels, isStaticToken, sampleKey, mcpServerName]);
 
   const summary = usage?.summary;
   const logs = usage?.logs ?? [];
@@ -201,9 +235,10 @@ export function PersonalView({ me }: PersonalViewProps) {
               onChange={setToolTab}
               options={[
                 { value: 'claude', label: 'Claude Code' },
-                { value: 'openai', label: 'Codex / OpenAI SDK' },
+                { value: 'openai', label: 'Codex / OpenAI' },
                 { value: 'gemini', label: 'Gemini CLI' },
                 { value: 'cursor', label: 'Cursor / IDE' },
+                { value: 'mcp', label: 'MCP Clients' },
               ]}
             />
           </div>

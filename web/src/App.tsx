@@ -4,6 +4,7 @@ import {
   AlertIcon,
   BookIcon,
   ChartBarIcon,
+  ChatBubbleIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   CloseIcon,
@@ -22,6 +23,8 @@ import {
   BudgetsAccessView,
   type BudgetsFocusState,
 } from './views/BudgetsAccessView';
+import { ChatView } from './views/ChatView';
+import { MCPView, type MCPFocusState } from './views/MCPView';
 import { OverviewView } from './views/OverviewView';
 import { PersonalView } from './views/PersonalView';
 import { RoutingView, type RoutingFocusState } from './views/RoutingView';
@@ -33,8 +36,11 @@ export type NavKey =
   | 'providers'
   | 'routes'
   | 'budgets'
+  | 'mcp_servers'
+  | 'mcp_audit'
   | 'guardrails'
   | 'webhooks'
+  | 'chat'
   | 'quickstart';
 
 type GroupKey = 'telemetry' | 'security' | 'admin' | 'developer';
@@ -43,6 +49,7 @@ interface SidebarCounts {
   providers: number;
   routes: number;
   budgets: number;
+  mcpServers: number;
   rules: number;
   webhooks: number;
 }
@@ -50,7 +57,15 @@ interface SidebarCounts {
 function groupForNav(nav: NavKey): GroupKey | null {
   if (nav === 'overview') return 'telemetry';
   if (nav === 'logs' || nav === 'guardrails' || nav === 'webhooks') return 'security';
-  if (nav === 'providers' || nav === 'routes' || nav === 'budgets') return 'admin';
+  if (
+    nav === 'providers' ||
+    nav === 'routes' ||
+    nav === 'budgets' ||
+    nav === 'mcp_servers' ||
+    nav === 'mcp_audit'
+  ) {
+    return 'admin';
+  }
   return null;
 }
 
@@ -87,6 +102,7 @@ export function App() {
     providers: 0,
     routes: 0,
     budgets: 0,
+    mcpServers: 0,
     rules: 0,
     webhooks: 0,
   });
@@ -95,6 +111,9 @@ export function App() {
     section: 'providers',
   });
   const [budgetsFocus, setBudgetsFocus] = useState<BudgetsFocusState>({});
+  const [mcpFocus, setMcpFocus] = useState<MCPFocusState>({
+    section: 'servers',
+  });
   const [logsFocus, setLogsFocus] = useState<LogsFocusState>({});
   const [securityFocus, setSecurityFocus] = useState<SecurityFocusState>({
     section: 'guardrails',
@@ -106,19 +125,21 @@ export function App() {
       .then((res) => {
         setMe(res);
         if (!res.is_admin) {
-          setActiveNav('quickstart');
+          setActiveNav('chat');
         } else {
           void Promise.all([
             api.listProviders().catch(() => []),
             api.listRoutes().catch(() => []),
             api.listBudgets().catch(() => []),
+            api.listAdminMCPServers().catch(() => []),
             api.listGuardrails().catch(() => []),
             api.listWebhooks().catch(() => []),
-          ]).then(([p, r, b, g, w]) => {
+          ]).then(([p, r, b, m, g, w]) => {
             setCounts({
               providers: p.length,
               routes: r.length,
               budgets: b.length,
+              mcpServers: m.length,
               rules: g.length,
               webhooks: w.length,
             });
@@ -201,6 +222,10 @@ export function App() {
       setRoutingFocus({ section: 'providers', nonce: Date.now() });
     } else if (next === 'routes') {
       setRoutingFocus({ section: 'routes', nonce: Date.now() });
+    } else if (next === 'mcp_servers') {
+      setMcpFocus({ section: 'servers', nonce: Date.now() });
+    } else if (next === 'mcp_audit') {
+      setMcpFocus({ section: 'audit', nonce: Date.now() });
     } else if (next === 'guardrails') {
       setSecurityFocus({ section: 'guardrails', nonce: Date.now() });
     } else if (next === 'webhooks') {
@@ -222,7 +247,10 @@ export function App() {
     ? `${me.principal.node_name}${me.principal.node_ip ? ` · ${me.principal.node_ip}` : ''}`
     : me.principal.node_ip || me.principal.auth_source;
 
-  const isQuickstartView = !me.is_admin || activeNav === 'quickstart';
+  const isChatView = activeNav === 'chat';
+  const isQuickstartView =
+    activeNav === 'quickstart' || (!me.is_admin && activeNav !== 'chat');
+  const isAdminConsoleView = me.is_admin && !isChatView && !isQuickstartView;
   const activeGroup = groupForNav(activeNav);
 
   return (
@@ -248,7 +276,7 @@ export function App() {
           <button
             type="button"
             className="ap-brand-btn"
-            onClick={() => navigate(me.is_admin ? 'overview' : 'quickstart')}
+            onClick={() => navigate(me.is_admin ? 'overview' : 'chat')}
           >
             <HeadlampMark size={22} />
             <span className="ap-brand-wordmark">headlamp</span>
@@ -425,6 +453,27 @@ export function App() {
                           <span className="ap-nav-count">{counts.budgets}</span>
                         )}
                       </button>
+                      <button
+                        type="button"
+                        className="ap-nav-item"
+                        tabIndex={openGroups.admin ? 0 : -1}
+                        data-active={activeNav === 'mcp_servers'}
+                        onClick={() => navigate('mcp_servers')}
+                      >
+                        <span>MCP Servers</span>
+                        {counts.mcpServers > 0 && (
+                          <span className="ap-nav-count">{counts.mcpServers}</span>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        className="ap-nav-item"
+                        tabIndex={openGroups.admin ? 0 : -1}
+                        data-active={activeNav === 'mcp_audit'}
+                        onClick={() => navigate('mcp_audit')}
+                      >
+                        <span>MCP Audit</span>
+                      </button>
                     </div>
                   </div>
                 </div>
@@ -474,16 +523,27 @@ export function App() {
               </div>
             </>
           ) : (
-            <div className="ap-nav-group">
+            <div className="ap-nav-group" style={{ gap: 3 }}>
               <button
                 type="button"
                 className="ap-nav-item ap-nav-item--top"
-                data-active={true}
+                data-active={activeNav === 'chat'}
+                onClick={() => navigate('chat')}
+              >
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 9 }}>
+                  <ChatBubbleIcon size={16} />
+                  <span>Team Chat</span>
+                </span>
+              </button>
+              <button
+                type="button"
+                className="ap-nav-item ap-nav-item--top"
+                data-active={activeNav === 'quickstart'}
                 onClick={() => navigate('quickstart')}
               >
                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 9 }}>
                   <TerminalIcon size={16} />
-                  <span>Quickstart & My Usage</span>
+                  <span>My Usage & SDKs</span>
                 </span>
               </button>
             </div>
@@ -492,29 +552,48 @@ export function App() {
 
         <div className="ap-sidebar-footer">
           {me.is_admin && (
-            <div className="ap-mode-switch-wrap">
-              <button
-                type="button"
-                className="ap-mode-switch-btn"
-                onClick={() =>
-                  navigate(isQuickstartView ? 'overview' : 'quickstart')
-                }
-              >
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 9 }}>
-                  {isQuickstartView ? (
-                    <>
-                      <GearIcon size={16} />
-                      <span>Admin console</span>
-                    </>
-                  ) : (
-                    <>
-                      <TerminalIcon size={16} />
-                      <span>Quickstart & SDKs</span>
-                    </>
-                  )}
-                </span>
-                <ChevronRightIcon size={13} />
-              </button>
+            <div className="ap-mode-switch-wrap" style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+              {!isChatView && (
+                <button
+                  type="button"
+                  className="ap-mode-switch-btn"
+                  onClick={() => navigate('chat')}
+                >
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 9 }}>
+                    <ChatBubbleIcon size={16} />
+                    <span>Team Chat</span>
+                  </span>
+                  <ChevronRightIcon size={13} />
+                </button>
+              )}
+
+              {!isQuickstartView && (
+                <button
+                  type="button"
+                  className="ap-mode-switch-btn"
+                  onClick={() => navigate('quickstart')}
+                >
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 9 }}>
+                    <TerminalIcon size={16} />
+                    <span>Quickstart & SDKs</span>
+                  </span>
+                  <ChevronRightIcon size={13} />
+                </button>
+              )}
+
+              {!isAdminConsoleView && (
+                <button
+                  type="button"
+                  className="ap-mode-switch-btn"
+                  onClick={() => navigate('overview')}
+                >
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 9 }}>
+                    <GearIcon size={16} />
+                    <span>Admin console</span>
+                  </span>
+                  <ChevronRightIcon size={13} />
+                </button>
+              )}
             </div>
           )}
 
@@ -558,7 +637,7 @@ export function App() {
           <span className="ap-badge ap-mono">{displayName}</span>
         </div>
 
-        {me.is_admin && !bannerDismissed && (
+        {me.is_admin && !bannerDismissed && !isChatView && (
           <div className="ap-info-banner">
             <div className="ap-info-banner-body">
               <SparkleIcon
@@ -601,7 +680,9 @@ export function App() {
         )}
 
         <main style={{ flex: 1, minWidth: 0 }}>
-          {isQuickstartView ? (
+          {isChatView ? (
+            <ChatView />
+          ) : isQuickstartView ? (
             <PersonalView me={me} />
           ) : activeNav === 'overview' ? (
             <OverviewView
@@ -625,6 +706,16 @@ export function App() {
               focus={budgetsFocus}
               onCountChange={(budgets) =>
                 setCounts((prev) => ({ ...prev, budgets }))
+              }
+            />
+          ) : activeNav === 'mcp_servers' || activeNav === 'mcp_audit' ? (
+            <MCPView
+              focus={mcpFocus}
+              onSectionChange={(sec) =>
+                setActiveNav(sec === 'audit' ? 'mcp_audit' : 'mcp_servers')
+              }
+              onCountChange={(mcpServers) =>
+                setCounts((prev) => ({ ...prev, mcpServers }))
               }
             />
           ) : activeNav === 'logs' ? (

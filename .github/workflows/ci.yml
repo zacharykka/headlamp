@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install web dependencies
+        run: npm --prefix web ci
+
+      - name: Run web tests
+        run: npm --prefix web test
+
+      - name: Build embedded web bundle
+        run: npm --prefix web run build
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run Go race tests
+        run: go test -race -count=1 ./...
+
+      - name: Verify static single-binary build
+        run: CGO_ENABLED=0 go build -trimpath -o ./bin/headlamp ./cmd/headlamp
