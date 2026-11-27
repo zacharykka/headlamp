@@ -672,8 +672,12 @@ func TestService_UpstreamErrors403And429PropagateAsSSEError(t *testing.T) {
 			t.Fatalf("expected SSE error event on 403, got %v", events)
 		}
 		msgs, _ := st.ListChatMessages(ctx, p.Subject, sess.ID)
-		if len(msgs) != 1 { // only user message persisted, no empty assistant message
-			t.Fatalf("expected 1 persisted message on 403 error, got %d", len(msgs))
+		if _, canDelete := any(st).(messageDeleter); canDelete {
+			if len(msgs) != 0 {
+				t.Fatalf("expected orphan user message rolled back on 403 error, got %d messages", len(msgs))
+			}
+		} else if len(msgs) != 1 {
+			t.Fatalf("expected 1 persisted message on 403 error without deleter, got %d", len(msgs))
 		}
 	})
 
@@ -821,4 +825,620 @@ func (w *callbackResponseWriter) Write(p []byte) (int, error) {
 
 func (w *callbackResponseWriter) Flush() {
 	w.ResponseRecorder.Flush()
+}
+
+type stubGuardrailInspector struct {
+	fn func(ctx context.Context, text string) (action, redacted, reason string, err error)
+}
+
+func (s stubGuardrailInspector) InspectText(ctx context.Context, text string) (string, string, string, error) {
+	return s.fn(ctx, text)
+}
+
+// rollbackTestStore wraps a store.Store and provides in-memory filtered DeleteChatMessage
+// tracking so Round-0 rollback tests work deterministically regardless of backing store.
+type rollbackTestStore struct {
+	store.Store
+	mu      sync.Mutex
+	deleted map[string]bool
+}
+
+func newRollbackTestStore(inner store.Store) *rollbackTestStore {
+	return &rollbackTestStore{
+		Store:   inner,
+		deleted: make(map[string]bool),
+	}
+}
+
+func (w *rollbackTestStore) DeleteChatMessage(ctx context.Context, subject, sessionID, messageID string) error {
+	w.mu.Lock()
+	w.deleted[messageID] = true
+	w.mu.Unlock()
+	if del, ok := w.Store.(messageDeleter); ok {
+		return del.DeleteChatMessage(ctx, subject, sessionID, messageID)
+	}
+	return nil
+}
+
+func (w *rollbackTestStore) ListChatMessages(ctx context.Context, subject, sessionID string) ([]store.ChatMessage, error) {
+	msgs, err := w.Store.ListChatMessages(ctx, subject, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := make([]store.ChatMessage, 0, len(msgs))
+	for _, m := range msgs {
+		if !w.deleted[m.ID] {
+			out = append(out, m)
+		}
+	}
+	return out, nil
+}
+
+func TestService_GuardrailPreCheckBlockRedactAndRound0Rollback(t *testing.T) {
+	ctx := context.Background()
+	baseStore := newTestStore(t)
+	st := newRollbackTestStore(baseStore)
+
+	var gatewayCalls atomic.Int32
+	var lastGatewayBody atomic.Value
+	var forceStatus atomic.Int32
+
+	mockGateway := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gatewayCalls.Add(1)
+		raw, _ := io.ReadAll(r.Body)
+		lastGatewayBody.Store(string(raw))
+
+		if code := int(forceStatus.Load()); code != 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(code)
+			_, _ = fmt.Fprintf(w, `{"error":{"type":"webhook_blocked","message":"blocked by sync_review"}}`)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"id\":\"cmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Safe reply\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+
+	inspector := stubGuardrailInspector{
+		fn: func(ctx context.Context, text string) (string, string, string, error) {
+			if strings.Contains(text, "BLOCK_SECRET") {
+				return "block", "", "detected prohibited API key", nil
+			}
+			if strings.Contains(text, "REDACT_PII") {
+				return "redact", strings.ReplaceAll(text, "REDACT_PII", "[REDACTED]"), "", nil
+			}
+			return "allow", text, "", nil
+		},
+	}
+
+	svc, err := NewService(Config{
+		Store:      st,
+		Gateway:    mockGateway,
+		Guardrails: inspector,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	alice := makePrincipal("alice@example.com", []string{"*"}, nil)
+	sess, err := st.CreateChatSession(ctx, store.ChatSession{
+		ID:      "sess-guard-1",
+		Subject: alice.Subject,
+		Title:   "New Chat",
+		Model:   "openai/gpt-4.1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Blocked message must NOT hit gateway, must NOT persist to chat_messages, and must NOT pollute session title.
+	rec1 := httptest.NewRecorder()
+	if err := svc.StreamMessage(ctx, rec1, alice, sess.ID, SendMessageRequest{Content: "My key is BLOCK_SECRET"}); err != nil {
+		t.Fatalf("StreamMessage(block) returned error: %v", err)
+	}
+	if gatewayCalls.Load() != 0 {
+		t.Fatalf("blocked message must not invoke gateway, got %d calls", gatewayCalls.Load())
+	}
+	events1 := parseSSEFrames(t, rec1.Body.Bytes())
+	if len(events1) != 1 || events1[0].Event != "error" || !strings.Contains(string(events1[0].Data), "detected prohibited API key") {
+		t.Fatalf("expected single guardrail SSE error event, got %+v", events1)
+	}
+	msgs, _ := st.ListChatMessages(ctx, alice.Subject, sess.ID)
+	if len(msgs) != 0 {
+		t.Fatalf("blocked user message must not be persisted, got %d messages", len(msgs))
+	}
+	sessAfterBlock, _ := st.GetChatSession(ctx, alice.Subject, sess.ID)
+	if sessAfterBlock.Title != "New Chat" {
+		t.Fatalf("session title must not be derived from blocked secret, got %q", sessAfterBlock.Title)
+	}
+
+	// 2. Round-0 gateway block (e.g. 403 from sync_review webhook) must roll back orphaned user message.
+	forceStatus.Store(http.StatusForbidden)
+	rec2 := httptest.NewRecorder()
+	if err := svc.StreamMessage(ctx, rec2, alice, sess.ID, SendMessageRequest{Content: "trigger webhook block"}); err != nil {
+		t.Fatalf("StreamMessage(403) returned error: %v", err)
+	}
+	msgs, _ = st.ListChatMessages(ctx, alice.Subject, sess.ID)
+	if len(msgs) != 0 {
+		t.Fatalf("Round-0 403 must roll back orphaned user message, got %d messages", len(msgs))
+	}
+	events2 := parseSSEFrames(t, rec2.Body.Bytes())
+	foundErr := false
+	for _, ev := range events2 {
+		if ev.Event == "error" && strings.Contains(string(ev.Data), "blocked by sync_review") {
+			foundErr = true
+		}
+	}
+	if !foundErr {
+		t.Fatalf("expected SSE error from sync_review block, got %+v", events2)
+	}
+
+	// 3. Redacted message persists redacted text and forwards redacted text to gateway (and session is NOT poisoned!).
+	forceStatus.Store(0)
+	// Reset title to verify auto-title uses redacted text.
+	sess.Title = "New Chat"
+	_, _ = st.UpdateChatSession(ctx, alice.Subject, *sess)
+
+	rec3 := httptest.NewRecorder()
+	if err := svc.StreamMessage(ctx, rec3, alice, sess.ID, SendMessageRequest{Content: "Help with REDACT_PII please"}); err != nil {
+		t.Fatalf("StreamMessage(redact) returned error: %v", err)
+	}
+	msgs, _ = st.ListChatMessages(ctx, alice.Subject, sess.ID)
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 persisted messages after redacted turn, got %d", len(msgs))
+	}
+	if msgs[0].Content != "Help with [REDACTED] please" {
+		t.Errorf("persisted user content = %q, want redacted content", msgs[0].Content)
+	}
+	if strings.Contains(lastGatewayBody.Load().(string), "REDACT_PII") {
+		t.Errorf("gateway received raw secret instead of redacted text: %s", lastGatewayBody.Load().(string))
+	}
+	sessAfterRedact, _ := st.GetChatSession(ctx, alice.Subject, sess.ID)
+	if strings.Contains(sessAfterRedact.Title, "REDACT_PII") {
+		t.Errorf("session title leaked unredacted secret: %q", sessAfterRedact.Title)
+	}
+}
+
+func TestBuildGeminiContents_MergesConsecutiveSameRoleTurns(t *testing.T) {
+	history := []store.ChatMessage{
+		{Role: "user", Content: "first attempt"},
+		{Role: "assistant", Content: ""}, // empty assistant turn skipped -> adjacent users!
+		{Role: "user", Content: "second attempt"},
+		{Role: "assistant", Content: "reply part 1"},
+		{Role: "assistant", Content: "reply part 2"},
+	}
+
+	contents := buildGeminiContents(history, "third prompt")
+	if len(contents) != 3 {
+		t.Fatalf("expected 3 alternating Gemini turns, got %d: %+v", len(contents), contents)
+	}
+	if contents[0].Role != "user" || len(contents[0].Parts) != 2 ||
+		contents[0].Parts[0].Text != "first attempt" || contents[0].Parts[1].Text != "second attempt" {
+		t.Errorf("turn 0 mismatch: %+v", contents[0])
+	}
+	if contents[1].Role != "model" || len(contents[1].Parts) != 2 ||
+		contents[1].Parts[0].Text != "reply part 1" || contents[1].Parts[1].Text != "reply part 2" {
+		t.Errorf("turn 1 mismatch: %+v", contents[1])
+	}
+	if contents[2].Role != "user" || len(contents[2].Parts) != 1 || contents[2].Parts[0].Text != "third prompt" {
+		t.Errorf("turn 2 mismatch: %+v", contents[2])
+	}
+
+	// Trailing orphaned user message in history merges with the new userPrompt.
+	orphanHistory := []store.ChatMessage{
+		{Role: "user", Content: "orphaned user message"},
+	}
+	merged := buildGeminiContents(orphanHistory, "retry message")
+	if len(merged) != 1 || merged[0].Role != "user" || len(merged[0].Parts) != 2 {
+		t.Fatalf("expected trailing orphan user merged with new prompt, got %+v", merged)
+	}
+}
+
+func TestSanitizeGeminiSchema_PropertiesPreservedAndRefInlining(t *testing.T) {
+	raw := json.RawMessage(`{
+		"$schema": "https://json-schema.org/draft/2020-12/schema",
+		"type": "object",
+		"additionalProperties": false,
+		"$defs": {
+			"Repo": {
+				"type": "object",
+				"additionalProperties": false,
+				"properties": {
+					"owner": {"type": "string", "default": "acme"},
+					"default": {"type": "boolean", "default": true}
+				},
+				"required": ["owner", "default"]
+			},
+			"CycleNode": {
+				"type": "object",
+				"properties": {
+					"name": {"type": "string"},
+					"child": {"$ref": "#/$defs/CycleNode"}
+				}
+			}
+		},
+		"definitions": {
+			"Mode": {"type": "string", "enum": ["fast", "deep"]}
+		},
+		"properties": {
+			"default": {"type": "string", "default": "main", "description": "Default branch"},
+			"definitions": {"type": "array", "items": {"type": "string"}},
+			"primary": {"$ref": "#/$defs/Repo", "description": "Primary repo"},
+			"secondary": {"$ref": "#/$defs/Repo"},
+			"mode": {"$ref": "#/definitions/Mode"},
+			"tree": {"$ref": "#/$defs/CycleNode"},
+			"dangling": {"$ref": "#/$defs/DoesNotExist"}
+		},
+		"required": ["default", "definitions", "primary"]
+	}`)
+
+	cleanedAny := sanitizeGeminiSchema(raw)
+	cleaned, ok := cleanedAny.(map[string]any)
+	if !ok {
+		t.Fatalf("expected map[string]any, got %T", cleanedAny)
+	}
+
+	// Verify unsupported schema keywords stripped at root.
+	for _, forbidden := range []string{"$schema", "additionalProperties", "$defs", "definitions"} {
+		if _, exists := cleaned[forbidden]; exists {
+			t.Errorf("forbidden keyword %q remained at root schema", forbidden)
+		}
+	}
+
+	// Verify no "$ref" remains anywhere in serialized output.
+	encoded, err := json.Marshal(cleaned)
+	if err != nil {
+		t.Fatalf("marshal cleaned schema: %v", err)
+	}
+	if strings.Contains(string(encoded), `"$ref"`) {
+		t.Fatalf("dangling $ref remained in cleaned schema: %s", string(encoded))
+	}
+
+	props := cleaned["properties"].(map[string]any)
+
+	// Parameter named "default" MUST remain in properties, while its inner schema keyword "default":"main" is stripped.
+	defaultProp, ok := props["default"].(map[string]any)
+	if !ok {
+		t.Fatalf("property named \"default\" was wrongly stripped! props=%v", props)
+	}
+	if defaultProp["type"] != "string" || defaultProp["description"] != "Default branch" {
+		t.Errorf("unexpected default property schema: %v", defaultProp)
+	}
+	if _, hasDefaultKeyword := defaultProp["default"]; hasDefaultKeyword {
+		t.Errorf("inner schema keyword \"default\" should have been stripped: %v", defaultProp)
+	}
+
+	// Parameter named "definitions" MUST remain in properties.
+	if _, ok := props["definitions"].(map[string]any); !ok {
+		t.Fatalf("property named \"definitions\" was wrongly stripped! props=%v", props)
+	}
+
+	// Both shared $ref usages ("primary" and "secondary") must be fully inlined (DAG, not treated as cycle).
+	for _, field := range []string{"primary", "secondary"} {
+		repoObj, ok := props[field].(map[string]any)
+		if !ok || repoObj["type"] != "object" {
+			t.Fatalf("%s $ref was not inlined into object schema: %v", field, props[field])
+		}
+		repoProps := repoObj["properties"].(map[string]any)
+		if _, hasDefault := repoProps["default"]; !hasDefault {
+			t.Errorf("%s inlined repo lost property named \"default\": %v", field, repoProps)
+		}
+	}
+	if props["primary"].(map[string]any)["description"] != "Primary repo" {
+		t.Errorf("sibling description alongside $ref was not preserved: %v", props["primary"])
+	}
+
+	// #/definitions/Mode inlined.
+	modeObj := props["mode"].(map[string]any)
+	if modeObj["type"] != "string" || len(modeObj["enum"].([]any)) != 2 {
+		t.Errorf("mode #/definitions/Mode was not inlined: %v", modeObj)
+	}
+
+	// Cyclic $ref terminated safely with {"type":"string"}.
+	treeObj := props["tree"].(map[string]any)
+	treeChild := treeObj["properties"].(map[string]any)["child"].(map[string]any)
+	if treeChild["type"] != "string" {
+		t.Errorf("cyclic $ref fallback = %v, want type=string", treeChild)
+	}
+
+	// Unresolvable $ref fell back safely to {"type":"string"}.
+	danglingObj := props["dangling"].(map[string]any)
+	if danglingObj["type"] != "string" {
+		t.Errorf("unresolvable $ref fallback = %v, want type=string", danglingObj)
+	}
+}
+
+func TestService_GeminiPreservesThoughtAndThoughtSignatureAcrossToolRounds(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	var round atomic.Int32
+	var round2Contents []geminiContent
+
+	fakeGemini := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Contents []geminiContent `json:"contents"`
+			Tools    []map[string]any `json:"tools"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+
+		cur := round.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if cur == 1 {
+			decls := payload.Tools[0]["functionDeclarations"].([]any)
+			fnName := decls[0].(map[string]any)["name"].(string)
+			// Gemini 2.5/3 thinking turn: thought part + thoughtSignature + functionCall with thoughtSignature.
+			chunk := fmt.Sprintf(`{"candidates":[{"content":{"role":"model","parts":[{"text":"Internal reasoning...","thought":true,"thoughtSignature":"sig_thought_abc"},{"functionCall":{"name":%q,"args":{"default":"main"}},"thoughtSignature":"sig_fc_xyz"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":10,"thoughtsTokenCount":25,"totalTokenCount":135}}`, fnName)
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", chunk)
+			return
+		}
+
+		round2Contents = payload.Contents
+		chunk := `{"candidates":[{"content":{"role":"model","parts":[{"text":"Branch main is healthy."}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":140,"candidatesTokenCount":12,"totalTokenCount":152}}`
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", chunk)
+	}))
+	defer fakeGemini.Close()
+
+	if err := st.UpsertProvider(ctx, store.Provider{
+		Name:    "gemini",
+		Type:    config.ProviderTypeGemini,
+		BaseURL: fakeGemini.URL,
+		APIKey:  "gem-key",
+		Models:  []string{"gemini-2.5-pro"},
+		Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ev := policy.NewEvaluator()
+	gw, err := proxy.NewGateway(proxy.GatewayConfig{Store: st, Authorizer: ev})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcpMock := &mockMCPBridge{
+		servers: []ServerTools{{
+			Name:    "git",
+			Enabled: true,
+			Tools: []ToolSpec{{
+				Server:      "git",
+				Name:        "branch_status",
+				Description: "Check branch status",
+				InputSchema: json.RawMessage(`{"type":"object","properties":{"default":{"type":"string"}},"required":["default"]}`),
+			}},
+		}},
+		callFn: func(ctx context.Context, p *auth.Principal, serverName, toolName string, args json.RawMessage) (*ToolResult, error) {
+			return &ToolResult{Result: "ok", DurationMS: 3}, nil
+		},
+	}
+
+	svc, err := NewService(Config{Store: st, Authorizer: ev, Gateway: gw, MCP: mcpMock})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	alice := makePrincipal("alice@example.com", []string{"gemini/*"}, nil)
+	sess, err := st.CreateChatSession(ctx, store.ChatSession{
+		ID:         "sess-gem-think",
+		Subject:    alice.Subject,
+		Model:      "gemini/gemini-2.5-pro",
+		MCPServers: []string{"git"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	if err := svc.StreamMessage(ctx, rec, alice, sess.ID, SendMessageRequest{Content: "Check default branch"}); err != nil {
+		t.Fatalf("StreamMessage failed: %v", err)
+	}
+
+	// Internal thought text MUST NOT leak into user-facing delta SSE or persisted assistant message.
+	if strings.Contains(rec.Body.String(), "Internal reasoning...") {
+		t.Fatalf("thought text leaked into SSE response: %s", rec.Body.String())
+	}
+
+	// Round 2 contents MUST include the model turn with both Thought+ThoughtSignature and FunctionCall+ThoughtSignature.
+	if len(round2Contents) < 3 {
+		t.Fatalf("expected at least 3 turns in round 2 contents, got %+v", round2Contents)
+	}
+	modelTurn := round2Contents[1]
+	if modelTurn.Role != "model" || len(modelTurn.Parts) != 2 {
+		t.Fatalf("expected model turn with 2 preserved parts, got %+v", modelTurn)
+	}
+	if !modelTurn.Parts[0].Thought || modelTurn.Parts[0].ThoughtSignature != "sig_thought_abc" || modelTurn.Parts[0].Text != "Internal reasoning..." {
+		t.Errorf("thought part not preserved verbatim: %+v", modelTurn.Parts[0])
+	}
+	if modelTurn.Parts[1].FunctionCall == nil || modelTurn.Parts[1].ThoughtSignature != "sig_fc_xyz" {
+		t.Errorf("functionCall thoughtSignature not preserved verbatim: %+v", modelTurn.Parts[1])
+	}
+}
+
+func TestService_PerSessionConcurrencyMutexAndCleanup(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	turn1Entered := make(chan struct{})
+	releaseTurn1 := make(chan struct{})
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	var callNum atomic.Int32
+
+	mockGateway := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		curActive := active.Add(1)
+		defer active.Add(-1)
+		for {
+			prev := maxActive.Load()
+			if curActive <= prev || maxActive.CompareAndSwap(prev, curActive) {
+				break
+			}
+		}
+
+		n := callNum.Add(1)
+		if n == 1 {
+			close(turn1Entered)
+			<-releaseTurn1
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "data: {\"id\":\"c-%d\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"reply-%d\"},\"finish_reason\":\"stop\"}]}\n\n", n, n)
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+
+	svc, err := NewService(Config{Store: st, Gateway: mockGateway})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	alice := makePrincipal("alice@example.com", []string{"*"}, nil)
+	sess, err := st.CreateChatSession(ctx, store.ChatSession{
+		ID:      "sess-serial",
+		Subject: alice.Subject,
+		Model:   "openai/gpt-4.1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	errCh := make(chan error, 2)
+
+	go func() {
+		defer wg.Done()
+		errCh <- svc.StreamMessage(ctx, httptest.NewRecorder(), alice, sess.ID, SendMessageRequest{Content: "turn-1"})
+	}()
+
+	<-turn1Entered
+
+	go func() {
+		defer wg.Done()
+		errCh <- svc.StreamMessage(ctx, httptest.NewRecorder(), alice, sess.ID, SendMessageRequest{Content: "turn-2"})
+	}()
+
+	// Give turn 2 a brief window to contend on the session mutex before releasing turn 1.
+	time.Sleep(40 * time.Millisecond)
+	if callNum.Load() != 1 {
+		t.Fatalf("turn 2 entered gateway concurrently with turn 1! calls=%d", callNum.Load())
+	}
+	close(releaseTurn1)
+
+	wg.Wait()
+	close(errCh)
+	for e := range errCh {
+		if e != nil {
+			t.Fatalf("concurrent StreamMessage returned error: %v", e)
+		}
+	}
+
+	if maxActive.Load() != 1 {
+		t.Fatalf("expected max 1 active turn per session, got %d", maxActive.Load())
+	}
+
+	// Messages must be strictly serialized: user1, assistant1, user2, assistant2.
+	msgs, err := st.ListChatMessages(ctx, alice.Subject, sess.ID)
+	if err != nil || len(msgs) != 4 {
+		t.Fatalf("expected 4 serialized messages, got %d (err=%v)", len(msgs), err)
+	}
+	wantSeq := []struct{ role, content string }{
+		{"user", "turn-1"},
+		{"assistant", "reply-1"},
+		{"user", "turn-2"},
+		{"assistant", "reply-2"},
+	}
+	for i, w := range wantSeq {
+		if msgs[i].Role != w.role || msgs[i].Content != w.content {
+			t.Errorf("msg[%d] = (%s, %q), want (%s, %q)", i, msgs[i].Role, msgs[i].Content, w.role, w.content)
+		}
+	}
+
+	// Ref-counted cleanup must leave sessionLocks empty.
+	svc.sessionLocksMu.Lock()
+	remaining := len(svc.sessionLocks)
+	svc.sessionLocksMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("expected sessionLocks map cleaned up to 0 entries, got %d", remaining)
+	}
+}
+
+func TestService_FallbackHeadersDriveCostCalculation(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	for _, p := range []store.Provider{
+		{Name: "openai", Type: config.ProviderTypeOpenAI, BaseURL: "http://127.0.0.1:1", Models: []string{"gpt-4.1"}, Enabled: true},
+		{Name: "anthropic", Type: config.ProviderTypeAnthropic, BaseURL: "http://127.0.0.1:1", Models: []string{"claude-haiku-4-5"}, Enabled: true},
+	} {
+		if err := st.UpsertProvider(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.UpsertModelRoute(ctx, store.ModelRoute{
+		Alias:         "team/smart",
+		ProviderName:  "openai",
+		UpstreamModel: "gpt-4.1",
+		Fallbacks:     []store.RouteTarget{{Provider: "anthropic", Model: "claude-haiku-4-5"}},
+		Enabled:       true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pricing, err := metering.LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate proxy.Gateway falling back from primary openai/gpt-4.1 to anthropic/claude-haiku-4-5
+	// and reporting actual upstream provider/model via X-Headlamp-* headers.
+	mockFallbackGateway := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("X-Headlamp-Provider-Type", config.ProviderTypeAnthropic)
+		w.Header().Set("X-Headlamp-Upstream-Model", "claude-haiku-4-5")
+		_, _ = io.WriteString(w, "data: {\"id\":\"cmpl-fb\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Fallback answer\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1000000,\"completion_tokens\":100000,\"total_tokens\":1100000}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+
+	svc, err := NewService(Config{
+		Store:   st,
+		Pricing: pricing,
+		Gateway: mockFallbackGateway,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	alice := makePrincipal("alice@example.com", []string{"*"}, nil)
+	sess, err := st.CreateChatSession(ctx, store.ChatSession{
+		ID:      "sess-fallback-cost",
+		Subject: alice.Subject,
+		Model:   "team/smart",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	if err := svc.StreamMessage(ctx, rec, alice, sess.ID, SendMessageRequest{Content: "hello"}); err != nil {
+		t.Fatalf("StreamMessage failed: %v", err)
+	}
+
+	msgs, err := st.ListChatMessages(ctx, alice.Subject, sess.ID)
+	if err != nil || len(msgs) != 2 {
+		t.Fatalf("expected 2 messages, got %d (err=%v)", len(msgs), err)
+	}
+
+	usage := metering.Usage{InputTokens: 1_000_000, OutputTokens: 100_000, TotalTokens: 1_100_000}
+	wantFallbackCost := pricing.CalculateCost(config.ProviderTypeAnthropic, "claude-haiku-4-5", usage, nil)
+	primaryCost := pricing.CalculateCost(config.ProviderTypeOpenAI, "gpt-4.1", usage, nil)
+	if wantFallbackCost == primaryCost {
+		t.Fatalf("test assumption invalid: expected distinct prices for haiku (%f) vs gpt-4.1 (%f)", wantFallbackCost, primaryCost)
+	}
+	if msgs[1].CostUSD != wantFallbackCost {
+		t.Fatalf("persisted CostUSD = %.6f, want fallback claude-haiku-4-5 cost %.6f (primary gpt-4.1 would be %.6f)",
+			msgs[1].CostUSD, wantFallbackCost, primaryCost)
+	}
 }

@@ -107,7 +107,92 @@ func NewGateway(cfg GatewayConfig) (*Gateway, error) {
 
 // ServeHTTP dispatches incoming requests across all LLM gateway endpoints.
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if isMutatingMethod(r.Method) {
+		if err := checkSameOriginCSRF(r); err != nil {
+			WriteError(w, ProtocolForPath(r.URL.Path), http.StatusForbidden, "csrf_blocked", err.Error())
+			return
+		}
+	}
 	g.mux.ServeHTTP(w, r)
+}
+
+func isMutatingMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+// checkSameOriginCSRF enforces same-origin validation whenever browser headers
+// (Origin or Sec-Fetch-Site) are present on mutating requests, while leaving
+// non-browser CLI/IDE SDK clients unaffected. Loopback dev-proxy aliases are
+// allowed ONLY when RemoteAddr, Origin, and Host are all strictly loopback.
+func checkSameOriginCSRF(r *http.Request) error {
+	remoteLoopback := isLoopbackRemoteAddr(r.RemoteAddr)
+	hostLoopback := isLoopbackHost(r.Host)
+	loopbackDevEligible := remoteLoopback && hostLoopback
+
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host == "" {
+			return fmt.Errorf("invalid Origin header %q", origin)
+		}
+		if !strings.EqualFold(u.Host, r.Host) {
+			if !(loopbackDevEligible && isLoopbackHost(u.Hostname())) {
+				return fmt.Errorf("cross-origin request blocked (origin=%q, host=%q)", u.Host, r.Host)
+			}
+		}
+	}
+
+	if sfs := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); sfs != "" {
+		switch sfs {
+		case "same-origin", "none":
+		case "same-site":
+			if !loopbackDevEligible {
+				return fmt.Errorf("cross-site request blocked (Sec-Fetch-Site=%q)", sfs)
+			}
+		default:
+			return fmt.Errorf("cross-site request blocked (Sec-Fetch-Site=%q)", sfs)
+		}
+	}
+	return nil
+}
+
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	host := strings.TrimSpace(remoteAddr)
+	if host == "" {
+		return false
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return addr.Unmap().IsLoopback()
+}
+
+func isLoopbackHost(hostport string) bool {
+	host := strings.TrimSpace(hostport)
+	if host == "" {
+		return false
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if host == "localhost" {
+		return true
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return addr.Unmap().IsLoopback()
 }
 
 var (
@@ -1310,6 +1395,8 @@ func (g *Gateway) handleJSONResponse(
 		if w.Header().Get("Content-Type") == "" {
 			w.Header().Set("Content-Type", "application/json")
 		}
+		w.Header().Set("X-Headlamp-Provider-Type", cand.provider.Type)
+		w.Header().Set("X-Headlamp-Upstream-Model", cand.upstreamModel)
 		w.WriteHeader(resp.StatusCode)
 		_, writeErr := w.Write(upBody)
 		errMsg := ""
@@ -1346,6 +1433,8 @@ func (g *Gateway) handleJSONResponse(
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Headlamp-Provider-Type", cand.provider.Type)
+	w.Header().Set("X-Headlamp-Upstream-Model", cand.upstreamModel)
 	w.WriteHeader(resp.StatusCode)
 	_, writeErr := w.Write(outBody)
 	errMsg := ""
@@ -1382,6 +1471,8 @@ func (g *Gateway) handleStreamingResponse(
 	}
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("X-Headlamp-Provider-Type", cand.provider.Type)
+	w.Header().Set("X-Headlamp-Upstream-Model", cand.upstreamModel)
 	w.Header().Del("Content-Length")
 	w.WriteHeader(resp.StatusCode)
 	if flusher != nil {

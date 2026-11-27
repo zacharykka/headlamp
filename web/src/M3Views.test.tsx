@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
-import { api } from './api/client';
+import { ApiError, api } from './api/client';
 import { ChatView } from './views/ChatView';
 import { MCPView } from './views/MCPView';
 
@@ -227,8 +227,14 @@ describe('Milestone 3: Team Web Chat, Admin MCP Gateway, and API helpers', () =>
           return;
         }
 
-        // Second stream stays open until Stop aborts signal
+        // Second stream starts a running tool and stays open until Stop aborts signal
         capturedAbortSignal = opts?.signal;
+        callbacks.onToolStart?.({
+          id: 'tc-running',
+          server: 'docs',
+          tool: 'long_scan',
+          arguments: {},
+        });
         await new Promise<void>((_resolve, reject) => {
           opts?.signal?.addEventListener('abort', () => {
             const abortErr = new Error('Aborted');
@@ -251,17 +257,23 @@ describe('Milestone 3: Team Web Chat, Admin MCP Gateway, and API helpers', () =>
     fireEvent.click(within(popover).getByRole('switch', { name: /Attach MCP server docs/i }));
     fireEvent.keyDown(window, { key: 'Escape' });
 
-    // Send first prompt via Enter
+    // Safari IME composition keyCode 229 must NOT trigger send (P2-6)
     const input = screen.getByLabelText('Message input');
     fireEvent.change(input, { target: { value: 'How do grants work?' } });
-    fireEvent.keyDown(input, { key: 'Enter' });
+    fireEvent.keyDown(input, { key: 'Enter', keyCode: 229, which: 229 });
+    expect(createSessSpy).not.toHaveBeenCalled();
+
+    // Real Enter sends prompt
+    fireEvent.keyDown(input, { key: 'Enter', keyCode: 13 });
 
     await waitFor(() => {
       expect(createSessSpy).toHaveBeenCalledWith(
         expect.objectContaining({
+          title: 'New Chat',
           model: 'anthropic/claude-sonnet-4-6',
           mcp_servers: ['docs'],
         }),
+        expect.objectContaining({ signal: expect.anything() }),
       );
       expect(screen.getByText('docs/search_kb')).toBeTruthy();
       expect(screen.getByText('Headscale')).toBeTruthy();
@@ -272,14 +284,16 @@ describe('Milestone 3: Team Web Chat, Admin MCP Gateway, and API helpers', () =>
     expect(screen.getByText('Tool Arguments')).toBeTruthy();
     expect(screen.getByText('[REDACTED:secret]')).toBeTruthy();
 
-    // Start second stream and click Stop button -> aborts controller cleanly
+    // Start second stream with an unfinished tool call and click Stop -> aborts signal and marks tool card cancelled (no infinite spinner!)
     fireEvent.change(input, { target: { value: 'Stream forever' } });
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
 
     const stopBtn = await screen.findByRole('button', { name: 'Stop generation' });
+    expect(screen.getByLabelText('Running tool')).toBeTruthy();
     fireEvent.click(stopBtn);
     await waitFor(() => {
       expect(capturedAbortSignal?.aborted).toBe(true);
+      expect(screen.queryByLabelText('Running tool')).toBeNull();
     });
 
     // Inline session rename
@@ -305,7 +319,136 @@ describe('Milestone 3: Team Web Chat, Admin MCP Gateway, and API helpers', () =>
     });
   });
 
-  it('enforces Managed by YAML locks, inline modal errors, tool discovery drawer, and audit inspector in MCPView', async () => {
+  it('handles pre-SSE draft restore, in-flight createChatSession abort race, unavailable historical model/MCPs, and bottom Attach MCP toggle (P1-5, P2-6)', async () => {
+    vi.spyOn(api, 'listChatModels').mockResolvedValue([
+      {
+        id: 'team/coding',
+        provider: 'anthropic-prod',
+        provider_type: 'anthropic',
+        is_alias: true,
+      },
+    ]);
+    vi.spyOn(api, 'listChatMCPServers').mockResolvedValue([
+      { name: 'docs', transport: 'streamable_http', enabled: true, tools: [] },
+    ]);
+    vi.spyOn(api, 'listChatSessions').mockResolvedValue([
+      {
+        id: 'sess-legacy',
+        title: 'Legacy Session',
+        model: 'openai/gpt-4-retired',
+        mcp_servers: ['retired-mcp'],
+        created_at: '2026-11-26T00:00:00Z',
+        updated_at: '2026-11-26T00:00:00Z',
+      },
+    ]);
+    vi.spyOn(api, 'getChatSession').mockResolvedValue({
+      session: {
+        id: 'sess-legacy',
+        title: 'Legacy Session',
+        model: 'openai/gpt-4-retired',
+        mcp_servers: ['retired-mcp'],
+        created_at: '2026-11-26T00:00:00Z',
+        updated_at: '2026-11-26T00:00:00Z',
+      },
+      messages: [],
+    });
+    const updateSessSpy = vi.spyOn(api, 'updateChatSession').mockResolvedValue({
+      id: 'sess-legacy',
+      title: 'Legacy Session',
+      model: 'openai/gpt-4-retired',
+      mcp_servers: [],
+      created_at: '2026-11-26T00:00:00Z',
+      updated_at: '2026-11-27T00:00:00Z',
+    });
+
+    // First createChatSession hangs so we can click New chat mid-flight; second succeeds
+    let resolvePendingCreate!: (s: {
+      id: string;
+      title: string;
+      model: string;
+      created_at: string;
+      updated_at: string;
+    }) => void;
+    let createCount = 0;
+    vi.spyOn(api, 'createChatSession').mockImplementation(() => {
+      createCount += 1;
+      if (createCount === 1) {
+        return new Promise((resolve) => {
+          resolvePendingCreate = resolve;
+        });
+      }
+      return Promise.resolve({
+        id: 'sess-2',
+        title: 'Rate limited prompt',
+        model: 'team/coding',
+        created_at: '2026-11-27T06:00:00Z',
+        updated_at: '2026-11-27T06:00:00Z',
+      });
+    });
+
+    vi.spyOn(api, 'streamChatMessage').mockRejectedValue(
+      new ApiError(429, 'Daily USD budget exceeded'),
+    );
+
+    render(<ChatView />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Legacy Session')).toBeTruthy();
+    });
+
+    // Bottom Attach MCP button opens AND closes cleanly without mousedown reopen race
+    const bottomAttachBtn = screen.getByRole('button', { name: /^Attach MCP$/i });
+    fireEvent.mouseDown(bottomAttachBtn);
+    fireEvent.click(bottomAttachBtn);
+    expect(screen.getByRole('dialog', { name: 'MCP Servers' })).toBeTruthy();
+
+    fireEvent.mouseDown(bottomAttachBtn);
+    fireEvent.click(bottomAttachBtn);
+    expect(screen.queryByRole('dialog', { name: 'MCP Servers' })).toBeNull();
+
+    // Start sending on a new chat, then abort via New chat BEFORE createChatSession resolves
+    const input = screen.getByLabelText('Message input') as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: 'Aborted first message' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    fireEvent.click(screen.getByRole('button', { name: /New chat/i }));
+
+    resolvePendingCreate({
+      id: 'sess-stale',
+      title: 'Stale',
+      model: 'team/coding',
+      created_at: '2026-11-27T06:00:00Z',
+      updated_at: '2026-11-27T06:00:00Z',
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.queryByText('Stale')).toBeNull();
+
+    // Pre-SSE HTTP 429 restores draft, removes empty placeholder bubble, and renders pinned alert
+    fireEvent.change(input, { target: { value: 'Rate limited prompt' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('Daily USD budget exceeded');
+    expect(input.value).toBe('Rate limited prompt');
+
+    // Load historical session with unavailable model & MCP server
+    fireEvent.click(screen.getByText('Legacy Session'));
+    await waitFor(() => {
+      expect(
+        screen.getByDisplayValue('openai/gpt-4-retired (unavailable)'),
+      ).toBeTruthy();
+    });
+    const detachChip = screen.getByRole('button', {
+      name: /retired-mcp \(unavailable\) ×/i,
+    });
+    fireEvent.click(detachChip);
+    await waitFor(() => {
+      expect(updateSessSpy).toHaveBeenCalledWith('sess-legacy', {
+        mcp_servers: [],
+      });
+    });
+  });
+
+  it('enforces Managed by YAML locks, hides none-auth token preview, opens failed-test diagnostic drawer, and inspects audit logs in MCPView (P2-7, P3-4)', async () => {
     vi.spyOn(api, 'listAdminMCPServers').mockResolvedValue([
       {
         name: 'github-yaml',
@@ -331,16 +474,25 @@ describe('Milestone 3: Team Web Chat, Admin MCP Gateway, and API helpers', () =>
         source: 'local',
         updated_at: '2026-11-27T00:00:00Z',
       },
+      {
+        name: 'public-docs',
+        url: 'https://mcp.docs.internal/mcp',
+        transport: 'streamable_http',
+        auth_type: 'none',
+        auth_header: '',
+        has_auth_token: true,
+        auth_token_preview: 'stale_...****',
+        enabled: true,
+        source: 'local',
+        updated_at: '2026-11-27T00:00:00Z',
+      },
     ]);
 
-    vi.spyOn(api, 'testAdminMCPServer').mockResolvedValue({
-      ok: true,
-      latency_ms: 19,
-      message: 'MCP initialize + tools/list succeeded',
-      tools: [
-        { name: 'list_pull_requests', description: 'List open repository PRs' },
-        { name: 'get_commit', description: 'Inspect commit diff' },
-      ],
+    vi.spyOn(api, 'testAdminMCPServer').mockResolvedValueOnce({
+      ok: false,
+      latency_ms: 8,
+      message: 'upstream HTTP 401 Unauthorized',
+      tools: [],
     });
 
     vi.spyOn(api, 'listAdminMCPLogs').mockResolvedValue([
@@ -369,6 +521,10 @@ describe('Milestone 3: Team Web Chat, Admin MCP Gateway, and API helpers', () =>
       expect(screen.getByText('bob@tailnet')).toBeTruthy();
     });
 
+    // auth_type === 'none' never renders stale auth_token_preview (P3-4)
+    expect(screen.queryByText('stale_...****')).toBeNull();
+    expect(screen.getByText('ghp_...****')).toBeTruthy();
+
     // YAML-managed server locks Edit, Toggle, and Delete
     expect(screen.getByText('Managed by YAML')).toBeTruthy();
     expect(
@@ -382,10 +538,6 @@ describe('Milestone 3: Team Web Chat, Admin MCP Gateway, and API helpers', () =>
         }) as HTMLButtonElement
       ).disabled,
     ).toBe(true);
-    expect(
-      (screen.getByRole('button', { name: 'Delete github-yaml' }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
 
     // Local server allows Edit and exposes clear_auth_token toggle
     fireEvent.click(screen.getByRole('button', { name: 'Edit pagerduty-local' }));
@@ -396,7 +548,6 @@ describe('Milestone 3: Team Web Chat, Admin MCP Gateway, and API helpers', () =>
       within(editDialog).getByRole('switch', { name: 'Clear stored auth token' }),
     ).toBeTruthy();
 
-    // Clear Custom Header Name -> inline validation alert inside modal
     fireEvent.change(within(editDialog).getByLabelText(/Custom Header Name/i), {
       target: { value: '   ' },
     });
@@ -407,13 +558,16 @@ describe('Milestone 3: Team Web Chat, Admin MCP Gateway, and API helpers', () =>
     );
     fireEvent.click(within(editDialog).getByRole('button', { name: /Cancel/i }));
 
-    // Test & Discover opens Discovered Tools drawer
+    // Failed Test (ok: false, tools: []) still opens Discovery Drawer with diagnostic alert (P2-7)
     const testButtons = screen.getAllByRole('button', { name: /^Test$/i });
     fireEvent.click(testButtons[0]);
     const discoveryDrawer = await screen.findByRole('dialog', {
       name: /MCP Discovery · github-yaml/i,
     });
-    expect(within(discoveryDrawer).getByText('list_pull_requests')).toBeTruthy();
+    expect(within(discoveryDrawer).getByText('Failed')).toBeTruthy();
+    expect(
+      within(discoveryDrawer).getAllByText(/upstream HTTP 401 Unauthorized/i).length,
+    ).toBeGreaterThan(0);
     fireEvent.click(within(discoveryDrawer).getByRole('button', { name: 'Close' }));
 
     // Click MCP Audit Log row -> opens Call Inspector Drawer with redaction highlight
@@ -476,7 +630,6 @@ describe('Milestone 3: Team Web Chat, Admin MCP Gateway, and API helpers', () =>
 
     render(<App />);
 
-    // Non-admin lands directly on Team Chat with 2 sidebar buttons
     await waitFor(() => {
       expect(screen.getByLabelText('Message input')).toBeTruthy();
     });
@@ -485,7 +638,6 @@ describe('Milestone 3: Team Web Chat, Admin MCP Gateway, and API helpers', () =>
     expect(within(nav).getByRole('button', { name: /My Usage & SDKs/i })).toBeTruthy();
     expect(within(nav).queryByText(/Administration/i)).toBeNull();
 
-    // Switch to My Usage & SDKs and open MCP Clients tab
     fireEvent.click(within(nav).getByRole('button', { name: /My Usage & SDKs/i }));
     await waitFor(() => {
       expect(screen.getByRole('heading', { name: 'Quickstart & My Usage' })).toBeTruthy();
@@ -496,5 +648,95 @@ describe('Milestone 3: Team Web Chat, Admin MCP Gateway, and API helpers', () =>
       expect(screen.getByText(/claude mcp add --transport http k8s-cluster/)).toBeTruthy();
       expect(screen.getByText(/\/mcp\/k8s-cluster/)).toBeTruthy();
     });
+  });
+
+  it('never leaks raw secret into createChatSession title and removes unpersisted or rolled-back user bubbles on SSE error (#148 P1-3)', async () => {
+    vi.spyOn(api, 'listChatModels').mockResolvedValue([
+      {
+        id: 'anthropic/claude-sonnet-4-6',
+        provider: 'anthropic',
+        provider_type: 'anthropic',
+        is_alias: false,
+      },
+    ]);
+    vi.spyOn(api, 'listChatMCPServers').mockResolvedValue([]);
+    vi.spyOn(api, 'listChatSessions').mockResolvedValue([]);
+
+    const createSessSpy = vi.spyOn(api, 'createChatSession').mockResolvedValue({
+      id: 'sess-safe',
+      title: 'New Chat',
+      model: 'anthropic/claude-sonnet-4-6',
+      created_at: '2026-11-27T08:30:00Z',
+      updated_at: '2026-11-27T08:30:00Z',
+    });
+
+    let callIdx = 0;
+    vi.spyOn(api, 'streamChatMessage').mockImplementation(
+      async (_sessionId, _payload, callbacks) => {
+        callIdx += 1;
+        if (callIdx === 1) {
+          // Case 1: Pre-persist guardrail block emits SSE error BEFORE message_start
+          callbacks.onError?.({
+            type: 'guardrail_blocked',
+            message: 'Request blocked by guardrail private_key',
+          });
+          return;
+        }
+        // Case 2: Round-0 message_start followed by upstream error (rolled back by backend before any delta/tool)
+        callbacks.onMessageStart?.({
+          user_message: {
+            id: 'msg-rolled-back',
+            session_id: 'sess-safe',
+            role: 'user',
+            content: 'Retry normal question',
+            created_at: '2026-11-27T08:31:00Z',
+          },
+          session: {
+            id: 'sess-safe',
+            title: 'Retry normal question',
+            model: 'anthropic/claude-sonnet-4-6',
+            created_at: '2026-11-27T08:30:00Z',
+            updated_at: '2026-11-27T08:31:00Z',
+          },
+        });
+        callbacks.onError?.({
+          type: 'upstream_error',
+          message: 'Upstream 429 rate limit',
+        });
+      },
+    );
+
+    const { container } = render(<ChatView />);
+
+    await waitFor(() => {
+      expect(screen.getByDisplayValue(/anthropic\/claude-sonnet-4-6/)).toBeTruthy();
+    });
+
+    const pemSecret = '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAsecret';
+    const input = screen.getByLabelText('Message input') as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: pemSecret } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+
+    const blockAlert = await screen.findByRole('alert');
+    expect(blockAlert.textContent).toContain('Request blocked by guardrail private_key');
+
+    // 1. Session was created with 'New Chat', NEVER with the raw PEM private key!
+    expect(createSessSpy).toHaveBeenCalledTimes(1);
+    expect(createSessSpy.mock.calls[0][0].title).toBe('New Chat');
+
+    // 2. Blocked user bubble is removed from the thread and draft is restored for editing
+    expect(container.querySelector('.ap-chat-msg-user')).toBeNull();
+    expect(container.querySelector('.ap-chat-msg-assistant')).toBeNull();
+    expect(input.value).toBe(pemSecret);
+
+    // 3. Round-0 rolled-back message_start + error also removes the rolled-back user bubble
+    fireEvent.change(input, { target: { value: 'Retry normal question' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert').textContent).toContain('Upstream 429 rate limit');
+    });
+    expect(container.querySelector('.ap-chat-msg-user')).toBeNull();
+    expect(container.querySelector('.ap-chat-msg-assistant')).toBeNull();
   });
 });

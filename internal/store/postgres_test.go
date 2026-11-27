@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/zacharykka/headlamp/internal/config"
 	"github.com/zacharykka/headlamp/internal/crypto"
 )
@@ -89,6 +91,7 @@ func TestPostgresEmbeddedMigrationsAndQueryBuilders(t *testing.T) {
 		"CREATE TABLE IF NOT EXISTS mcp_audit_logs",
 		"CREATE TABLE IF NOT EXISTS chat_sessions",
 		"CREATE TABLE IF NOT EXISTS chat_messages",
+		"seq BIGSERIAL NOT NULL",
 		"TIMESTAMPTZ",
 		"JSONB",
 		"DOUBLE PRECISION",
@@ -144,6 +147,98 @@ func TestPostgresEmbeddedMigrationsAndQueryBuilders(t *testing.T) {
 	}
 }
 
+func TestStripPostgresNULAndJSONNUL(t *testing.T) {
+	if got := stripPostgresNUL("clean text"); got != "clean text" {
+		t.Fatalf("stripPostgresNUL(clean) = %q", got)
+	}
+	if got := stripPostgresNUL("hello\x00world\x00!"); got != "helloworld!" {
+		t.Fatalf("stripPostgresNUL(nul) = %q, want helloworld!", got)
+	}
+
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "plain_json",
+			in:   `{"ok":true,"text":"hello"}`,
+			want: `{"ok":true,"text":"hello"}`,
+		},
+		{
+			name: "raw_nul_and_lower_escape",
+			in:   "{\"a\":\"hi\x00\\u0000there\"}",
+			want: `{"a":"hithere"}`,
+		},
+		{
+			name: "upper_escape",
+			in:   `{"a":"foo\U0000bar"}`,
+			want: `{"a":"foobar"}`,
+		},
+		{
+			name: "escaped_backslash_before_u0000_preserved",
+			in:   `{"a":"literal \\u0000 text"}`,
+			want: `{"a":"literal \\u0000 text"}`,
+		},
+		{
+			name: "escaped_backslash_plus_real_u0000",
+			in:   `{"a":"\\\u0000"}`,
+			want: `{"a":"\\"}`,
+		},
+		{
+			name: "consecutive_real_u0000_after_escaped_backslash",
+			in:   `{"a":"\\\u0000\u0000x"}`,
+			want: `{"a":"\\x"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := string(stripPostgresJSONNUL([]byte(tc.in)))
+			if got != tc.want {
+				t.Fatalf("stripPostgresJSONNUL(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			if !json.Valid([]byte(got)) {
+				t.Fatalf("stripPostgresJSONNUL(%q) produced invalid JSON: %q", tc.in, got)
+			}
+		})
+	}
+}
+
+func TestPostgresSnapshotCacheTTLOption(t *testing.T) {
+	base := time.Date(2026, 11, 27, 16, 0, 0, 0, time.UTC)
+	s := &PostgresStore{
+		cacheTTL: defaultPostgresCacheTTL,
+		cache:    &configSnapshot{},
+	}
+	if s.cacheTTL != 5*time.Second {
+		t.Fatalf("default cacheTTL = %v, want 5s", s.cacheTTL)
+	}
+
+	WithPostgresCacheTTL(2 * time.Second)(s)
+	if s.cacheTTL != 2*time.Second {
+		t.Fatalf("WithPostgresCacheTTL(2s) = %v", s.cacheTTL)
+	}
+	s.cacheLoadedAt = base
+
+	if !s.isCacheFreshLocked(base.Add(1999 * time.Millisecond)) {
+		t.Fatal("expected cache to be fresh before TTL elapses")
+	}
+	if s.isCacheFreshLocked(base.Add(2 * time.Second)) {
+		t.Fatal("expected cache to expire at TTL boundary")
+	}
+
+	WithPostgresCacheTTL(0)(s)
+	if s.isCacheFreshLocked(base) {
+		t.Fatal("expected TTL <= 0 to disable snapshot cache reuse")
+	}
+
+	WithPostgresCacheTTL(2 * time.Second)(s)
+	s.cache = nil
+	if s.isCacheFreshLocked(base) {
+		t.Fatal("expected nil cache to report not fresh")
+	}
+}
+
 func TestPostgresStoreLiveIntegration(t *testing.T) {
 	dsn := strings.TrimSpace(os.Getenv("HEADLAMP_TEST_POSTGRES_DSN"))
 	if dsn == "" {
@@ -162,86 +257,224 @@ func TestPostgresStoreLiveIntegration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	st, err := NewPostgresStore(ctx, dsn, cipher)
+	prefix := "pgtest-" + uuid.NewString()[:8] + "-"
+	providerName := prefix + "openai"
+	mcpName := prefix + "docs"
+	localMCPName := prefix + "local-mcp"
+	ruleID := prefix + "rule"
+	usageID := prefix + "u1"
+	usageNULID := prefix + "u-nul"
+	mcpAuditID := prefix + "m-nul"
+	alice := prefix + "alice"
+	bob := prefix + "bob"
+	tag := "tag:" + prefix + "pg"
+
+	st, err := NewPostgresStore(ctx, dsn, cipher, WithPostgresCacheTTL(40*time.Millisecond))
 	if err != nil {
 		t.Fatalf("NewPostgresStore: %v", err)
 	}
 	defer func() { _ = st.Close() }()
 
-	// Idempotent re-migrate
+	stReplica, err := NewPostgresStore(ctx, dsn, cipher, WithPostgresCacheTTL(40*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewPostgresStore(replica): %v", err)
+	}
+	defer func() { _ = stReplica.Close() }()
+
+	defer func() {
+		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanCancel()
+		_, _ = st.DB().ExecContext(cleanCtx, `DELETE FROM usage_logs WHERE id IN ($1, $2)`, usageID, usageNULID)
+		_, _ = st.DB().ExecContext(cleanCtx, `DELETE FROM mcp_audit_logs WHERE id = $1`, mcpAuditID)
+		_, _ = st.DB().ExecContext(cleanCtx, `DELETE FROM guardrail_rules WHERE id = $1`, ruleID)
+		_, _ = st.DB().ExecContext(cleanCtx, `DELETE FROM mcp_servers WHERE name IN ($1, $2)`, mcpName, localMCPName)
+		_, _ = st.DB().ExecContext(cleanCtx, `DELETE FROM providers WHERE name = $1`, providerName)
+	}()
+
+	// Idempotent re-migrate (exercises pg_advisory_xact_lock transaction pooling path).
 	if err := st.Migrate(ctx); err != nil {
 		t.Fatalf("second Migrate: %v", err)
 	}
 
-	// SyncConfig + encrypted provider/webhook/MCP server round-trip
-	cfg, err := config.LoadFromBytes([]byte(`
+	// SyncConfig + encrypted provider/MCP server round-trip + multi-replica TTL refresh.
+	cfg, err := config.LoadFromBytes([]byte(fmt.Sprintf(`
 providers:
-  - name: pg-openai
+  - name: %s
     type: openai
     api_key: "sk-pg-secret"
     models: ["gpt-5"]
 mcp_servers:
-  - name: pg-docs
+  - name: %s
     url: "https://pg-docs.internal/mcp"
     auth_type: bearer
     auth_token: "mcp-pg-token"
-`))
+`, providerName, mcpName)))
 	if err != nil {
 		t.Fatalf("LoadFromBytes: %v", err)
 	}
 	if err := st.SyncConfig(ctx, cfg); err != nil {
 		t.Fatalf("SyncConfig: %v", err)
 	}
-	p, err := st.GetProvider(ctx, "pg-openai")
+	p, err := st.GetProvider(ctx, providerName)
 	if err != nil || p.APIKey != "sk-pg-secret" {
-		t.Fatalf("GetProvider(pg-openai) = (%+v, %v)", p, err)
+		t.Fatalf("GetProvider(%s) = (%+v, %v)", providerName, p, err)
 	}
-	m, err := st.GetMCPServer(ctx, "pg-docs")
+	m, err := st.GetMCPServer(ctx, mcpName)
 	if err != nil || m.AuthToken != "mcp-pg-token" {
-		t.Fatalf("GetMCPServer(pg-docs) = (%+v, %v)", m, err)
+		t.Fatalf("GetMCPServer(%s) = (%+v, %v)", mcpName, m, err)
 	}
 
-	// Usage analytics (P95, hour/day series, tag filter)
-	base := time.Now().UTC().Truncate(time.Hour)
-	_ = st.InsertUsageLog(ctx, UsageLog{
-		ID: "pg-u1", CreatedAt: base, Subject: "pg-alice", Tags: []string{"tag:pg"},
-		ProviderName: "pg-openai", RequestedModel: "gpt-5", TotalTokens: 1000, CostUSD: 0.05,
-		LatencyMS: 250, StatusCode: 200,
-	})
-	ext, err := st.SummarizeUsageExtended(ctx, UsageFilter{Tag: "tag:pg"})
-	if err != nil || ext.RequestCount < 1 || ext.P95LatencyMS <= 0 || math.Abs(ext.CostUSD) < 1e-9 {
-		t.Fatalf("SummarizeUsageExtended(tag:pg) = (%+v, %v)", ext, err)
+	// Prime replica cache, mutate on primary, verify replica sees update after TTL.
+	if mRep, err := stReplica.GetMCPServer(ctx, mcpName); err != nil || mRep.AuthToken != "mcp-pg-token" {
+		t.Fatalf("replica initial GetMCPServer = (%+v, %v)", mRep, err)
 	}
-	series, err := st.QueryUsageSeries(ctx, UsageFilter{Tag: "tag:pg"}, "hour")
+	// Seed a source='local' server, then sync YAML switching mcpName to auth_type=none
+	// and taking over localMCPName without auth_token (must not inherit local secret).
+	if err := st.UpsertMCPServer(ctx, MCPServer{
+		Name: localMCPName, URL: "https://local.internal/mcp",
+		Transport: config.MCPTransportStreamableHTTP, AuthType: config.MCPAuthBearer,
+		AuthToken: "local-secret-must-not-leak", Enabled: true, Source: SourceLocal,
+	}); err != nil {
+		t.Fatalf("UpsertMCPServer(local): %v", err)
+	}
+	cfgUpdated, err := config.LoadFromBytes([]byte(fmt.Sprintf(`
+providers:
+  - name: %s
+    type: openai
+    api_key: "sk-pg-secret"
+    models: ["gpt-5"]
+mcp_servers:
+  - name: %s
+    url: "https://pg-docs.internal/mcp"
+    auth_type: none
+  - name: %s
+    url: "https://config.internal/mcp"
+    auth_type: bearer
+`, providerName, mcpName, localMCPName)))
+	if err != nil {
+		t.Fatalf("LoadFromBytes(updated): %v", err)
+	}
+	if err := st.SyncConfig(ctx, cfgUpdated); err != nil {
+		t.Fatalf("SyncConfig(updated): %v", err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	mRepUpdated, err := stReplica.GetMCPServer(ctx, mcpName)
+	if err != nil || mRepUpdated.AuthType != config.MCPAuthNone || mRepUpdated.AuthToken != "" {
+		t.Fatalf("replica TTL refresh failed or auth_type=none leaked secret: (%+v, %v)", mRepUpdated, err)
+	}
+	mTaken, err := stReplica.GetMCPServer(ctx, localMCPName)
+	if err != nil || mTaken.Source != SourceConfig || mTaken.AuthToken != "" {
+		t.Fatalf("expected source=config takeover not to inherit source=local token: (%+v, %v)", mTaken, err)
+	}
+
+	// Guardrail rule lowercase normalization.
+	if err := st.UpsertGuardrailRule(ctx, GuardrailRule{
+		ID: ruleID, Name: "Upper Case Rule", Category: " SECRET ", Pattern: "tok_[0-9]+",
+		Action: " BLOCK ", Enabled: true, Source: SourceLocal,
+	}); err != nil {
+		t.Fatalf("UpsertGuardrailRule: %v", err)
+	}
+	gotRule, err := st.GetGuardrailRule(ctx, ruleID)
+	if err != nil || gotRule.Category != "secret" || gotRule.Action != "block" {
+		t.Fatalf("expected lowercased category/action, got (%+v, %v)", gotRule, err)
+	}
+
+	// Usage analytics (P95, hour/day series, tag filter) + NUL byte sanitization.
+	base := time.Now().UTC().Truncate(time.Hour)
+	if err := st.InsertUsageLog(ctx, UsageLog{
+		ID: usageID, CreatedAt: base, Subject: alice, Tags: []string{tag},
+		ProviderName: providerName, RequestedModel: "gpt-5", TotalTokens: 1000, CostUSD: 0.05,
+		LatencyMS: 250, StatusCode: 200,
+	}); err != nil {
+		t.Fatalf("InsertUsageLog(%s): %v", usageID, err)
+	}
+	if err := st.InsertUsageLog(ctx, UsageLog{
+		ID: usageNULID, CreatedAt: base, Subject: alice, Tags: []string{tag, "bad\x00tag"},
+		ProviderName: providerName, RequestedModel: "gpt-5", TotalTokens: 10, CostUSD: 0.01,
+		LatencyMS: 100, StatusCode: 500, ErrorMessage: "upstream\x00err",
+	}); err != nil {
+		t.Fatalf("InsertUsageLog(nul): %v", err)
+	}
+	if err := st.InsertAuditPayload(ctx, AuditPayload{
+		UsageLogID:      usageNULID,
+		RequestHeaders:  map[string]string{"X-Test": "val\x00ue"},
+		RequestBody:     "req\x00body",
+		ResponseHeaders: map[string]string{"X-Resp": "ok\x00"},
+		ResponseBody:    "resp\x00body",
+	}); err != nil {
+		t.Fatalf("InsertAuditPayload(nul): %v", err)
+	}
+	if err := st.InsertMCPAuditLog(ctx, MCPAuditLog{
+		ID: mcpAuditID, CreatedAt: base, Subject: alice, Tags: []string{"t\x001"},
+		ServerName: mcpName, Method: "tools/call", ToolName: "search", Status: "ok",
+		ArgumentsPreview: "{\"q\":\"hi\x00there\"}", ErrorMessage: "warn\x00",
+	}); err != nil {
+		t.Fatalf("InsertMCPAuditLog(nul): %v", err)
+	}
+
+	ext, err := st.SummarizeUsageExtended(ctx, UsageFilter{Tag: tag})
+	if err != nil || ext.RequestCount != 2 || ext.P95LatencyMS <= 0 || math.Abs(ext.CostUSD-0.06) > 1e-9 {
+		t.Fatalf("SummarizeUsageExtended(%s) = (%+v, %v)", tag, ext, err)
+	}
+	series, err := st.QueryUsageSeries(ctx, UsageFilter{Tag: tag}, "hour")
 	if err != nil || len(series) == 0 || !strings.HasSuffix(series[0].Bucket, ":00:00Z") {
 		t.Fatalf("QueryUsageSeries(hour) = (%+v, %v)", series, err)
 	}
 
-	// Chat session isolation & tool event JSONB round-trip
+	// Chat session isolation, same-microsecond seq ordering, NUL sanitization, and DeleteChatMessage rollback.
 	sess, err := st.CreateChatSession(ctx, ChatSession{
-		Subject:    "pg-alice",
+		Subject:    alice,
 		Title:      "PG Chat",
 		Model:      "gpt-5",
-		MCPServers: []string{"pg-docs"},
+		MCPServers: []string{mcpName},
 	})
 	if err != nil {
 		t.Fatalf("CreateChatSession: %v", err)
 	}
-	defer func() { _ = st.DeleteChatSession(ctx, "pg-alice", sess.ID) }()
+	defer func() { _ = st.DeleteChatSession(ctx, alice, sess.ID) }()
 
-	if _, err := st.GetChatSession(ctx, "pg-bob", sess.ID); !errors.Is(err, ErrNotFound) {
+	if _, err := st.GetChatSession(ctx, bob, sess.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for cross-subject session read, got %v", err)
 	}
-	if _, err := st.InsertChatMessage(ctx, "pg-alice", ChatMessage{
+
+	sameTS := time.Now().UTC().Truncate(time.Microsecond)
+	userMsg, err := st.InsertChatMessage(ctx, alice, ChatMessage{
+		ID:        prefix + "z-user",
+		SessionID: sess.ID,
+		Role:      "user",
+		Content:   "hello\x00world",
+		CreatedAt: sameTS,
+	})
+	if err != nil {
+		t.Fatalf("InsertChatMessage(user): %v", err)
+	}
+	if _, err := st.InsertChatMessage(ctx, alice, ChatMessage{
+		ID:         prefix + "a-assistant",
 		SessionID:  sess.ID,
 		Role:       "assistant",
-		Content:    "Done",
-		ToolEvents: []ChatToolEvent{{ID: "t1", Server: "pg-docs", Tool: "search", Arguments: json.RawMessage(`{"q":"pg"}`), Result: "ok", DurationMS: 12}},
+		Content:    "Done\x00ok",
+		ToolEvents: []ChatToolEvent{{ID: "t1", Server: mcpName, Tool: "search", Arguments: json.RawMessage(`{"q":"pg\u0000test"}`), Result: "ok\x00res", DurationMS: 12}},
+		CreatedAt:  sameTS,
 	}); err != nil {
-		t.Fatalf("InsertChatMessage: %v", err)
+		t.Fatalf("InsertChatMessage(assistant): %v", err)
 	}
-	msgs, err := st.ListChatMessages(ctx, "pg-alice", sess.ID)
-	if err != nil || len(msgs) != 1 || len(msgs[0].ToolEvents) != 1 {
-		t.Fatalf("ListChatMessages = (%+v, %v)", msgs, err)
+
+	msgs, err := st.ListChatMessages(ctx, alice, sess.ID)
+	if err != nil || len(msgs) != 2 || msgs[0].ID != prefix+"z-user" || msgs[1].ID != prefix+"a-assistant" ||
+		msgs[0].Content != "helloworld" || msgs[1].Content != "Doneok" ||
+		len(msgs[1].ToolEvents) != 1 || msgs[1].ToolEvents[0].Result != "okres" {
+		t.Fatalf("ListChatMessages same-microsecond seq order / NUL strip failed: (%+v, %v)", msgs, err)
+	}
+
+	// Cross-subject DeleteChatMessage denied; owner rollback succeeds.
+	if err := st.DeleteChatMessage(ctx, bob, sess.ID, userMsg.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for cross-subject DeleteChatMessage, got %v", err)
+	}
+	if err := st.DeleteChatMessage(ctx, alice, sess.ID, userMsg.ID); err != nil {
+		t.Fatalf("owner DeleteChatMessage: %v", err)
+	}
+	msgsAfter, err := st.ListChatMessages(ctx, alice, sess.ID)
+	if err != nil || len(msgsAfter) != 1 || msgsAfter[0].ID != prefix+"a-assistant" {
+		t.Fatalf("ListChatMessages after DeleteChatMessage = (%+v, %v)", msgsAfter, err)
 	}
 }

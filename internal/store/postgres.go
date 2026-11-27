@@ -28,25 +28,43 @@ var pgMigrationsFS embed.FS
 
 // pgMigrationAdvisoryLockID prevents concurrent schema migration races when
 // multiple Headlamp replicas start simultaneously against PostgreSQL.
-const pgMigrationAdvisoryLockID int64 = 72491827341
+const (
+	pgMigrationAdvisoryLockID int64 = 72491827341
+	defaultPostgresCacheTTL         = 5 * time.Second
+)
+
+// PostgresOption configures optional PostgresStore behavior.
+type PostgresOption func(*PostgresStore)
+
+// WithPostgresCacheTTL sets the maximum age of the in-memory config snapshot cache
+// before PostgresStore refreshes from PostgreSQL (default 5s). A non-positive TTL
+// disables cross-request snapshot caching so every read queries PostgreSQL.
+func WithPostgresCacheTTL(ttl time.Duration) PostgresOption {
+	return func(s *PostgresStore) {
+		s.cacheTTL = ttl
+	}
+}
 
 // PostgresStore implements Store backed by PostgreSQL using pure-Go jackc/pgx/v5 (zero CGO).
 // Decrypted providers, model routes, budgets, guardrail rules, webhooks, and MCP servers are
-// served from an immutable in-memory snapshot cache invalidated on mutations.
+// served from a short-TTL immutable in-memory snapshot cache invalidated on local mutations.
 type PostgresStore struct {
 	db     *sql.DB
 	cipher *crypto.Cipher
 
-	cacheMu    sync.RWMutex
-	cache      *configSnapshot
-	cacheLoads atomic.Int64
+	cacheMu       sync.RWMutex
+	cache         *configSnapshot
+	cacheLoadedAt time.Time
+	cacheTTL      time.Duration
+	now           func() time.Time
+	cacheLoads    atomic.Int64
 }
 
 var _ Store = (*PostgresStore)(nil)
 
 // NewPostgresStore validates dsn, opens a pgx/v5 connection pool, pings PostgreSQL,
-// and applies all embedded PostgreSQL migrations under an advisory lock.
-func NewPostgresStore(ctx context.Context, dsn string, cipher *crypto.Cipher) (*PostgresStore, error) {
+// and applies all embedded PostgreSQL migrations under a transaction-scoped advisory lock.
+func NewPostgresStore(ctx context.Context, dsn string, cipher *crypto.Cipher, opts ...PostgresOption) (*PostgresStore, error) {
 	if cipher == nil {
 		return nil, errors.New("store: cipher is required")
 	}
@@ -73,8 +91,15 @@ func NewPostgresStore(ctx context.Context, dsn string, cipher *crypto.Cipher) (*
 	}
 
 	s := &PostgresStore{
-		db:     db,
-		cipher: cipher,
+		db:       db,
+		cipher:   cipher,
+		cacheTTL: defaultPostgresCacheTTL,
+		now:      time.Now,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
 	}
 	if err := s.Migrate(ctx); err != nil {
 		_ = db.Close()
@@ -96,22 +121,24 @@ func (s *PostgresStore) Close() error {
 	return s.db.Close()
 }
 
-// Migrate applies all unapplied embedded PostgreSQL migrations in ascending version order.
+// Migrate applies all unapplied embedded PostgreSQL migrations in ascending version order
+// inside a single transaction protected by pg_advisory_xact_lock (compatible with PgBouncer/
+// Supavisor transaction pooling).
 func (s *PostgresStore) Migrate(ctx context.Context) error {
-	conn, err := s.db.Conn(ctx)
+	list, err := readPGMigrations()
 	if err != nil {
-		return fmt.Errorf("store: acquire postgres migration conn: %w", err)
+		return err
 	}
-	defer func() { _ = conn.Close() }()
 
-	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, pgMigrationAdvisoryLockID); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin postgres migration tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, pgMigrationAdvisoryLockID); err != nil {
 		return fmt.Errorf("store: acquire postgres migration lock: %w", err)
 	}
-	defer func() {
-		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_, _ = conn.ExecContext(unlockCtx, `SELECT pg_advisory_unlock($1)`, pgMigrationAdvisoryLockID)
-	}()
 
 	const createTable = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -119,17 +146,12 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 	name TEXT NOT NULL,
 	applied_at TIMESTAMPTZ NOT NULL
 );`
-	if _, err := conn.ExecContext(ctx, createTable); err != nil {
+	if _, err := tx.ExecContext(ctx, createTable); err != nil {
 		return fmt.Errorf("store: create postgres schema_migrations: %w", err)
 	}
 
-	list, err := readPGMigrations()
-	if err != nil {
-		return err
-	}
-
 	applied := make(map[int]bool)
-	rows, err := conn.QueryContext(ctx, `SELECT version FROM schema_migrations`)
+	rows, err := tx.QueryContext(ctx, `SELECT version FROM schema_migrations`)
 	if err != nil {
 		return fmt.Errorf("store: query postgres schema_migrations: %w", err)
 	}
@@ -156,13 +178,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 		if err != nil {
 			return fmt.Errorf("store: read postgres migration %q: %w", m.name, err)
 		}
-
-		tx, err := conn.BeginTx(ctx, nil)
-		if err != nil {
-			return fmt.Errorf("store: begin postgres migration %q: %w", m.name, err)
-		}
 		if _, err := tx.ExecContext(ctx, string(sqlBytes)); err != nil {
-			_ = tx.Rollback()
 			return fmt.Errorf("store: apply postgres migration %q: %w", m.name, err)
 		}
 		if _, err := tx.ExecContext(
@@ -170,14 +186,13 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 			`INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)`,
 			m.version, m.name, time.Now().UTC(),
 		); err != nil {
-			_ = tx.Rollback()
 			return fmt.Errorf("store: record postgres migration %q: %w", m.name, err)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("store: commit postgres migration %q: %w", m.name, err)
 		}
 	}
 
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit postgres migrations: %w", err)
+	}
 	return nil
 }
 
@@ -439,29 +454,36 @@ ON CONFLICT(id) DO UPDATE SET
 	for _, m := range cfg.MCPServers {
 		mcpServerNames = append(mcpServerNames, m.Name)
 
+		transport := m.Transport
+		if transport == "" {
+			transport = config.MCPTransportStreamableHTTP
+		}
+		authType := strings.ToLower(strings.TrimSpace(m.AuthType))
+		if authType == "" {
+			authType = config.MCPAuthNone
+		}
+
 		tokenEnc := ""
-		if m.AuthToken != "" {
+		switch {
+		case authType == config.MCPAuthNone:
+			tokenEnc = ""
+		case m.AuthToken != "":
 			tokenEnc, err = s.cipher.EncryptString(m.AuthToken)
 			if err != nil {
 				return fmt.Errorf("store: encrypt auth token for mcp server %q: %w", m.Name, err)
 			}
-		} else {
+		default:
 			var existingEnc string
-			err := tx.QueryRowContext(ctx, `SELECT auth_token_enc FROM mcp_servers WHERE name = $1`, m.Name).Scan(&existingEnc)
+			err := tx.QueryRowContext(
+				ctx,
+				`SELECT auth_token_enc FROM mcp_servers WHERE name = $1 AND source = $2`,
+				m.Name, SourceConfig,
+			).Scan(&existingEnc)
 			if err == nil {
 				tokenEnc = existingEnc
 			} else if !errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("store: lookup existing mcp server %q: %w", m.Name, err)
 			}
-		}
-
-		transport := m.Transport
-		if transport == "" {
-			transport = config.MCPTransportStreamableHTTP
-		}
-		authType := m.AuthType
-		if authType == "" {
-			authType = config.MCPAuthNone
 		}
 
 		_, err = tx.ExecContext(ctx, `
@@ -557,17 +579,34 @@ func pgDeleteStaleConfigRowsTx(ctx context.Context, tx *sql.Tx, table, keyCol st
 
 // --- Snapshot Cache ---
 
+func (s *PostgresStore) currentTime() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+func (s *PostgresStore) isCacheFreshLocked(now time.Time) bool {
+	if s.cache == nil || s.cacheTTL <= 0 {
+		return false
+	}
+	return now.Sub(s.cacheLoadedAt) < s.cacheTTL
+}
+
 func (s *PostgresStore) snapshot(ctx context.Context) (*configSnapshot, error) {
+	now := s.currentTime()
 	s.cacheMu.RLock()
-	snap := s.cache
-	s.cacheMu.RUnlock()
-	if snap != nil {
+	if s.isCacheFreshLocked(now) {
+		snap := s.cache
+		s.cacheMu.RUnlock()
 		return snap, nil
 	}
+	s.cacheMu.RUnlock()
 
 	s.cacheMu.Lock()
 	defer s.cacheMu.Unlock()
-	if s.cache != nil {
+	now = s.currentTime()
+	if s.isCacheFreshLocked(now) {
 		return s.cache, nil
 	}
 
@@ -576,13 +615,23 @@ func (s *PostgresStore) snapshot(ctx context.Context) (*configSnapshot, error) {
 		return nil, err
 	}
 	s.cache = loaded
+	s.cacheLoadedAt = s.currentTime()
 	s.cacheLoads.Add(1)
 	return loaded, nil
 }
 
 func (s *PostgresStore) loadSnapshotLocked(ctx context.Context) (*configSnapshot, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: begin postgres snapshot tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	// Providers
-	provRows, err := s.db.QueryContext(ctx, `
+	provRows, err := tx.QueryContext(ctx, `
 SELECT name, type, base_url, api_key_enc, passthrough, models_json::text, enabled, source, created_at, updated_at
 FROM providers ORDER BY name ASC`)
 	if err != nil {
@@ -605,7 +654,7 @@ FROM providers ORDER BY name ASC`)
 	}
 
 	// Model routes
-	routeRows, err := s.db.QueryContext(ctx, `
+	routeRows, err := tx.QueryContext(ctx, `
 SELECT alias, provider_name, upstream_model, fallbacks_json::text,
        input_cost_per_million, output_cost_per_million,
        cache_read_cost_per_million, cache_write_cost_per_million,
@@ -631,7 +680,7 @@ FROM model_routes ORDER BY alias ASC`)
 	}
 
 	// Budgets
-	budgetRows, err := s.db.QueryContext(ctx, `
+	budgetRows, err := tx.QueryContext(ctx, `
 SELECT scope, rpm, tpm, max_concurrent, daily_usd, monthly_usd,
        soft_alert_pct, enabled, source, created_at, updated_at
 FROM budgets ORDER BY scope ASC`)
@@ -655,7 +704,7 @@ FROM budgets ORDER BY scope ASC`)
 	}
 
 	// Guardrail rules
-	ruleRows, err := s.db.QueryContext(ctx, `
+	ruleRows, err := tx.QueryContext(ctx, `
 SELECT id, name, category, pattern, action, builtin, enabled, source, created_at, updated_at
 FROM guardrail_rules ORDER BY builtin DESC, id ASC`)
 	if err != nil {
@@ -678,7 +727,7 @@ FROM guardrail_rules ORDER BY builtin DESC, id ASC`)
 	}
 
 	// Webhooks
-	whRows, err := s.db.QueryContext(ctx, `
+	whRows, err := tx.QueryContext(ctx, `
 SELECT id, name, url, type, secret_enc, events_json::text, timeout_ms, fail_open, enabled, source, created_at, updated_at
 FROM webhooks ORDER BY id ASC`)
 	if err != nil {
@@ -701,7 +750,7 @@ FROM webhooks ORDER BY id ASC`)
 	}
 
 	// MCP servers
-	mcpRows, err := s.db.QueryContext(ctx, `
+	mcpRows, err := tx.QueryContext(ctx, `
 SELECT name, url, transport, auth_type, auth_header, auth_token_enc, enabled, source, created_at, updated_at
 FROM mcp_servers ORDER BY name ASC`)
 	if err != nil {
@@ -721,6 +770,10 @@ FROM mcp_servers ORDER BY name ASC`)
 	}
 	if err := mcpRows.Err(); err != nil {
 		return nil, fmt.Errorf("store: iterate mcp servers snapshot rows: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("store: commit postgres snapshot tx: %w", err)
 	}
 
 	byName := make(map[string]Provider, len(providers))
@@ -1122,11 +1175,11 @@ func (s *PostgresStore) UpsertGuardrailRule(ctx context.Context, r GuardrailRule
 	if strings.TrimSpace(r.Pattern) == "" {
 		return errors.New("store: guardrail rule pattern is required")
 	}
-	category := strings.TrimSpace(r.Category)
+	category := strings.ToLower(strings.TrimSpace(r.Category))
 	if category == "" {
 		category = config.GuardrailCategoryCustom
 	}
-	action := strings.TrimSpace(r.Action)
+	action := strings.ToLower(strings.TrimSpace(r.Action))
 	if action == "" {
 		action = config.GuardrailActionRedact
 	}
@@ -1362,7 +1415,7 @@ func (s *PostgresStore) UpsertMCPServer(ctx context.Context, srv MCPServer) erro
 	}
 
 	tokenEnc := ""
-	if srv.AuthToken != "" {
+	if authType != config.MCPAuthNone && srv.AuthToken != "" {
 		var err error
 		tokenEnc, err = s.cipher.EncryptString(srv.AuthToken)
 		if err != nil {
@@ -1478,6 +1531,7 @@ func (s *PostgresStore) InsertMCPAuditLog(ctx context.Context, log MCPAuditLog) 
 	if err != nil {
 		return fmt.Errorf("store: encode mcp audit tags: %w", err)
 	}
+	tagsJSON = string(stripPostgresJSONNUL([]byte(tagsJSON)))
 
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO mcp_audit_logs (
@@ -1486,10 +1540,11 @@ INSERT INTO mcp_audit_logs (
 	latency_ms, error_message, arguments_preview
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13, $14, $15, $16)`,
-		log.ID, createdAt, log.RequestID, log.Subject, log.DisplayName,
-		log.NodeName, log.NodeIP, tagsJSON, log.AuthSource, log.ServerName,
-		log.Method, log.ToolName, log.Status, log.LatencyMS, log.ErrorMessage,
-		log.ArgumentsPreview,
+		stripPostgresNUL(log.ID), createdAt, stripPostgresNUL(log.RequestID), stripPostgresNUL(log.Subject),
+		stripPostgresNUL(log.DisplayName), stripPostgresNUL(log.NodeName), stripPostgresNUL(log.NodeIP),
+		tagsJSON, stripPostgresNUL(log.AuthSource), stripPostgresNUL(log.ServerName),
+		stripPostgresNUL(log.Method), stripPostgresNUL(log.ToolName), stripPostgresNUL(log.Status),
+		log.LatencyMS, stripPostgresNUL(log.ErrorMessage), stripPostgresNUL(log.ArgumentsPreview),
 	)
 	if err != nil {
 		return fmt.Errorf("store: insert mcp audit log %q: %w", log.ID, err)
@@ -1503,7 +1558,7 @@ func (s *PostgresStore) QueryMCPAuditLogs(ctx context.Context, filter MCPAuditFi
 SELECT id, created_at, request_id, subject, display_name, node_name, node_ip,
        tags_json::text, auth_source, server_name, method, tool_name, status,
        latency_ms, error_message, arguments_preview
-FROM mcp_audit_logs` + where + ` ORDER BY created_at DESC`
+FROM mcp_audit_logs` + where + ` ORDER BY created_at DESC, id DESC`
 
 	if filter.Limit > 0 {
 		args = append(args, filter.Limit)
@@ -1615,12 +1670,14 @@ func (s *PostgresStore) CreateChatSession(ctx context.Context, session ChatSessi
 	if err != nil {
 		return nil, fmt.Errorf("store: encode chat session mcp_servers: %w", err)
 	}
+	mcpJSON = string(stripPostgresJSONNUL([]byte(mcpJSON)))
 
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO chat_sessions (id, subject, title, model, mcp_servers_json, system_prompt, created_at, updated_at)
 VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)`,
-		session.ID, session.Subject, session.Title, session.Model,
-		mcpJSON, session.SystemPrompt, session.CreatedAt, session.UpdatedAt,
+		stripPostgresNUL(session.ID), stripPostgresNUL(session.Subject), stripPostgresNUL(session.Title),
+		stripPostgresNUL(session.Model), mcpJSON, stripPostgresNUL(session.SystemPrompt),
+		session.CreatedAt, session.UpdatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("store: create chat session %q: %w", session.ID, err)
@@ -1653,7 +1710,7 @@ func (s *PostgresStore) ListChatSessions(ctx context.Context, subject string, li
 	}
 	query := `
 SELECT id, subject, title, model, mcp_servers_json::text, system_prompt, created_at, updated_at
-FROM chat_sessions WHERE subject = $1 ORDER BY updated_at DESC, created_at DESC`
+FROM chat_sessions WHERE subject = $1 ORDER BY updated_at DESC, created_at DESC, id DESC`
 	args := []any{subject}
 	if limit > 0 {
 		args = append(args, limit)
@@ -1690,11 +1747,13 @@ func (s *PostgresStore) UpdateChatSession(ctx context.Context, subject string, s
 	if err != nil {
 		return nil, fmt.Errorf("store: encode chat session mcp_servers: %w", err)
 	}
+	mcpJSON = string(stripPostgresJSONNUL([]byte(mcpJSON)))
 	res, err := s.db.ExecContext(ctx, `
 UPDATE chat_sessions
 SET title = $1, model = $2, mcp_servers_json = $3::jsonb, system_prompt = $4, updated_at = $5
 WHERE id = $6 AND subject = $7`,
-		session.Title, session.Model, mcpJSON, session.SystemPrompt, time.Now().UTC(), session.ID, subject,
+		stripPostgresNUL(session.Title), stripPostgresNUL(session.Model), mcpJSON,
+		stripPostgresNUL(session.SystemPrompt), time.Now().UTC(), session.ID, subject,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("store: update chat session %q: %w", session.ID, err)
@@ -1725,8 +1784,24 @@ func (s *PostgresStore) InsertChatMessage(ctx context.Context, subject string, m
 	if strings.TrimSpace(msg.ID) == "" {
 		msg.ID = uuid.NewString()
 	}
+	msg.Role = stripPostgresNUL(msg.Role)
+	msg.Content = stripPostgresNUL(msg.Content)
+	msg.Model = stripPostgresNUL(msg.Model)
 	if msg.ToolEvents == nil {
 		msg.ToolEvents = []ChatToolEvent{}
+	} else {
+		cleaned := make([]ChatToolEvent, len(msg.ToolEvents))
+		for i, ev := range msg.ToolEvents {
+			ev.ID = stripPostgresNUL(ev.ID)
+			ev.Server = stripPostgresNUL(ev.Server)
+			ev.Tool = stripPostgresNUL(ev.Tool)
+			ev.Result = stripPostgresNUL(ev.Result)
+			if len(ev.Arguments) > 0 {
+				ev.Arguments = stripPostgresJSONNUL(ev.Arguments)
+			}
+			cleaned[i] = ev
+		}
+		msg.ToolEvents = cleaned
 	}
 	createdAt := msg.CreatedAt.UTC()
 	if createdAt.IsZero() {
@@ -1738,6 +1813,7 @@ func (s *PostgresStore) InsertChatMessage(ctx context.Context, subject string, m
 	if err != nil {
 		return nil, fmt.Errorf("store: encode chat tool_events: %w", err)
 	}
+	eventsJSON = string(stripPostgresJSONNUL([]byte(eventsJSON)))
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1756,7 +1832,7 @@ func (s *PostgresStore) InsertChatMessage(ctx context.Context, subject string, m
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO chat_messages (id, session_id, role, content, tool_events_json, model, input_tokens, output_tokens, cost_usd, created_at)
 VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10)`,
-		msg.ID, msg.SessionID, msg.Role, msg.Content, eventsJSON,
+		stripPostgresNUL(msg.ID), stripPostgresNUL(msg.SessionID), msg.Role, msg.Content, eventsJSON,
 		msg.Model, msg.InputTokens, msg.OutputTokens, msg.CostUSD, createdAt,
 	); err != nil {
 		return nil, fmt.Errorf("store: insert chat message %q: %w", msg.ID, err)
@@ -1789,7 +1865,7 @@ func (s *PostgresStore) ListChatMessages(ctx context.Context, subject, sessionID
 
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, session_id, role, content, tool_events_json::text, model, input_tokens, output_tokens, cost_usd, created_at
-FROM chat_messages WHERE session_id = $1 ORDER BY created_at ASC, id ASC`, sessionID)
+FROM chat_messages WHERE session_id = $1 ORDER BY created_at ASC, seq ASC`, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list postgres chat messages: %w", err)
 	}
@@ -1804,6 +1880,25 @@ FROM chat_messages WHERE session_id = $1 ORDER BY created_at ASC, id ASC`, sessi
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+func (s *PostgresStore) DeleteChatMessage(ctx context.Context, subject, sessionID, messageID string) error {
+	subject = strings.TrimSpace(subject)
+	sessionID = strings.TrimSpace(sessionID)
+	messageID = strings.TrimSpace(messageID)
+	if subject == "" || sessionID == "" || messageID == "" {
+		return ErrNotFound
+	}
+	res, err := s.db.ExecContext(ctx, `
+DELETE FROM chat_messages
+WHERE id = $1 AND session_id = $2
+  AND EXISTS (SELECT 1 FROM chat_sessions WHERE id = $2 AND subject = $3)`,
+		messageID, sessionID, subject,
+	)
+	if err != nil {
+		return fmt.Errorf("store: delete postgres chat message %q: %w", messageID, err)
+	}
+	return checkAffected(res)
 }
 
 func pgScanChatSession(sc scanner) (ChatSession, error) {
@@ -1917,10 +2012,12 @@ func (s *PostgresStore) InsertUsageLog(ctx context.Context, log UsageLog) error 
 	if err != nil {
 		return fmt.Errorf("store: encode usage tags: %w", err)
 	}
+	tagsJSON = string(stripPostgresJSONNUL([]byte(tagsJSON)))
 	hitsJSON, err := marshalStringSlice(log.GuardrailHits)
 	if err != nil {
 		return fmt.Errorf("store: encode guardrail hits: %w", err)
 	}
+	hitsJSON = string(stripPostgresJSONNUL([]byte(hitsJSON)))
 
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO usage_logs (
@@ -1932,13 +2029,14 @@ INSERT INTO usage_logs (
 	status_code, error_message, guardrail_action, guardrail_hits_json
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30::jsonb)`,
-		log.ID, createdAt, log.RequestID, log.Subject, log.DisplayName,
-		log.NodeName, log.NodeIP, tagsJSON, log.AuthSource, log.ProviderName,
-		log.ProviderType, log.RequestedModel, log.UpstreamModel, log.Protocol,
-		log.Endpoint, log.Stream, log.Translated,
+		stripPostgresNUL(log.ID), createdAt, stripPostgresNUL(log.RequestID), stripPostgresNUL(log.Subject),
+		stripPostgresNUL(log.DisplayName), stripPostgresNUL(log.NodeName), stripPostgresNUL(log.NodeIP),
+		tagsJSON, stripPostgresNUL(log.AuthSource), stripPostgresNUL(log.ProviderName),
+		stripPostgresNUL(log.ProviderType), stripPostgresNUL(log.RequestedModel), stripPostgresNUL(log.UpstreamModel),
+		stripPostgresNUL(log.Protocol), stripPostgresNUL(log.Endpoint), log.Stream, log.Translated,
 		log.InputTokens, log.OutputTokens, log.CacheReadTokens, log.CacheWriteTokens,
 		log.ReasoningTokens, log.TotalTokens, log.CostUSD, log.LatencyMS, log.TTFTMS,
-		log.StatusCode, log.ErrorMessage, log.GuardrailAction, hitsJSON,
+		log.StatusCode, stripPostgresNUL(log.ErrorMessage), stripPostgresNUL(log.GuardrailAction), hitsJSON,
 	)
 	if err != nil {
 		return fmt.Errorf("store: insert postgres usage log %q: %w", log.ID, err)
@@ -1975,7 +2073,7 @@ SELECT id, created_at, request_id, subject, display_name, node_name, node_ip,
        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
        reasoning_tokens, total_tokens, cost_usd, latency_ms, ttft_ms,
        status_code, error_message, guardrail_action, guardrail_hits_json::text
-FROM usage_logs` + where + ` ORDER BY created_at DESC`
+FROM usage_logs` + where + ` ORDER BY created_at DESC, id DESC`
 
 	if filter.Limit > 0 {
 		args = append(args, filter.Limit)
@@ -2257,10 +2355,12 @@ func (s *PostgresStore) InsertAuditPayload(ctx context.Context, payload AuditPay
 	if err != nil {
 		return fmt.Errorf("store: encode request headers: %w", err)
 	}
+	reqHeaders = string(stripPostgresJSONNUL([]byte(reqHeaders)))
 	respHeaders, err := marshalStringMap(payload.ResponseHeaders)
 	if err != nil {
 		return fmt.Errorf("store: encode response headers: %w", err)
 	}
+	respHeaders = string(stripPostgresJSONNUL([]byte(respHeaders)))
 
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO audit_payloads (
@@ -2268,8 +2368,8 @@ INSERT INTO audit_payloads (
 	response_headers_json, response_body, redacted
 )
 VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb, $7, $8)`,
-		payload.ID, payload.UsageLogID, createdAt, reqHeaders,
-		payload.RequestBody, respHeaders, payload.ResponseBody, payload.Redacted,
+		stripPostgresNUL(payload.ID), stripPostgresNUL(payload.UsageLogID), createdAt, reqHeaders,
+		stripPostgresNUL(payload.RequestBody), respHeaders, stripPostgresNUL(payload.ResponseBody), payload.Redacted,
 	)
 	if err != nil {
 		return fmt.Errorf("store: insert postgres audit payload: %w", err)
@@ -2315,4 +2415,55 @@ func (s *PostgresStore) PurgeAuditPayloads(ctx context.Context, olderThan time.T
 		return 0, fmt.Errorf("store: purge postgres audit payloads rows affected: %w", err)
 	}
 	return n, nil
+}
+
+// stripPostgresNUL removes NUL (0x00) bytes which PostgreSQL TEXT columns reject (SQLSTATE 22P05).
+func stripPostgresNUL(s string) string {
+	if strings.IndexByte(s, 0) < 0 {
+		return s
+	}
+	return strings.ReplaceAll(s, "\x00", "")
+}
+
+// stripPostgresJSONNUL removes raw NUL bytes (0x00) and unescaped JSON Unicode NUL escapes
+// (\u0000 / \U0000) which PostgreSQL JSONB columns reject (SQLSTATE 22P05), while preserving
+// escaped literal backslash sequences such as \\u0000.
+func stripPostgresJSONNUL(b []byte) []byte {
+	if len(b) == 0 {
+		return b
+	}
+	needsScan := false
+	for _, c := range b {
+		if c == 0 || c == '\\' {
+			needsScan = true
+			break
+		}
+	}
+	if !needsScan {
+		return b
+	}
+
+	out := make([]byte, 0, len(b))
+	backslashes := 0
+	for i := 0; i < len(b); {
+		c := b[i]
+		if c == 0 {
+			i++
+			continue
+		}
+		if c == '\\' && backslashes%2 == 0 && i+5 < len(b) &&
+			(b[i+1] == 'u' || b[i+1] == 'U') &&
+			b[i+2] == '0' && b[i+3] == '0' && b[i+4] == '0' && b[i+5] == '0' {
+			i += 6
+			continue
+		}
+		out = append(out, c)
+		if c == '\\' {
+			backslashes++
+		} else {
+			backslashes = 0
+		}
+		i++
+	}
+	return out
 }

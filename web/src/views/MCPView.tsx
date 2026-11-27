@@ -64,7 +64,7 @@ export function MCPView({
   );
 
   // Server probe / test & discover state
-  const [testingName, setTestingName] = useState<string | null>(null);
+  const [testingMap, setTestingMap] = useState<Record<string, boolean>>({});
   const [testResults, setTestResults] = useState<
     Record<string, MCPServerTestResult>
   >({});
@@ -300,13 +300,12 @@ export function MCPView({
   };
 
   const handleTestServer = async (name: string) => {
-    setTestingName(name);
+    if (testingMap[name]) return;
+    setTestingMap((prev) => ({ ...prev, [name]: true }));
     try {
       const res = await api.testAdminMCPServer(name);
       setTestResults((prev) => ({ ...prev, [name]: res }));
-      if ((res.tools ?? []).length > 0) {
-        setInspectToolsServer(name);
-      }
+      setInspectToolsServer(name);
     } catch (err: unknown) {
       setTestResults((prev) => ({
         ...prev,
@@ -317,8 +316,9 @@ export function MCPView({
           tools: [],
         },
       }));
+      setInspectToolsServer(name);
     } finally {
-      setTestingName(null);
+      setTestingMap((prev) => ({ ...prev, [name]: false }));
     }
   };
 
@@ -441,7 +441,7 @@ export function MCPView({
                 ) : (
                   servers.map((srv) => {
                     const isYaml = srv.source === 'config';
-                    const isTesting = testingName === srv.name;
+                    const isTesting = Boolean(testingMap[srv.name]);
                     const probe = testResults[srv.name];
                     const clientUrl = `${origin}/mcp/${srv.name}`;
 
@@ -543,19 +543,21 @@ export function MCPView({
                                 ? `header:${srv.auth_header}`
                                 : srv.auth_type || 'none'}
                             </span>
-                            {srv.has_auth_token && (
-                              <span
-                                className="ap-mono ap-truncate"
-                                style={{
-                                  fontSize: 11,
-                                  color: 'var(--ap-text-muted)',
-                                  maxWidth: '100%',
-                                }}
-                                title={srv.auth_token_preview || 'Stored'}
-                              >
-                                {srv.auth_token_preview || '****'}
-                              </span>
-                            )}
+                            {srv.auth_type &&
+                              srv.auth_type !== 'none' &&
+                              srv.has_auth_token && (
+                                <span
+                                  className="ap-mono ap-truncate"
+                                  style={{
+                                    fontSize: 11,
+                                    color: 'var(--ap-text-muted)',
+                                    maxWidth: '100%',
+                                  }}
+                                  title={srv.auth_token_preview || 'Stored'}
+                                >
+                                  {srv.auth_token_preview || '****'}
+                                </span>
+                              )}
                           </div>
                         </td>
                         <td>
@@ -974,6 +976,13 @@ export function MCPView({
       >
         {inspectedDiscovery && (
           <>
+            {!inspectedDiscovery.ok && inspectedDiscovery.message && (
+              <div className="ap-alert ap-alert--danger" role="alert">
+                <AlertIcon style={{ flexShrink: 0, marginTop: 1 }} />
+                <span>{inspectedDiscovery.message}</span>
+              </div>
+            )}
+
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <span
                 className={`ap-badge ${

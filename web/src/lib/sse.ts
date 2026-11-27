@@ -75,6 +75,7 @@ export async function consumeSSEStream(
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   const parser = new SSEParser();
+  let completedNormally = false;
 
   try {
     while (true) {
@@ -94,7 +95,11 @@ export async function consumeSSEStream(
     for (const frame of parser.flush()) {
       onFrame(frame);
     }
+    completedNormally = true;
   } finally {
+    if (!completedNormally) {
+      await reader.cancel().catch(() => {});
+    }
     reader.releaseLock();
   }
 }

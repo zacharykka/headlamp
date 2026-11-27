@@ -13,6 +13,7 @@ import {
   CheckIcon,
   ChevronDownIcon,
   ChevronRightIcon,
+  CloseIcon,
   EditIcon,
   HeadlampMark,
   PlusIcon,
@@ -56,6 +57,46 @@ function formatToolArgs(args: unknown): string {
   } catch {
     return String(args);
   }
+}
+
+function finalizeIncompleteAssistantMessage(
+  messages: ChatMessage[],
+  assistantId: string,
+  reason: 'aborted' | 'error',
+): ChatMessage[] {
+  const out: ChatMessage[] = [];
+  for (const msg of messages) {
+    if (msg.id !== assistantId) {
+      out.push(msg);
+      continue;
+    }
+
+    const updatedTools = (msg.tool_events ?? []).map((ev) =>
+      ev.result === undefined && !ev.is_error
+        ? {
+            ...ev,
+            is_error: true,
+            result:
+              reason === 'aborted'
+                ? 'Cancelled by user'
+                : 'Interrupted by stream error',
+          }
+        : ev,
+    );
+
+    const hasText = Boolean(msg.content && msg.content.length > 0);
+    const hasTools = updatedTools.length > 0;
+    if (!hasText && !hasTools) {
+      // Remove empty placeholder bubble on early stop or error before output arrives
+      continue;
+    }
+
+    out.push({
+      ...msg,
+      tool_events: updatedTools,
+    });
+  }
+  return out;
 }
 
 function ToolEventCard({ event }: { event: ChatToolEvent }) {
@@ -139,7 +180,9 @@ export function ChatView() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loadingThread, setLoadingThread] = useState(false);
 
-  const [railOpen, setRailOpen] = useState(true);
+  const [railOpen, setRailOpen] = useState(() =>
+    typeof window !== 'undefined' ? window.innerWidth >= 960 : true,
+  );
   const [selectedModel, setSelectedModel] = useState('');
   const [selectedMcpNames, setSelectedMcpNames] = useState<string[]>([]);
   const [systemPrompt, setSystemPrompt] = useState('');
@@ -156,6 +199,7 @@ export function ChatView() {
   // MCP tools popover & System prompt modal
   const [toolsPopoverOpen, setToolsPopoverOpen] = useState(false);
   const toolsPopoverRef = useRef<HTMLDivElement | null>(null);
+  const bottomToolsBtnRef = useRef<HTMLButtonElement | null>(null);
   const [sysModalOpen, setSysModalOpen] = useState(false);
   const [sysDraft, setSysDraft] = useState('');
   const [sysModalError, setSysModalError] = useState<string | null>(null);
@@ -163,6 +207,7 @@ export function ChatView() {
 
   // Streaming & auto-scroll refs
   const streamAbortRef = useRef<AbortController | null>(null);
+  const activeTempAssistantIdRef = useRef<string | null>(null);
   const threadAbortRef = useRef<AbortController | null>(null);
   const threadScrollRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
@@ -193,12 +238,14 @@ export function ChatView() {
   useEffect(() => {
     if (!toolsPopoverOpen) return;
     const onPointerDown = (e: MouseEvent) => {
+      const target = e.target as Node;
       if (
-        toolsPopoverRef.current &&
-        !toolsPopoverRef.current.contains(e.target as Node)
+        (toolsPopoverRef.current && toolsPopoverRef.current.contains(target)) ||
+        (bottomToolsBtnRef.current && bottomToolsBtnRef.current.contains(target))
       ) {
-        setToolsPopoverOpen(false);
+        return;
       }
+      setToolsPopoverOpen(false);
     };
     const onKeyDown = (e: globalThis.KeyboardEvent) => {
       if (e.key === 'Escape') setToolsPopoverOpen(false);
@@ -226,14 +273,30 @@ export function ChatView() {
     [sessions, activeSessionId],
   );
 
-  const selectSession = async (session: ChatSession) => {
-    if (streaming) {
-      streamAbortRef.current?.abort();
-      setStreaming(false);
+  const abortActiveStream = () => {
+    if (streamAbortRef.current) {
+      streamAbortRef.current.abort();
+      streamAbortRef.current = null;
     }
+    if (activeTempAssistantIdRef.current) {
+      const pendingId = activeTempAssistantIdRef.current;
+      activeTempAssistantIdRef.current = null;
+      setMessages((prev) =>
+        finalizeIncompleteAssistantMessage(prev, pendingId, 'aborted'),
+      );
+    }
+    setStreaming(false);
+  };
+
+  const selectSession = async (session: ChatSession) => {
+    abortActiveStream();
     threadAbortRef.current?.abort();
     const controller = new AbortController();
     threadAbortRef.current = controller;
+
+    if (typeof window !== 'undefined' && window.innerWidth < 768) {
+      setRailOpen(false);
+    }
 
     setActiveSessionId(session.id);
     setSelectedModel(session.model || models[0]?.id || '');
@@ -263,13 +326,16 @@ export function ChatView() {
   };
 
   const startNewChat = () => {
-    if (streaming) {
-      streamAbortRef.current?.abort();
-      setStreaming(false);
-    }
+    abortActiveStream();
     threadAbortRef.current?.abort();
+    if (typeof window !== 'undefined' && window.innerWidth < 768) {
+      setRailOpen(false);
+    }
     setActiveSessionId(null);
     setMessages([]);
+    if (models.length > 0 && !models.some((m) => m.id === selectedModel)) {
+      setSelectedModel(models[0].id);
+    }
     setSystemPrompt('');
     setError(null);
     stickToBottomRef.current = true;
@@ -378,9 +444,7 @@ export function ChatView() {
   };
 
   const handleStopStreaming = () => {
-    streamAbortRef.current?.abort();
-    streamAbortRef.current = null;
-    setStreaming(false);
+    abortActiveStream();
   };
 
   const handleSend = async () => {
@@ -393,29 +457,44 @@ export function ChatView() {
       return;
     }
 
+    streamAbortRef.current?.abort();
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+
     setError(null);
     setDraft('');
     setStreaming(true);
     stickToBottomRef.current = true;
 
     let sessionId = activeSessionId;
+    let sseStarted = false;
+    let persistedUserId: string | null = null;
+    let assistantProgressed = false;
+    const tempUserId = `temp-user-${Date.now()}`;
+    const tempAssistantId = `temp-asst-${Date.now()}`;
+    activeTempAssistantIdRef.current = tempAssistantId;
+
+    const isStaleOrAborted = () =>
+      controller.signal.aborted || streamAbortRef.current !== controller;
+
     try {
       if (!sessionId) {
-        const autoTitle =
-          content.length > 44 ? `${content.slice(0, 44).trim()}...` : content;
-        const created = await api.createChatSession({
-          title: autoTitle,
-          model: effectiveModel,
-          mcp_servers: selectedMcpNames,
-          system_prompt: systemPrompt || undefined,
-        });
+        const created = await api.createChatSession(
+          {
+            title: 'New Chat',
+            model: effectiveModel,
+            mcp_servers: selectedMcpNames,
+            system_prompt: systemPrompt || undefined,
+          },
+          { signal: controller.signal },
+        );
+        if (isStaleOrAborted()) return;
         sessionId = created.id;
         setActiveSessionId(created.id);
         setSessions((prev) => [created, ...prev.filter((s) => s.id !== created.id)]);
       }
 
-      const tempUserId = `temp-user-${Date.now()}`;
-      const tempAssistantId = `temp-asst-${Date.now()}`;
+      if (isStaleOrAborted()) return;
       const nowIso = new Date().toISOString();
 
       setMessages((prev) => [
@@ -438,9 +517,6 @@ export function ChatView() {
         },
       ]);
 
-      const controller = new AbortController();
-      streamAbortRef.current = controller;
-
       await api.streamChatMessage(
         sessionId,
         {
@@ -450,6 +526,9 @@ export function ChatView() {
         },
         {
           onMessageStart: ({ user_message, session }) => {
+            if (isStaleOrAborted()) return;
+            sseStarted = true;
+            persistedUserId = user_message.id;
             setSessions((prev) => [
               session,
               ...prev.filter((s) => s.id !== session.id),
@@ -459,6 +538,9 @@ export function ChatView() {
             );
           },
           onDelta: ({ text }) => {
+            if (isStaleOrAborted()) return;
+            sseStarted = true;
+            assistantProgressed = true;
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === tempAssistantId
@@ -468,6 +550,9 @@ export function ChatView() {
             );
           },
           onToolStart: (ev) => {
+            if (isStaleOrAborted()) return;
+            sseStarted = true;
+            assistantProgressed = true;
             setMessages((prev) =>
               prev.map((m) => {
                 if (m.id !== tempAssistantId) return m;
@@ -488,6 +573,9 @@ export function ChatView() {
             );
           },
           onToolResult: (ev) => {
+            if (isStaleOrAborted()) return;
+            sseStarted = true;
+            assistantProgressed = true;
             setMessages((prev) =>
               prev.map((m) => {
                 if (m.id !== tempAssistantId) return m;
@@ -519,6 +607,12 @@ export function ChatView() {
             );
           },
           onMessageDone: ({ assistant_message }) => {
+            if (isStaleOrAborted()) return;
+            sseStarted = true;
+            assistantProgressed = true;
+            if (activeTempAssistantIdRef.current === tempAssistantId) {
+              activeTempAssistantIdRef.current = null;
+            }
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === tempAssistantId
@@ -535,23 +629,79 @@ export function ChatView() {
             );
           },
           onError: (errEvt) => {
+            if (isStaleOrAborted()) return;
+            sseStarted = true;
             setError(errEvt.message || 'Stream error');
+            if (!assistantProgressed) {
+              const userIdToRemove = persistedUserId ?? tempUserId;
+              setMessages((prev) =>
+                prev.filter(
+                  (m) =>
+                    m.id !== tempUserId &&
+                    m.id !== userIdToRemove &&
+                    m.id !== tempAssistantId,
+                ),
+              );
+              if (!persistedUserId) {
+                setDraft((prev) => prev || content);
+              }
+            } else {
+              setMessages((prev) =>
+                finalizeIncompleteAssistantMessage(prev, tempAssistantId, 'error'),
+              );
+            }
           },
         },
         { signal: controller.signal },
       );
+
+      // Ensure any dangling empty placeholder or unfinished tool card is cleaned up if stream ended without message_done
+      if (!isStaleOrAborted() && activeTempAssistantIdRef.current === tempAssistantId) {
+        activeTempAssistantIdRef.current = null;
+        setMessages((prev) =>
+          finalizeIncompleteAssistantMessage(prev, tempAssistantId, 'error'),
+        );
+      }
     } catch (err: unknown) {
-      if ((err as { name?: string })?.name !== 'AbortError') {
+      const isAbort =
+        controller.signal.aborted || (err as { name?: string })?.name === 'AbortError';
+      if (isAbort) {
+        if (streamAbortRef.current === controller) {
+          setMessages((prev) =>
+            sseStarted
+              ? finalizeIncompleteAssistantMessage(prev, tempAssistantId, 'aborted')
+              : prev.filter((m) => m.id !== tempUserId && m.id !== tempAssistantId),
+          );
+        }
+      } else if (streamAbortRef.current === controller) {
         setError(err instanceof Error ? err.message : 'Failed to send message');
+        if (!sseStarted) {
+          setDraft((prev) => prev || content);
+          setMessages((prev) =>
+            prev.filter((m) => m.id !== tempUserId && m.id !== tempAssistantId),
+          );
+        } else {
+          setMessages((prev) =>
+            finalizeIncompleteAssistantMessage(prev, tempAssistantId, 'error'),
+          );
+        }
       }
     } finally {
-      streamAbortRef.current = null;
-      setStreaming(false);
+      if (activeTempAssistantIdRef.current === tempAssistantId) {
+        activeTempAssistantIdRef.current = null;
+      }
+      if (streamAbortRef.current === controller) {
+        streamAbortRef.current = null;
+        setStreaming(false);
+      }
     }
   };
 
   const handleComposerKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+    if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) {
+      return;
+    }
+    if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       void handleSend();
     }
@@ -562,153 +712,182 @@ export function ChatView() {
     [models, selectedModel],
   );
 
+  const isSelectedModelMissing =
+    Boolean(selectedModel) && !models.some((m) => m.id === selectedModel);
+
   const availableMcpServers = mcpServers.filter((s) => s.enabled);
+  const missingSelectedMcpNames = useMemo(
+    () =>
+      selectedMcpNames.filter(
+        (name) => !availableMcpServers.some((s) => s.name === name),
+      ),
+    [selectedMcpNames, availableMcpServers],
+  );
+
+  const resolveProviderType = (modelId?: string): string => {
+    const target = modelId || selectedModel;
+    if (!target) return 'other';
+    const match = models.find((m) => m.id === target);
+    return match?.provider_type || match?.provider || target;
+  };
 
   return (
     <div className="ap-chat-shell">
       {railOpen && (
-        <aside className="ap-chat-rail" aria-label="Chat history">
-          <div className="ap-chat-rail-head">
-            <button
-              type="button"
-              className="ap-btn ap-btn-sm"
-              style={{ width: '100%', justifyContent: 'flex-start' }}
-              onClick={startNewChat}
-            >
-              <PlusIcon size={14} />
-              <span>New chat</span>
-            </button>
-          </div>
-
-          <div className="ap-chat-rail-list">
-            <div
-              style={{
-                padding: '4px 8px 6px',
-                fontSize: 11,
-                fontWeight: 600,
-                color: 'var(--ap-text-muted)',
-                letterSpacing: '0.02em',
-              }}
-            >
-              Chats
+        <>
+          <div
+            className="ap-chat-rail-backdrop"
+            onClick={() => setRailOpen(false)}
+            aria-hidden="true"
+          />
+          <aside className="ap-chat-rail" aria-label="Chat history">
+            <div className="ap-chat-rail-head">
+              <button
+                type="button"
+                className="ap-btn ap-btn-sm"
+                style={{ width: '100%', justifyContent: 'flex-start' }}
+                onClick={startNewChat}
+              >
+                <PlusIcon size={14} />
+                <span>New chat</span>
+              </button>
             </div>
 
-            {sessions.length === 0 ? (
+            <div className="ap-chat-rail-list">
               <div
                 style={{
-                  padding: '8px 8px',
-                  fontSize: 12.5,
+                  padding: '4px 8px 6px',
+                  fontSize: 11,
+                  fontWeight: 600,
                   color: 'var(--ap-text-muted)',
+                  letterSpacing: '0.02em',
                 }}
               >
-                No conversations yet
+                Chats
               </div>
-            ) : (
-              sessions.map((sess) => {
-                const isActive = sess.id === activeSessionId;
-                const isRenaming = renamingId === sess.id;
 
-                return (
-                  <div
-                    key={sess.id}
-                    className="ap-chat-session-row"
-                    data-active={isActive}
-                    onClick={() => {
-                      if (!isRenaming) void selectSession(sess);
-                    }}
-                  >
-                    {isRenaming ? (
-                      <form
-                        style={{ flex: 1, display: 'flex', gap: 4, minWidth: 0 }}
-                        onSubmit={(e) => {
-                          e.preventDefault();
-                          void commitRename(sess.id);
-                        }}
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        <input
-                          className="ap-input ap-input--sm"
-                          style={{ height: 26, padding: '2px 6px', fontSize: 12 }}
-                          autoFocus
-                          value={renameText}
-                          onChange={(e) => setRenameText(e.target.value)}
-                          onBlur={() => void commitRename(sess.id)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Escape') {
-                              e.stopPropagation();
-                              renameSubmittingRef.current = true;
-                              setRenamingId(null);
-                              window.setTimeout(() => {
-                                renameSubmittingRef.current = false;
-                              }, 0);
-                            }
+              {sessions.length === 0 ? (
+                <div
+                  style={{
+                    padding: '8px 8px',
+                    fontSize: 12.5,
+                    color: 'var(--ap-text-muted)',
+                  }}
+                >
+                  No conversations yet
+                </div>
+              ) : (
+                sessions.map((sess) => {
+                  const isActive = sess.id === activeSessionId;
+                  const isRenaming = renamingId === sess.id;
+
+                  return (
+                    <div
+                      key={sess.id}
+                      className="ap-chat-session-row"
+                      data-active={isActive}
+                      onClick={() => {
+                        if (!isRenaming) void selectSession(sess);
+                      }}
+                    >
+                      {isRenaming ? (
+                        <form
+                          style={{ flex: 1, display: 'flex', gap: 4, minWidth: 0 }}
+                          onSubmit={(e) => {
+                            e.preventDefault();
+                            void commitRename(sess.id);
                           }}
-                          aria-label="Session title"
-                        />
-                        <button
-                          type="submit"
-                          className="ap-btn ap-btn-ghost ap-btn-sm ap-btn-icon-compact"
-                          aria-label="Save title"
-                        >
-                          <CheckIcon size={13} />
-                        </button>
-                      </form>
-                    ) : (
-                      <>
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div
-                            className="ap-truncate"
-                            style={{
-                              fontSize: 12.5,
-                              fontWeight: isActive ? 600 : 480,
-                            }}
-                            title={sess.title || 'Untitled chat'}
-                          >
-                            {sess.title || 'Untitled chat'}
-                          </div>
-                          <div
-                            className="ap-mono ap-truncate"
-                            style={{ fontSize: 10.5, color: 'var(--ap-text-muted)' }}
-                          >
-                            {sess.model}
-                          </div>
-                        </div>
-
-                        <div
-                          style={{ display: 'inline-flex', alignItems: 'center', gap: 2, flexShrink: 0 }}
                           onClick={(e) => e.stopPropagation()}
                         >
-                          <button
-                            type="button"
-                            className="ap-btn ap-btn-ghost ap-btn-sm ap-btn-icon-compact"
-                            style={{ padding: '0 4px', height: 24 }}
-                            aria-label={`Rename ${sess.title || 'chat'}`}
-                            title="Rename chat"
-                            onClick={() => {
-                              setRenamingId(sess.id);
-                              setRenameText(sess.title || '');
+                          <input
+                            className="ap-input ap-input--sm"
+                            style={{ height: 26, padding: '2px 6px', fontSize: 12 }}
+                            autoFocus
+                            value={renameText}
+                            onChange={(e) => setRenameText(e.target.value)}
+                            onBlur={() => void commitRename(sess.id)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Escape') {
+                                e.stopPropagation();
+                                renameSubmittingRef.current = true;
+                                setRenamingId(null);
+                                window.setTimeout(() => {
+                                  renameSubmittingRef.current = false;
+                                }, 0);
+                              }
                             }}
-                          >
-                            <EditIcon size={12} />
-                          </button>
-                          <ConfirmDeleteButton
-                            itemName={sess.title || 'chat'}
-                            onConfirm={() => handleDeleteSession(sess.id)}
+                            aria-label="Session title"
                           />
-                        </div>
-                      </>
-                    )}
-                  </div>
-                );
-              })
-            )}
-          </div>
-        </aside>
+                          <button
+                            type="submit"
+                            className="ap-btn ap-btn-ghost ap-btn-sm ap-btn-icon-compact"
+                            aria-label="Save title"
+                          >
+                            <CheckIcon size={13} />
+                          </button>
+                        </form>
+                      ) : (
+                        <>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div
+                              className="ap-truncate"
+                              style={{
+                                fontSize: 12.5,
+                                fontWeight: isActive ? 600 : 480,
+                              }}
+                              title={sess.title || 'Untitled chat'}
+                            >
+                              {sess.title || 'Untitled chat'}
+                            </div>
+                            <div
+                              className="ap-mono ap-truncate"
+                              style={{ fontSize: 10.5, color: 'var(--ap-text-muted)' }}
+                            >
+                              {sess.model}
+                            </div>
+                          </div>
+
+                          <div
+                            style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: 2,
+                              flexShrink: 0,
+                            }}
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <button
+                              type="button"
+                              className="ap-btn ap-btn-ghost ap-btn-sm ap-btn-icon-compact"
+                              style={{ padding: '0 4px', height: 24 }}
+                              aria-label={`Rename ${sess.title || 'chat'}`}
+                              title="Rename chat"
+                              onClick={() => {
+                                setRenamingId(sess.id);
+                                setRenameText(sess.title || '');
+                              }}
+                            >
+                              <EditIcon size={12} />
+                            </button>
+                            <ConfirmDeleteButton
+                              itemName={sess.title || 'chat'}
+                              onConfirm={() => handleDeleteSession(sess.id)}
+                            />
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </aside>
+        </>
       )}
 
       <div className="ap-chat-main">
         <header className="ap-chat-topbar">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+          <div className="ap-chat-topbar-left">
             <button
               type="button"
               className="ap-btn ap-btn-ghost ap-btn-sm ap-btn-icon-compact"
@@ -719,42 +898,46 @@ export function ChatView() {
               <SidebarToggleIcon size={15} />
             </button>
             <span
-              className="ap-truncate"
+              className="ap-truncate ap-chat-topbar-title"
               style={{ fontWeight: 600, fontSize: 13.5 }}
             >
               {activeSession ? activeSession.title || 'Untitled chat' : 'New chat'}
             </span>
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-            <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-              {activeModelOption && (
-                <ProviderGlyph
-                  type={activeModelOption.provider_type || activeModelOption.provider}
-                />
+          <div className="ap-chat-topbar-right">
+            <div className="ap-chat-model-wrap">
+              {(activeModelOption || selectedModel) && (
+                <ProviderGlyph type={resolveProviderType(selectedModel)} />
               )}
               <select
-                className="ap-select ap-select--sm ap-mono"
-                style={{ width: 236, maxWidth: '32vw' }}
+                className="ap-select ap-select--sm ap-mono ap-chat-model-select"
                 value={selectedModel}
                 onChange={(e) => void handleModelChange(e.target.value)}
                 aria-label="Select chat model"
               >
-                {models.length === 0 ? (
+                {models.length === 0 && !selectedModel ? (
                   <option value="">No models available</option>
                 ) : (
-                  models.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.id}
-                      {m.is_alias ? ' (route)' : ''}
-                    </option>
-                  ))
+                  <>
+                    {isSelectedModelMissing && (
+                      <option value={selectedModel}>
+                        {selectedModel} (unavailable)
+                      </option>
+                    )}
+                    {models.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.id}
+                        {m.is_alias ? ' (route)' : ''}
+                      </option>
+                    ))}
+                  </>
                 )}
               </select>
             </div>
 
             {/* MCP Tools Attach Popover */}
-            <div ref={toolsPopoverRef} style={{ position: 'relative' }}>
+            <div ref={toolsPopoverRef} style={{ position: 'relative', flexShrink: 0 }}>
               <button
                 type="button"
                 className="ap-btn ap-btn-sm"
@@ -763,7 +946,7 @@ export function ChatView() {
                 aria-label="Attach MCP Tools"
               >
                 <WrenchIcon size={14} />
-                <span>Tools</span>
+                <span className="ap-chat-tools-label">Tools</span>
                 {selectedMcpNames.length > 0 && (
                   <span className="ap-badge ap-badge--blue ap-tabular">
                     {selectedMcpNames.length}
@@ -788,7 +971,38 @@ export function ChatView() {
                     </span>
                   </div>
 
-                  {availableMcpServers.length === 0 ? (
+                  {missingSelectedMcpNames.map((missingName) => (
+                    <div
+                      key={missingName}
+                      style={{
+                        padding: '8px 8px',
+                        borderRadius: 'var(--ap-radius-sm)',
+                        background: 'var(--ap-amber-soft)',
+                        border: '1px solid var(--ap-amber-border)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: 10,
+                      }}
+                    >
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <span className="ap-mono ap-truncate" style={{ fontWeight: 600, fontSize: 12 }}>
+                            {missingName}
+                          </span>
+                          <span className="ap-badge ap-badge--amber">(unavailable)</span>
+                        </div>
+                      </div>
+                      <Toggle
+                        checked
+                        onChange={() => void handleToggleMcpServer(missingName, false)}
+                        label={`Detach unavailable MCP server ${missingName}`}
+                      />
+                    </div>
+                  ))}
+
+                  {availableMcpServers.length === 0 &&
+                  missingSelectedMcpNames.length === 0 ? (
                     <div
                       style={{
                         padding: '10px 6px',
@@ -874,7 +1088,7 @@ export function ChatView() {
 
             <button
               type="button"
-              className="ap-btn ap-btn-sm"
+              className="ap-btn ap-btn-sm ap-btn-icon-compact"
               onClick={openSystemPromptModal}
               title="Configure system prompt"
             >
@@ -904,17 +1118,6 @@ export function ChatView() {
               el.scrollHeight - el.scrollTop - el.clientHeight < 72;
           }}
         >
-          {error && (
-            <div
-              className="ap-alert ap-alert--danger"
-              role="alert"
-              style={{ maxWidth: 780, width: '100%', margin: '0 auto 14px' }}
-            >
-              <AlertIcon style={{ flexShrink: 0, marginTop: 1 }} />
-              <span>{error}</span>
-            </div>
-          )}
-
           {loadingThread ? (
             <div className="ap-chat-hero">
               <span style={{ color: 'var(--ap-text-secondary)' }}>
@@ -970,7 +1173,7 @@ export function ChatView() {
                 return (
                   <div key={msg.id} className="ap-chat-msg-assistant">
                     <div style={{ marginTop: 2 }}>
-                      <ProviderGlyph type={msg.model || selectedModel} />
+                      <ProviderGlyph type={resolveProviderType(msg.model)} />
                     </div>
                     <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 8 }}>
                       {toolEvents.length > 0 && (
@@ -1025,6 +1228,35 @@ export function ChatView() {
           )}
         </div>
 
+        {error && (
+          <div className="ap-chat-error-pin">
+            <div
+              className="ap-alert ap-alert--danger"
+              role="alert"
+              style={{
+                maxWidth: 780,
+                width: '100%',
+                margin: '0 auto',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'flex-start', gap: 9, minWidth: 0 }}>
+                <AlertIcon style={{ flexShrink: 0, marginTop: 1 }} />
+                <span style={{ wordBreak: 'break-word' }}>{error}</span>
+              </div>
+              <button
+                type="button"
+                className="ap-btn ap-btn-ghost ap-btn-sm ap-btn-icon-compact"
+                onClick={() => setError(null)}
+                aria-label="Dismiss error"
+              >
+                <CloseIcon size={13} />
+              </button>
+            </div>
+          </div>
+        )}
+
         <div className="ap-chat-composer-dock">
           <div className="ap-chat-composer">
             <textarea
@@ -1039,6 +1271,7 @@ export function ChatView() {
             <div className="ap-chat-composer-bar">
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                 <button
+                  ref={bottomToolsBtnRef}
                   type="button"
                   className="ap-btn ap-btn-ghost ap-btn-sm"
                   onClick={() => setToolsPopoverOpen((prev) => !prev)}
@@ -1050,6 +1283,18 @@ export function ChatView() {
                       : 'Attach MCP'}
                   </span>
                 </button>
+                {missingSelectedMcpNames.map((missingName) => (
+                  <button
+                    key={missingName}
+                    type="button"
+                    className="ap-badge ap-badge--amber ap-mono"
+                    style={{ cursor: 'pointer' }}
+                    title={`Remove unavailable MCP server ${missingName}`}
+                    onClick={() => void handleToggleMcpServer(missingName, false)}
+                  >
+                    <span>{missingName} (unavailable) ×</span>
+                  </button>
+                ))}
                 <button
                   type="button"
                   className="ap-btn ap-btn-ghost ap-btn-sm"
@@ -1065,7 +1310,7 @@ export function ChatView() {
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 {selectedModel && (
                   <span
-                    className="ap-mono ap-truncate"
+                    className="ap-mono ap-truncate ap-chat-composer-model"
                     style={{
                       fontSize: 11.5,
                       color: 'var(--ap-text-secondary)',
@@ -1091,7 +1336,9 @@ export function ChatView() {
                   <button
                     type="button"
                     className="ap-chat-send-btn"
-                    disabled={!draft.trim() || models.length === 0}
+                    disabled={
+                      !draft.trim() || (models.length === 0 && !selectedModel)
+                    }
                     onClick={() => void handleSend()}
                     aria-label="Send message"
                   >

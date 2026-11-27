@@ -359,3 +359,223 @@ func TestEndToEnd_TSNetWhoIsToPolicyEvaluator(t *testing.T) {
 		t.Fatalf("expected docs/search MCP tool allowed via Aperture connectors, got ok=%v err=%v", toolOK, err)
 	}
 }
+
+func TestEvaluator_MCPPatternDeepSlashAndNoBareCrossServerMatch(t *testing.T) {
+	ctx := context.Background()
+	ev := NewEvaluator()
+
+	// P2-1: deny_mcp_tools: ["github/*"] MUST block multi-segment tools like "github/repos/delete"
+	// even when mcp_tools: ["*"] is granted!
+	deepDenyUser := &auth.Principal{
+		Subject: "alice@example.com",
+		RawCaps: map[string][]byte{
+			CapHeadlampGateway: []byte(`[
+				{"role":"user","mcp_tools":["*"],"deny_mcp_tools":["github/*","docs/admin/*"]}
+			]`),
+		},
+	}
+
+	toolCases := []struct {
+		tool string
+		want bool
+	}{
+		{"github/read_issue", false},
+		{"github/repos/delete", false},        // multi-segment tool denied by "github/*"
+		{"github/repos/v2/force/push", false}, // deeper nesting denied by "github/*"
+		{"github-enterprise/read_issue", true},
+		{"docs/search", true},
+		{"docs/admin/purge", false},
+		{"docs/admin/users/delete", false}, // multi-segment tool denied by "docs/admin/*"
+	}
+	for _, tc := range toolCases {
+		got, reason, err := ev.AuthorizeMCPTool(ctx, deepDenyUser, tc.tool)
+		if err != nil {
+			t.Fatalf("AuthorizeMCPTool(%q) error: %v", tc.tool, err)
+		}
+		if got != tc.want {
+			t.Errorf("AuthorizeMCPTool(%q) = %v (%s), want %v", tc.tool, got, reason, tc.want)
+		}
+	}
+
+	// Verify IsMCPToolDenied matches multi-segment deny directly.
+	ep, err := ev.Evaluate(ctx, deepDenyUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if denied, _ := ep.IsMCPToolDenied("github/repos/delete"); !denied {
+		t.Fatal("expected IsMCPToolDenied(github/repos/delete) == true for deny github/*")
+	}
+
+	// P2-1: allow_mcp_tools: ["github/*"] also matches multi-segment tools under github/.
+	deepAllowUser := &auth.Principal{
+		Subject: "bob@example.com",
+		RawCaps: map[string][]byte{
+			CapHeadlampGateway: []byte(`[
+				{"role":"user","mcp_tools":["github/*"],"deny_mcp_tools":["github/repos/delete*"]}
+			]`),
+		},
+	}
+	if ok, reason, err := ev.AuthorizeMCPTool(ctx, deepAllowUser, "github/repos/list"); err != nil || !ok {
+		t.Fatalf("expected github/repos/list allowed by github/*, got ok=%v reason=%q err=%v", ok, reason, err)
+	}
+	if ok, reason, err := ev.AuthorizeMCPTool(ctx, deepAllowUser, "github/repos/delete_branch"); err != nil || ok {
+		t.Fatalf("expected github/repos/delete_branch denied, got ok=%v reason=%q err=%v", ok, reason, err)
+	}
+
+	// P2-1: Bare patterns without "/" MUST NEVER perform cross-server suffix matching on MCP tools.
+	barePatternUser := &auth.Principal{
+		Subject: "carol@example.com",
+		RawCaps: map[string][]byte{
+			CapHeadlampGateway: []byte(`[
+				{"role":"user","mcp_tools":["github","read_*"],"deny_mcp_tools":["delete"]}
+			]`),
+		},
+	}
+	for _, target := range []string{"other/github", "github/read_issue", "docs/read_file"} {
+		if ok, reason, err := ev.AuthorizeMCPTool(ctx, barePatternUser, target); err != nil || ok {
+			t.Fatalf("bare MCP pattern must not match %q, got ok=%v reason=%q err=%v", target, ok, reason, err)
+		}
+	}
+	bareEP, err := ev.Evaluate(ctx, barePatternUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if denied, _ := bareEP.IsMCPToolDenied("other/delete"); denied {
+		t.Fatal("bare deny pattern \"delete\" must not cross-server match \"other/delete\"")
+	}
+}
+
+func TestEvaluator_AuthorizeMCPServer(t *testing.T) {
+	ctx := context.Background()
+	ev := NewEvaluator()
+
+	// Nil principal -> ErrUnauthenticated.
+	if _, _, err := ev.AuthorizeMCPServer(ctx, nil, "github"); err != auth.ErrUnauthenticated {
+		t.Fatalf("expected ErrUnauthenticated for nil principal, got %v", err)
+	}
+
+	// Nil EffectivePolicy -> denied.
+	var nilEP *EffectivePolicy
+	if ok, _ := nilEP.AllowsMCPServer("github"); ok {
+		t.Fatal("expected nil EffectivePolicy.AllowsMCPServer == false")
+	}
+
+	// No grants -> denied.
+	noGrants := &auth.Principal{Subject: "nobody@example.com"}
+	if ok, reason, err := ev.AuthorizeMCPServer(ctx, noGrants, "github"); err != nil || ok || reason == "" {
+		t.Fatalf("expected no-grants server denied with reason, got ok=%v reason=%q err=%v", ok, reason, err)
+	}
+
+	tests := []struct {
+		name     string
+		capJSON  string
+		server   string
+		wantOK   bool
+	}{
+		{
+			name:    "blank server name denied",
+			capJSON: `[{"role":"user","mcp_tools":["*"]}]`,
+			server:  "   ",
+			wantOK:  false,
+		},
+		{
+			name:    "wildcard allow permits server",
+			capJSON: `[{"role":"user","mcp_tools":["*"]}]`,
+			server:  "github",
+			wantOK:  true,
+		},
+		{
+			name:    "wildcard deny blocks server despite wildcard allow",
+			capJSON: `[{"role":"user","mcp_tools":["*"],"deny_mcp_tools":["*"]}]`,
+			server:  "github",
+			wantOK:  false,
+		},
+		{
+			name:    "double-star deny blocks server",
+			capJSON: `[{"role":"user","mcp_tools":["github/*"],"deny_mcp_tools":["**"]}]`,
+			server:  "github",
+			wantOK:  false,
+		},
+		{
+			name:    "server single-star blanket deny blocks server",
+			capJSON: `[{"role":"user","mcp_tools":["*"],"deny_mcp_tools":["github/*"]}]`,
+			server:  "github",
+			wantOK:  false,
+		},
+		{
+			name:    "server double-star blanket deny blocks server",
+			capJSON: `[{"role":"user","mcp_tools":["*"],"deny_mcp_tools":["github/**"]}]`,
+			server:  "github",
+			wantOK:  false,
+		},
+		{
+			name:    "server blanket deny does not block unrelated server",
+			capJSON: `[{"role":"user","mcp_tools":["*"],"deny_mcp_tools":["github/*"]}]`,
+			server:  "docs",
+			wantOK:  true,
+		},
+		{
+			name:    "partial tool deny still allows server when other tools remain",
+			capJSON: `[{"role":"user","mcp_tools":["github/*"],"deny_mcp_tools":["github/delete_*"]}]`,
+			server:  "github",
+			wantOK:  true,
+		},
+		{
+			name:    "narrow single tool allow permits matching server",
+			capJSON: `[{"role":"user","mcp_tools":["github/repos/read"]}]`,
+			server:  "github",
+			wantOK:  true,
+		},
+		{
+			name:    "narrow single tool allow does not permit other server or prefix-similar server",
+			capJSON: `[{"role":"user","mcp_tools":["github/repos/read"]}]`,
+			server:  "github-enterprise",
+			wantOK:  false,
+		},
+		{
+			name:    "literal tool allow shadowed by deny denies server",
+			capJSON: `[{"role":"user","mcp_tools":["github/delete_repo"],"deny_mcp_tools":["github/delete_*"]}]`,
+			server:  "github",
+			wantOK:  false,
+		},
+		{
+			name:    "bare pattern without slash cannot match any tool on server",
+			capJSON: `[{"role":"user","mcp_tools":["github"]}]`,
+			server:  "github",
+			wantOK:  false,
+		},
+		{
+			name:    "cross-server tool wildcard allows server",
+			capJSON: `[{"role":"user","mcp_tools":["*/read_*"]}]`,
+			server:  "github",
+			wantOK:  true,
+		},
+		{
+			name:    "recursive double-star prefix allows server",
+			capJSON: `[{"role":"user","mcp_tools":["**/search"]}]`,
+			server:  "docs",
+			wantOK:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &auth.Principal{
+				Subject: "user@example.com",
+				RawCaps: map[string][]byte{
+					CapHeadlampGateway: []byte(tc.capJSON),
+				},
+			}
+			got, reason, err := ev.AuthorizeMCPServer(ctx, p, tc.server)
+			if err != nil {
+				t.Fatalf("AuthorizeMCPServer(%q) error: %v", tc.server, err)
+			}
+			if got != tc.wantOK {
+				t.Errorf("AuthorizeMCPServer(%q) = %v (%s), want %v", tc.server, got, reason, tc.wantOK)
+			}
+			if reason == "" {
+				t.Errorf("AuthorizeMCPServer(%q) returned empty reason", tc.server)
+			}
+		})
+	}
+}

@@ -1364,6 +1364,11 @@ pre,
   height: 100dvh;
   min-width: 0;
   background: var(--ap-canvas-bg);
+  position: relative;
+}
+
+.ap-chat-rail-backdrop {
+  display: none;
 }
 
 .ap-chat-rail {
@@ -1443,6 +1448,41 @@ pre,
   gap: 12px;
   flex-shrink: 0;
   background: rgba(250, 249, 247, 0.92);
+  min-width: 0;
+}
+
+.ap-chat-topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.ap-chat-topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+.ap-chat-model-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ap-chat-model-select {
+  width: 236px;
+  max-width: 32vw;
+  min-width: 0;
+}
+
+.ap-chat-error-pin {
+  padding: 6px 24px 0;
+  flex-shrink: 0;
 }
 
 .ap-chat-thread {
@@ -1622,6 +1662,8 @@ pre,
   top: calc(100% + 6px);
   right: 0;
   width: min(320px, 90vw);
+  max-height: min(320px, 50vh);
+  overflow-y: auto;
   background: var(--ap-card-bg);
   border: 1px solid var(--ap-border-strong);
   border-radius: var(--ap-radius-lg);
@@ -1801,5 +1843,79 @@ pre,
   .ap-form-grid,
   .ap-form-grid-4 {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ap-chat-shell,
+  .ap-chat-main {
+    height: calc(100dvh - 48px);
+    overflow: hidden;
+  }
+
+  .ap-chat-rail-backdrop {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 34;
+    background: rgba(18, 18, 16, 0.28);
+  }
+
+  .ap-chat-rail {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: min(260px, 82vw);
+    z-index: 35;
+    box-shadow: var(--ap-shadow-float);
+  }
+
+  .ap-chat-topbar {
+    padding: 0 12px;
+    gap: 6px;
+  }
+
+  .ap-chat-topbar-left {
+    flex: 0 1 auto;
+    gap: 6px;
+  }
+
+  .ap-chat-topbar-title {
+    display: none;
+  }
+
+  .ap-chat-topbar-right {
+    flex: 1 1 auto;
+    justify-content: flex-end;
+    gap: 6px;
+  }
+
+  .ap-chat-model-wrap {
+    flex: 1 1 auto;
+  }
+
+  .ap-chat-model-select {
+    flex: 1 1 auto;
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .ap-chat-tools-label,
+  .ap-chat-composer-model {
+    display: none;
+  }
+
+  .ap-chat-thread {
+    padding: 14px 12px 10px;
+  }
+
+  .ap-chat-error-pin {
+    padding: 6px 12px 0;
+  }
+
+  .ap-chat-composer-dock {
+    padding: 8px 12px 12px;
+  }
+
+  .ap-popover {
+    right: -36px;
+    width: min(310px, calc(100vw - 24px));
   }
 }

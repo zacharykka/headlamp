@@ -405,10 +405,14 @@ export const api = {
     return res.sessions ?? [];
   },
 
-  createChatSession(payload: ChatSessionCreatePayload): Promise<ChatSession> {
+  createChatSession(
+    payload: ChatSessionCreatePayload,
+    opts?: RequestOptions,
+  ): Promise<ChatSession> {
     return requestJson<ChatSession>('/api/v1/chat/sessions', {
       method: 'POST',
       body: JSON.stringify(payload),
+      signal: opts?.signal,
     });
   },
 

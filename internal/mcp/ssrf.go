@@ -71,6 +71,85 @@ func validateDialAddr(address string, blockLoopback bool) error {
 	return nil
 }
 
+// isMutatingMethod reports whether method can cause server-side state changes.
+func isMutatingMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+// checkSameOriginCSRF enforces same-origin validation whenever browser headers
+// (Origin or Sec-Fetch-Site) are present on mutating requests, matching internal/api.
+// Non-browser CLI/IDE MCP clients without Origin/Sec-Fetch-Site are unaffected.
+func checkSameOriginCSRF(r *http.Request) error {
+	remoteLoopback := isLoopbackRemoteAddr(r.RemoteAddr)
+	hostLoopback := isLoopbackHost(r.Host)
+	loopbackDevEligible := remoteLoopback && hostLoopback
+
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host == "" {
+			return fmt.Errorf("invalid Origin header %q", origin)
+		}
+		if !strings.EqualFold(u.Host, r.Host) {
+			if !(loopbackDevEligible && isLoopbackHost(u.Hostname())) {
+				return fmt.Errorf("cross-origin request blocked (origin=%q, host=%q)", u.Host, r.Host)
+			}
+		}
+	}
+
+	if sfs := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); sfs != "" {
+		switch sfs {
+		case "same-origin", "none":
+		case "same-site":
+			if !loopbackDevEligible {
+				return fmt.Errorf("cross-site request blocked (Sec-Fetch-Site=%q)", sfs)
+			}
+		default:
+			return fmt.Errorf("cross-site request blocked (Sec-Fetch-Site=%q)", sfs)
+		}
+	}
+	return nil
+}
+
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	host := strings.TrimSpace(remoteAddr)
+	if host == "" {
+		return false
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return addr.Unmap().IsLoopback()
+}
+
+func isLoopbackHost(hostport string) bool {
+	host := strings.TrimSpace(hostport)
+	if host == "" {
+		return false
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if host == "localhost" {
+		return true
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return addr.Unmap().IsLoopback()
+}
+
 // applyUpstreamAuth strips caller credentials and injects decrypted upstream MCP auth headers.
 func applyUpstreamAuth(upReq *http.Request, srv store.MCPServer) {
 	for _, h := range []string{"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "X-Goog-Api-Key"} {
@@ -102,13 +181,9 @@ func applyUpstreamAuth(upReq *http.Request, srv store.MCPServer) {
 	}
 }
 
-// buildUpstreamURL constructs the target URL for an upstream MCP server request,
-// locking scheme and host strictly to srv.URL.
-//
-// When subpath is empty, srv.URL's exact path is preserved. When subpath is non-empty
-// (e.g. a rewritten legacy SSE callback path like "/messages"), the cleaned subpath
-// replaces the path on srv.URL's origin while merging query parameters.
-func buildUpstreamURL(srv store.MCPServer, subpath, rawQuery string) (string, error) {
+// buildUpstreamBaseURL returns srv.URL strictly validated for http/https without
+// allowing caller-supplied path overrides.
+func buildUpstreamBaseURL(srv store.MCPServer, rawQuery string) (string, error) {
 	base, err := url.Parse(strings.TrimSpace(srv.URL))
 	if err != nil || base.Scheme == "" || base.Host == "" {
 		return "", fmt.Errorf("mcp: invalid upstream URL for server %q", srv.Name)
@@ -119,18 +194,31 @@ func buildUpstreamURL(srv store.MCPServer, subpath, rawQuery string) (string, er
 	}
 
 	target := *base
-	if subpath != "" {
-		cleaned := path.Clean("/" + subpath)
-		target.Path = cleaned
-		target.RawPath = ""
-		target.RawQuery = rawQuery
-	} else if rawQuery != "" {
+	if rawQuery != "" {
 		if target.RawQuery != "" {
 			target.RawQuery = target.RawQuery + "&" + rawQuery
 		} else {
 			target.RawQuery = rawQuery
 		}
 	}
+	return target.String(), nil
+}
+
+// buildUpstreamCallbackURL resolves a previously validated legacy SSE callback path
+// (recorded from upstream's "event: endpoint") against srv.URL's origin.
+func buildUpstreamCallbackURL(srv store.MCPServer, recordedCallbackPath string) (string, error) {
+	base, err := url.Parse(strings.TrimSpace(srv.URL))
+	if err != nil || base.Scheme == "" || base.Host == "" {
+		return "", fmt.Errorf("mcp: invalid upstream URL for server %q", srv.Name)
+	}
+	cb, err := url.Parse(recordedCallbackPath)
+	if err != nil {
+		return "", fmt.Errorf("mcp: invalid recorded SSE callback path: %w", err)
+	}
+	target := *base
+	target.Path = path.Clean("/" + cb.Path)
+	target.RawPath = ""
+	target.RawQuery = cb.RawQuery
 	return target.String(), nil
 }
 
@@ -152,13 +240,7 @@ func resolveSameOriginEndpoint(srv store.MCPServer, rawEndpoint string) (*url.UR
 	return resolved, nil
 }
 
-// rewriteSSEEndpoint rewrites an upstream legacy SSE "event: endpoint" data payload
-// so follow-up client POSTs route back through Headlamp's /mcp/{server_name}/... proxy.
-func rewriteSSEEndpoint(srv store.MCPServer, rawEndpoint string) (string, error) {
-	resolved, err := resolveSameOriginEndpoint(srv, rawEndpoint)
-	if err != nil {
-		return "", err
-	}
+func formatRecordedCallbackPath(resolved *url.URL) string {
 	epPath := resolved.EscapedPath()
 	if epPath == "" {
 		epPath = "/"
@@ -166,11 +248,10 @@ func rewriteSSEEndpoint(srv store.MCPServer, rawEndpoint string) (string, error)
 	if !strings.HasPrefix(epPath, "/") {
 		epPath = "/" + epPath
 	}
-	rewritten := "/mcp/" + url.PathEscape(srv.Name) + epPath
 	if resolved.RawQuery != "" {
-		rewritten += "?" + resolved.RawQuery
+		return epPath + "?" + resolved.RawQuery
 	}
-	return rewritten, nil
+	return epPath
 }
 
 func sanitizeURLError(err error) string {
@@ -190,38 +271,29 @@ func sanitizeURLError(err error) string {
 	return err.Error()
 }
 
-var hopByHopHeaders = map[string]struct{}{
-	"connection":          {},
-	"keep-alive":          {},
-	"proxy-authenticate":  {},
-	"proxy-authorization": {},
-	"te":                  {},
-	"trailer":             {},
-	"trailers":            {},
-	"transfer-encoding":   {},
-	"upgrade":             {},
-	"content-encoding":    {},
-	"content-length":      {},
+// allowedResponseHeaders is the strict allowlist of upstream MCP response headers
+// safe to copy to clients (stripping Set-Cookie, Location, CORS, Server, etc.).
+// Mcp-Session-Id is handled explicitly via per-user session ID translation.
+var allowedResponseHeaders = []string{
+	"Content-Type",
+	"Cache-Control",
+	"MCP-Protocol-Version",
 }
 
 func copyResponseHeaders(dst, src http.Header) {
-	for k, vals := range src {
-		if _, skip := hopByHopHeaders[strings.ToLower(k)]; skip {
-			continue
-		}
-		for _, v := range vals {
-			dst.Add(k, v)
+	for _, h := range allowedResponseHeaders {
+		for _, v := range src.Values(h) {
+			dst.Add(h, v)
 		}
 	}
 }
 
+// copyMCPRequestHeaders copies only safe protocol headers; Mcp-Session-Id and
+// Last-Event-ID are handled explicitly after per-user session ownership checks.
 func copyMCPRequestHeaders(dst, src http.Header) {
 	for _, h := range []string{
-		"Content-Type",
 		"Accept",
-		"Mcp-Session-Id",
 		"MCP-Protocol-Version",
-		"Last-Event-ID",
 		"User-Agent",
 	} {
 		for _, v := range src.Values(h) {

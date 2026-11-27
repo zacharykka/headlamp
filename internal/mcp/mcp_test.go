@@ -25,6 +25,7 @@ import (
 	"github.com/zacharykka/headlamp/internal/guardrail"
 	"github.com/zacharykka/headlamp/internal/policy"
 	"github.com/zacharykka/headlamp/internal/store"
+	"github.com/zacharykka/headlamp/internal/translate"
 )
 
 func newTestStore(t *testing.T) store.Store {
@@ -46,8 +47,12 @@ func newTestStore(t *testing.T) store.Store {
 }
 
 func makePrincipal(subject string, allowTools, denyTools []string) *auth.Principal {
+	return makePrincipalWithRole(subject, "user", allowTools, denyTools)
+}
+
+func makePrincipalWithRole(subject, role string, allowTools, denyTools []string) *auth.Principal {
 	capPayload, _ := json.Marshal([]map[string]any{{
-		"role":           "user",
+		"role":           role,
 		"models":         []string{"*"},
 		"mcp_tools":      allowTools,
 		"deny_mcp_tools": denyTools,
@@ -58,11 +63,21 @@ func makePrincipal(subject string, allowTools, denyTools []string) *auth.Princip
 		NodeName:    "alice-mac",
 		NodeIP:      "100.64.0.12",
 		Tags:        []string{"tag:eng"},
+		Roles:       []string{role},
 		AuthSource:  auth.AuthSourceTSNet,
 		RawCaps: map[string][]byte{
 			auth.CapHeadlampGateway: capPayload,
 		},
 	}
+}
+
+func decodeTestToolParams(raw json.RawMessage) (string, json.RawMessage) {
+	var p struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	_ = json.Unmarshal(raw, &p)
+	return p.Name, p.Arguments
 }
 
 type guardrailEngineAdapter struct {
@@ -166,7 +181,7 @@ func TestStreamableHTTPProxyToolsListFilterAndToolCallGovernance(t *testing.T) {
 				resps = append(resps, jsonRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: resJSON})
 			case "tools/call":
 				callHits.Add(1)
-				_, args, _ := extractToolCallParams(msg.Params)
+				_, args := decodeTestToolParams(msg.Params)
 				mu.Lock()
 				seenCallArgs = bytes.Clone(args)
 				mu.Unlock()
@@ -253,13 +268,14 @@ func TestStreamableHTTPProxyToolsListFilterAndToolCallGovernance(t *testing.T) {
 		}
 	}
 
-	// 2. tools/list JSON response filters out denied "delete_all" & injects Bearer auth (never forwarding caller Authorization).
+	// 2. tools/list JSON response filters out denied "delete_all", injects Bearer auth, and translates Mcp-Session-Id to opaque hl-mcp-*.
 	reqList := authedReq(alice, http.MethodPost, "/mcp/docs", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
 	reqList.Header.Set("Authorization", "Bearer caller-headlamp-token")
 	recList := httptest.NewRecorder()
 	gw.ServeHTTP(recList, reqList)
-	if recList.Code != http.StatusOK || recList.Header().Get("Mcp-Session-Id") != "sess-up-1" {
-		t.Fatalf("tools/list failed: code=%d sid=%q body=%s", recList.Code, recList.Header().Get("Mcp-Session-Id"), recList.Body.String())
+	aliceClientSID := recList.Header().Get("Mcp-Session-Id")
+	if recList.Code != http.StatusOK || !strings.HasPrefix(aliceClientSID, clientSessionIDPrefix) || aliceClientSID == "sess-up-1" {
+		t.Fatalf("tools/list failed or leaked raw session ID: code=%d sid=%q body=%s", recList.Code, aliceClientSID, recList.Body.String())
 	}
 	var listResp struct {
 		Result struct {
@@ -380,18 +396,18 @@ func TestStreamableHTTPProxyToolsListFilterAndToolCallGovernance(t *testing.T) {
 		t.Fatalf("batch b3 denied tool call expected -32003 error, got %+v", byID[`"b3"`])
 	}
 
-	// 9. DELETE forwards Mcp-Session-Id.
+	// 9. DELETE translates Alice's opaque hl-mcp-* session ID back to upstream "sess-up-1".
 	reqDel := authedReq(alice, http.MethodDelete, "/mcp/docs", "")
-	reqDel.Header.Set("Mcp-Session-Id", "sess-up-1")
+	reqDel.Header.Set("Mcp-Session-Id", aliceClientSID)
 	recDel := httptest.NewRecorder()
 	gw.ServeHTTP(recDel, reqDel)
 	if recDel.Code != http.StatusNoContent {
-		t.Fatalf("expected 204 on DELETE, got %d", recDel.Code)
+		t.Fatalf("expected 204 on DELETE, got %d: %s", recDel.Code, recDel.Body.String())
 	}
 	mu.Lock()
 	if seenDeleteSID != "sess-up-1" {
 		mu.Unlock()
-		t.Fatalf("DELETE did not forward Mcp-Session-Id, got %q", seenDeleteSID)
+		t.Fatalf("DELETE did not forward translated upstream Mcp-Session-Id, got %q", seenDeleteSID)
 	}
 	mu.Unlock()
 
@@ -487,7 +503,7 @@ func newMockLegacySSEServer(t *testing.T, customEndpoint string) *mockLegacySSES
 				reply = jsonRPCMessage{JSONRPC: "2.0", ID: msg.ID, Result: json.RawMessage(`{"tools":[{"name":"echo","description":"echo text"},{"name":"secret_admin","description":"denied"}]}`)}
 			case "tools/call":
 				m.callHits.Add(1)
-				toolName, args, _ := extractToolCallParams(msg.Params)
+				toolName, args := decodeTestToolParams(msg.Params)
 				res, _ := json.Marshal(map[string]any{
 					"content": []map[string]any{{"type": "text", "text": toolName + ":" + string(args)}},
 				})
@@ -533,10 +549,14 @@ func TestLegacySSETransportRewriteAndAsyncToolsFiltering(t *testing.T) {
 	}
 
 	alice := makePrincipal("alice@example.com", []string{"legacy/*"}, []string{"legacy/secret_*"})
+	bob := makePrincipal("bob@example.com", []string{"legacy/*"}, nil)
 
-	// Host Gateway behind httptest.NewServer so streaming GET /mcp/legacy and follow-up POST work concurrently.
 	gwSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gw.ServeHTTP(w, r.WithContext(auth.WithPrincipal(r.Context(), alice)))
+		p := alice
+		if r.Header.Get("X-Test-User") == "bob" {
+			p = bob
+		}
+		gw.ServeHTTP(w, r.WithContext(auth.WithPrincipal(r.Context(), p)))
 	}))
 	defer gwSrv.Close()
 
@@ -555,12 +575,36 @@ func TestLegacySSETransportRewriteAndAsyncToolsFiltering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read endpoint frame: %v", err)
 	}
-	if epFrame.Event != "endpoint" || string(epFrame.Data) != "/mcp/legacy/messages?sessionId=sid-legacy-1" {
-		t.Fatalf("unexpected rewritten SSE endpoint: event=%q data=%q", epFrame.Event, string(epFrame.Data))
+	epURL := string(epFrame.Data)
+	if epFrame.Event != "endpoint" || !strings.HasPrefix(epURL, "/mcp/legacy/_sse/"+clientSessionIDPrefix) {
+		t.Fatalf("unexpected rewritten SSE endpoint: event=%q data=%q", epFrame.Event, epURL)
 	}
 
-	// Follow-up POST tools/list to the rewritten endpoint -> response arrives on SSE stream with secret_admin filtered out!
-	postResp, err := http.Post(gwSrv.URL+string(epFrame.Data), "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`))
+	// Bob attempting to hijack Alice's /_sse/<clientID> callback receives 403 Forbidden!
+	bobReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, gwSrv.URL+epURL, strings.NewReader(`{"jsonrpc":"2.0","id":9,"method":"tools/list"}`))
+	bobReq.Header.Set("Content-Type", "application/json")
+	bobReq.Header.Set("X-Test-User", "bob")
+	bobResp, err := http.DefaultClient.Do(bobReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = bobResp.Body.Close()
+	if bobResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 when Bob uses Alice's SSE callback path, got %d", bobResp.StatusCode)
+	}
+
+	// Arbitrary unissued subpath on SSE server -> 404 Not Found!
+	unissuedResp, err := http.Post(gwSrv.URL+"/mcp/legacy/messages?sessionId=sid-legacy-1", "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":8,"method":"tools/list"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unissuedResp.Body.Close()
+	if unissuedResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 on unissued SSE subpath, got %d", unissuedResp.StatusCode)
+	}
+
+	// Follow-up POST tools/list to Alice's issued endpoint -> response arrives on SSE stream with secret_admin filtered out!
+	postResp, err := http.Post(gwSrv.URL+epURL, "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -578,7 +622,7 @@ func TestLegacySSETransportRewriteAndAsyncToolsFiltering(t *testing.T) {
 	}
 
 	// Follow-up POST for denied tool -> immediate JSON-RPC -32003, never hits upstream!
-	denyResp, err := http.Post(gwSrv.URL+string(epFrame.Data), "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"secret_admin","arguments":{}}}`))
+	denyResp, err := http.Post(gwSrv.URL+epURL, "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"secret_admin","arguments":{}}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -651,7 +695,7 @@ func TestProgrammaticHelpersDiscoverListAndCallAuthorizedTool(t *testing.T) {
 			b, _ := json.Marshal(resp)
 			_, _ = w.Write([]byte("event: message\ndata: " + string(b) + "\n\n"))
 		case "tools/call":
-			toolName, args, _ := extractToolCallParams(msg.Params)
+			toolName, args := decodeTestToolParams(msg.Params)
 			mu.Lock()
 			seenCallArgs = bytes.Clone(args)
 			mu.Unlock()
@@ -673,6 +717,13 @@ func TestProgrammaticHelpersDiscoverListAndCallAuthorizedTool(t *testing.T) {
 
 	legacy := newMockLegacySSEServer(t, "")
 
+	var unauthServerHits atomic.Int32
+	unauthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		unauthServerHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer unauthSrv.Close()
+
 	st := newTestStore(t)
 	for _, r := range store.DefaultBuiltinGuardrailRules() {
 		_ = st.UpsertGuardrailRule(context.Background(), r)
@@ -687,6 +738,10 @@ func TestProgrammaticHelpersDiscoverListAndCallAuthorizedTool(t *testing.T) {
 	})
 	_ = st.UpsertMCPServer(context.Background(), store.MCPServer{
 		Name: "broken", URL: "http://127.0.0.1:1/mcp?token=topsecret", Transport: config.MCPTransportStreamableHTTP,
+		AuthType: config.MCPAuthNone, Enabled: true, Source: store.SourceLocal,
+	})
+	_ = st.UpsertMCPServer(context.Background(), store.MCPServer{
+		Name: "forbidden", URL: unauthSrv.URL + "/mcp", Transport: config.MCPTransportStreamableHTTP,
 		AuthType: config.MCPAuthNone, Enabled: true, Source: store.SourceLocal,
 	})
 
@@ -726,14 +781,21 @@ func TestProgrammaticHelpersDiscoverListAndCallAuthorizedTool(t *testing.T) {
 		t.Fatalf("DiscoverTools(legacy) failed: tools=%+v err=%v", legacyTools, err)
 	}
 
-	// 3. ListAuthorizedToolsForPrincipal filters denied tools & isolates broken server error without leaking ?token=.
+	// 3. ListAuthorizedToolsForPrincipal:
+	//    - skips "forbidden" BEFORE dialing (unauthServerHits == 0),
+	//    - filters denied tools on allowed servers,
+	//    - redacts "broken" error to "upstream MCP server unavailable" for non-admin user,
+	//      while showing sanitized detail (without ?token=) for admin!
 	alice := makePrincipal("alice@example.com", []string{"docs/*", "legacy/*", "broken/*"}, []string{"docs/admin_*", "legacy/secret_*"})
 	listed, err := gw.ListAuthorizedToolsForPrincipal(context.Background(), alice, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if unauthServerHits.Load() != 0 {
+		t.Fatalf("unauthorized server 'forbidden' should NEVER be dialed, got %d hits", unauthServerHits.Load())
+	}
 	if len(listed) != 3 {
-		t.Fatalf("expected 3 enabled servers, got %d", len(listed))
+		t.Fatalf("expected 3 authorized servers (excluding forbidden), got %d", len(listed))
 	}
 	byName := make(map[string]AuthorizedServerTools)
 	for _, s := range listed {
@@ -745,8 +807,17 @@ func TestProgrammaticHelpersDiscoverListAndCallAuthorizedTool(t *testing.T) {
 	if len(byName["legacy"].Tools) != 1 || byName["legacy"].Tools[0].Name != "echo" {
 		t.Fatalf("expected only [echo] on legacy, got %+v", byName["legacy"])
 	}
-	if byName["broken"].Error == "" || strings.Contains(byName["broken"].Error, "topsecret") {
-		t.Fatalf("broken server should isolate sanitized error, got %+v", byName["broken"])
+	if byName["broken"].Error != "upstream MCP server unavailable" {
+		t.Fatalf("non-admin must receive redacted error, got %q", byName["broken"].Error)
+	}
+
+	admin := makePrincipalWithRole("admin@example.com", "admin", []string{"broken/*"}, nil)
+	adminListed, err := gw.ListAuthorizedToolsForPrincipal(context.Background(), admin, []string{"broken"})
+	if err != nil || len(adminListed) != 1 {
+		t.Fatalf("admin list failed: %+v err=%v", adminListed, err)
+	}
+	if adminListed[0].Error == "" || adminListed[0].Error == "upstream MCP server unavailable" || strings.Contains(adminListed[0].Error, "topsecret") {
+		t.Fatalf("admin should receive sanitized error without secret query token, got %q", adminListed[0].Error)
 	}
 
 	// Subset filter returns only requested server(s).
@@ -902,5 +973,415 @@ func TestMCPSSRFAndRedirectBlocking(t *testing.T) {
 		if _, _, err := gw.DiscoverTools(context.Background(), *srv); !errors.Is(err, ErrBlockedAddress) {
 			t.Fatalf("DiscoverTools(%s) expected ErrBlockedAddress, got %v", name, err)
 		}
+	}
+}
+
+func TestMCPP01StrictJSONRPCAndSmugglingRejection(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}]}}`))
+	}))
+	defer upstream.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertMCPServer(context.Background(), store.MCPServer{
+		Name: "docs", URL: upstream.URL + "/mcp", Transport: config.MCPTransportStreamableHTTP,
+		AuthType: config.MCPAuthBearer, AuthToken: "secret", Enabled: true, Source: store.SourceLocal,
+	})
+
+	gw, err := NewGateway(GatewayConfig{
+		Store:      st,
+		Authorizer: policy.NewEvaluator(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	alice := makePrincipal("alice@example.com", []string{"docs/search"}, []string{"docs/delete_*"})
+
+	smugglingCases := []struct {
+		name     string
+		payload  string
+		wantCode int
+	}{
+		{
+			name:     "P0-1.1 fail-open Name type error smuggling",
+			payload:  `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_all","Name":123,"arguments":{}}}`,
+			wantCode: CodeInvalidParams,
+		},
+		{
+			name:     "P0-1.2 case-folded tool name and arguments smuggling",
+			payload:  `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"delete_all","Name":"search","arguments":{"secret":"sk-123"},"Arguments":{}}}`,
+			wantCode: CodeInvalidParams,
+		},
+		{
+			name:     "P0-1.3 case-folded method smuggling",
+			payload:  `{"jsonrpc":"2.0","id":4,"method":"tools/call","Method":"ping","params":{"name":"delete_all"}}`,
+			wantCode: CodeInvalidRequest,
+		},
+		{
+			name:     "duplicate exact key in params",
+			payload:  `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"delete_all","name":"search","arguments":{}}}`,
+			wantCode: CodeInvalidParams,
+		},
+		{
+			name:     "empty tool name fail-closed",
+			payload:  `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"","arguments":{}}}`,
+			wantCode: CodeInvalidParams,
+		},
+		{
+			name:     "non-object params fail-closed",
+			payload:  `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":["delete_all"]}`,
+			wantCode: CodeInvalidParams,
+		},
+		{
+			name:     "non-object arguments fail-closed",
+			payload:  `{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"search","arguments":"raw"}}`,
+			wantCode: CodeInvalidParams,
+		},
+		{
+			name:     "non-JSON-RPC arbitrary object rejected",
+			payload:  `{"action":"reset","force":true}`,
+			wantCode: CodeInvalidRequest,
+		},
+	}
+
+	for _, tc := range smugglingCases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			gw.ServeHTTP(rec, authedReq(alice, http.MethodPost, "/mcp/docs", tc.payload))
+			var resp jsonRPCMessage
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil || resp.Error == nil {
+				t.Fatalf("expected JSON-RPC error response, got status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if resp.Error.Code != tc.wantCode {
+				t.Fatalf("expected error code %d, got %d (%s)", tc.wantCode, resp.Error.Code, resp.Error.Message)
+			}
+		})
+	}
+
+	if upstreamHits.Load() != 0 {
+		t.Fatalf("NONE of the smuggling/malformed payloads may ever reach upstream (got %d hits)", upstreamHits.Load())
+	}
+}
+
+func TestMCPP02CSRFAndContentTypeEnforcement(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`))
+	}))
+	defer upstream.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertMCPServer(context.Background(), store.MCPServer{
+		Name: "docs", URL: upstream.URL + "/mcp", Transport: config.MCPTransportStreamableHTTP,
+		AuthType: config.MCPAuthNone, Enabled: true, Source: store.SourceLocal,
+	})
+
+	gw, err := NewGateway(GatewayConfig{Store: st, Authorizer: policy.NewEvaluator()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	alice := makePrincipal("alice@example.com", []string{"docs/*"}, nil)
+
+	// 1. Browser cross-site CSRF with Origin + Sec-Fetch-Site + text/plain -> 403 Forbidden.
+	reqCSRF := authedReq(alice, http.MethodPost, "/mcp/docs", `{"jsonrpc":"2.0","id":1,"method":"ping"}`)
+	reqCSRF.Host = "headlamp.ts.net"
+	reqCSRF.RemoteAddr = "100.64.0.10:55555"
+	reqCSRF.Header.Set("Origin", "https://evil.example")
+	reqCSRF.Header.Set("Sec-Fetch-Site", "cross-site")
+	reqCSRF.Header.Set("Content-Type", "text/plain")
+	recCSRF := httptest.NewRecorder()
+	gw.ServeHTTP(recCSRF, reqCSRF)
+	if recCSRF.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on cross-origin MCP POST, got %d: %s", recCSRF.Code, recCSRF.Body.String())
+	}
+
+	// 2. Non-JSON Content-Type (text/plain) or missing Content-Type -> 415 Unsupported Media Type.
+	for _, ct := range []string{"", "text/plain", "application/x-www-form-urlencoded"} {
+		req := authedReq(alice, http.MethodPost, "/mcp/docs", `{"jsonrpc":"2.0","id":1,"method":"ping"}`)
+		req.Header.Set("Content-Type", ct)
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnsupportedMediaType {
+			t.Fatalf("expected 415 for Content-Type=%q, got %d: %s", ct, rec.Code, rec.Body.String())
+		}
+	}
+	if upstreamHits.Load() != 0 {
+		t.Fatalf("CSRF/415 requests must never reach upstream (got %d hits)", upstreamHits.Load())
+	}
+
+	// 3. Valid application/json; charset=utf-8 from same-origin browser -> 200 OK.
+	reqOK := authedReq(alice, http.MethodPost, "/mcp/docs", `{"jsonrpc":"2.0","id":1,"method":"ping"}`)
+	reqOK.Host = "headlamp.ts.net"
+	reqOK.RemoteAddr = "100.64.0.10:55555"
+	reqOK.Header.Set("Origin", "https://headlamp.ts.net")
+	reqOK.Header.Set("Sec-Fetch-Site", "same-origin")
+	reqOK.Header.Set("Content-Type", "application/json; charset=utf-8")
+	recOK := httptest.NewRecorder()
+	gw.ServeHTTP(recOK, reqOK)
+	if recOK.Code != http.StatusOK {
+		t.Fatalf("expected 200 on valid same-origin JSON request, got %d: %s", recOK.Code, recOK.Body.String())
+	}
+}
+
+func TestMCPP11ServerGateSubpathLockdownAndSessionIsolation(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Mcp-Session-Id", "up-secret-sid")
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`))
+	}))
+	defer upstream.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertMCPServer(context.Background(), store.MCPServer{
+		Name: "docs", URL: upstream.URL + "/mcp", Transport: config.MCPTransportStreamableHTTP,
+		AuthType: config.MCPAuthNone, Enabled: true, Source: store.SourceLocal,
+	})
+
+	gw, err := NewGateway(GatewayConfig{Store: st, Authorizer: policy.NewEvaluator()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. User with deny_mcp_tools: ["*"] is rejected at entry with 403 on POST/GET/DELETE.
+	noAccess := makePrincipal("eve@example.com", nil, []string{"*"})
+	for _, method := range []string{http.MethodPost, http.MethodGet, http.MethodDelete} {
+		body := ""
+		if method == http.MethodPost {
+			body = `{"jsonrpc":"2.0","id":1,"method":"initialize"}`
+		}
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, authedReq(noAccess, method, "/mcp/docs", body))
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for unauthorized user on %s /mcp/docs, got %d", method, rec.Code)
+		}
+	}
+
+	// 2. User with narrow tool grant (docs/search only) cannot invoke resources/read or prompts/get (-32003).
+	narrow := makePrincipal("narrow@example.com", []string{"docs/search"}, nil)
+	for _, method := range []string{"resources/read", "prompts/get"} {
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, authedReq(narrow, http.MethodPost, "/mcp/docs", `{"jsonrpc":"2.0","id":1,"method":"`+method+`"}`))
+		var resp jsonRPCMessage
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil || resp.Error == nil || resp.Error.Code != CodeToolDenied {
+			t.Fatalf("expected -32003 for narrow user calling %s, got %d %s", method, rec.Code, rec.Body.String())
+		}
+	}
+
+	// 3. streamable_http rejects ANY non-empty subpath with 404 Not Found.
+	alice := makePrincipal("alice@example.com", []string{"docs/*"}, nil)
+	bob := makePrincipal("bob@example.com", []string{"docs/*"}, nil)
+
+	recSub := httptest.NewRecorder()
+	gw.ServeHTTP(recSub, authedReq(alice, http.MethodPost, "/mcp/docs/admin/reset", `{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+	if recSub.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 on streamable_http subpath, got %d", recSub.Code)
+	}
+	if upstreamHits.Load() != 0 {
+		t.Fatalf("blocked entry/resources/subpath requests should not hit upstream, got %d", upstreamHits.Load())
+	}
+
+	// 4. Per-user Mcp-Session-Id isolation: Alice gets hl-mcp-*; Bob cannot POST/GET/DELETE with Alice's session ID!
+	recInit := httptest.NewRecorder()
+	gw.ServeHTTP(recInit, authedReq(alice, http.MethodPost, "/mcp/docs", `{"jsonrpc":"2.0","id":1,"method":"initialize"}`))
+	aliceSID := recInit.Header().Get("Mcp-Session-Id")
+	if !strings.HasPrefix(aliceSID, clientSessionIDPrefix) {
+		t.Fatalf("expected opaque client session ID, got %q", aliceSID)
+	}
+
+	beforeBob := upstreamHits.Load()
+	for _, method := range []string{http.MethodPost, http.MethodGet, http.MethodDelete} {
+		body := ""
+		if method == http.MethodPost {
+			body = `{"jsonrpc":"2.0","id":2,"method":"ping"}`
+		}
+		reqBob := authedReq(bob, method, "/mcp/docs", body)
+		reqBob.Header.Set("Mcp-Session-Id", aliceSID)
+		recBob := httptest.NewRecorder()
+		gw.ServeHTTP(recBob, reqBob)
+		if recBob.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 when Bob uses Alice's Mcp-Session-Id on %s, got %d", method, recBob.Code)
+		}
+	}
+	// Unknown session ID -> 404.
+	reqUnk := authedReq(alice, http.MethodDelete, "/mcp/docs", "")
+	reqUnk.Header.Set("Mcp-Session-Id", "hl-mcp-nonexistent")
+	recUnk := httptest.NewRecorder()
+	gw.ServeHTTP(recUnk, reqUnk)
+	if recUnk.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 on unknown Mcp-Session-Id, got %d", recUnk.Code)
+	}
+	if upstreamHits.Load() != beforeBob {
+		t.Fatalf("cross-user/unknown session requests must NEVER reach upstream")
+	}
+}
+
+func TestMCPP12MultiLineSSELimitAndFailClosedToolsList(t *testing.T) {
+	// 1. Multi-line SSE data: accumulation exceeding MaxSSELineBytes returns ErrSSELineTooLong.
+	chunk := "data: " + strings.Repeat("b", 1024*1024) + "\n"
+	var sb strings.Builder
+	for range 17 {
+		sb.WriteString(chunk)
+	}
+	sb.WriteByte('\n')
+	if _, err := readSSEFrame(bufio.NewReader(strings.NewReader(sb.String()))); !errors.Is(err, translate.ErrSSELineTooLong) {
+		t.Fatalf("expected ErrSSELineTooLong for >16 MiB multi-line SSE frame, got %v", err)
+	}
+
+	// 2. Oversized or malformed tools/list response MUST fail closed with 502 Bad Gateway (never leak unfiltered tools).
+	var mode atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if mode.Load() == 0 {
+			// Exceeds tiny 128-byte MaxResponseBodyBytes.
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"secret_tool","description":"` + strings.Repeat("z", 300) + `"}]}}`))
+			return
+		}
+		// Malformed truncated JSON.
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"secret_tool"`))
+	}))
+	defer upstream.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertMCPServer(context.Background(), store.MCPServer{
+		Name: "docs", URL: upstream.URL + "/mcp", Transport: config.MCPTransportStreamableHTTP,
+		AuthType: config.MCPAuthNone, Enabled: true, Source: store.SourceLocal,
+	})
+	gw, err := NewGateway(GatewayConfig{
+		Store:                st,
+		Authorizer:           policy.NewEvaluator(),
+		MaxResponseBodyBytes: 128,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	alice := makePrincipal("alice@example.com", []string{"docs/search"}, []string{"docs/secret_*"})
+
+	// Case A: oversized > MaxResponseBodyBytes -> 502 and body never contains "secret_tool".
+	recBig := httptest.NewRecorder()
+	gw.ServeHTTP(recBig, authedReq(alice, http.MethodPost, "/mcp/docs", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+	if recBig.Code != http.StatusBadGateway || strings.Contains(recBig.Body.String(), "secret_tool") {
+		t.Fatalf("oversized tools/list must fail closed with 502, got %d: %s", recBig.Code, recBig.Body.String())
+	}
+
+	// Case B: malformed JSON on tools/list -> 502 and body never contains "secret_tool".
+	mode.Store(1)
+	recBad := httptest.NewRecorder()
+	gw.ServeHTTP(recBad, authedReq(alice, http.MethodPost, "/mcp/docs", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+	if recBad.Code != http.StatusBadGateway || strings.Contains(recBad.Body.String(), "secret_tool") {
+		t.Fatalf("malformed tools/list must fail closed with 502, got %d: %s", recBad.Code, recBad.Body.String())
+	}
+}
+
+type spyGuardrailInspector struct {
+	mu    sync.Mutex
+	calls []GuardrailRequest
+}
+
+func (s *spyGuardrailInspector) Inspect(_ context.Context, req GuardrailRequest) (*GuardrailDecision, error) {
+	s.mu.Lock()
+	s.calls = append(s.calls, req)
+	s.mu.Unlock()
+	return &GuardrailDecision{Action: "allow"}, nil
+}
+
+func TestMCPP22AndP23HeaderAllowlistDuplicateBatchIDsAndOmittedArgs(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("MCP-Protocol-Version", "2025-03-26")
+		w.Header().Set("Set-Cookie", "evil=1; Path=/")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Location", "https://evil.example")
+		w.Header().Set("X-Internal-Secret", "leak")
+
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) > 0 && trimmed[0] == '[' {
+			_, _ = w.Write([]byte(`[
+				{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"first"}]}},
+				{"jsonrpc":"2.0","id":7,"result":{"isError":true,"content":[{"type":"text","text":"second failed"}]}}
+			]`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}]}}`))
+	}))
+	defer upstream.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertMCPServer(context.Background(), store.MCPServer{
+		Name: "docs", URL: upstream.URL + "/mcp", Transport: config.MCPTransportStreamableHTTP,
+		AuthType: config.MCPAuthNone, Enabled: true, Source: store.SourceLocal,
+	})
+
+	spy := &spyGuardrailInspector{}
+	gw, err := NewGateway(GatewayConfig{
+		Store:      st,
+		Authorizer: policy.NewEvaluator(),
+		Guardrails: spy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	alice := makePrincipal("alice@example.com", []string{"docs/*"}, nil)
+
+	// 1. Omitted "arguments" MUST still invoke Guardrails.Inspect with normalized {} + strip unsafe response headers!
+	recOmit := httptest.NewRecorder()
+	gw.ServeHTTP(recOmit, authedReq(alice, http.MethodPost, "/mcp/docs", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_items"}}`))
+	if recOmit.Code != http.StatusOK {
+		t.Fatalf("omitted arguments tools/call failed: %d %s", recOmit.Code, recOmit.Body.String())
+	}
+	if recOmit.Header().Get("Set-Cookie") != "" ||
+		recOmit.Header().Get("Access-Control-Allow-Origin") != "" ||
+		recOmit.Header().Get("Location") != "" ||
+		recOmit.Header().Get("X-Internal-Secret") != "" {
+		t.Fatalf("unsafe upstream response headers leaked: %+v", recOmit.Header())
+	}
+	if recOmit.Header().Get("MCP-Protocol-Version") != "2025-03-26" {
+		t.Fatalf("allowlisted MCP-Protocol-Version header missing")
+	}
+	spy.mu.Lock()
+	if len(spy.calls) != 1 || string(spy.calls[0].Body) != `{"arguments":{}}` {
+		spy.mu.Unlock()
+		t.Fatalf("omitted arguments must still invoke guardrail with normalized {}, got %+v", spy.calls)
+	}
+	spy.mu.Unlock()
+
+	// 2. Batch with duplicate IDs (id=7 twice) records BOTH audit entries in FIFO order (one ok, one error).
+	dupBatch := `[
+		{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"tool_a","arguments":{}}},
+		{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"tool_b","arguments":{}}}
+	]`
+	recDup := httptest.NewRecorder()
+	gw.ServeHTTP(recDup, authedReq(alice, http.MethodPost, "/mcp/docs", dupBatch))
+	if recDup.Code != http.StatusOK {
+		t.Fatalf("duplicate-id batch failed: %d %s", recDup.Code, recDup.Body.String())
+	}
+
+	logs, err := st.QueryMCPAuditLogs(context.Background(), store.MCPAuditFilter{ServerName: "docs", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundA, foundB := false, false
+	for _, l := range logs {
+		if l.ToolName == "tool_a" && l.Status == AuditStatusOK {
+			foundA = true
+		}
+		if l.ToolName == "tool_b" && l.Status == AuditStatusError {
+			foundB = true
+		}
+	}
+	if !foundA || !foundB {
+		t.Fatalf("duplicate batch IDs lost an audit record: foundA=%v foundB=%v logs=%+v", foundA, foundB, logs)
 	}
 }

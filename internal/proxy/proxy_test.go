@@ -2075,3 +2075,150 @@ func TestUpstreamSSRFGuardAndRedirectBlock(t *testing.T) {
 		t.Fatalf("sanitized 502 error leaked Gemini query key: %s", recIMDSv6.Body.String())
 	}
 }
+
+func TestProxySameOriginCSRFEnforcement(t *testing.T) {
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-csrf","object":"chat.completion","model":"gpt-4.1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "openai", Type: config.ProviderTypeOpenAI, BaseURL: upstream.URL, APIKey: "sk-1", Models: []string{"gpt-4.1"}, Enabled: true,
+	})
+	gw, err := NewGateway(GatewayConfig{Store: st})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}]}`
+
+	// 1. Cross-origin browser Origin header -> 403 Forbidden, zero upstream hit.
+	reqEvilOrigin := authedReq(http.MethodPost, "/v1/chat/completions", body)
+	reqEvilOrigin.Host = "headlamp.ts.net"
+	reqEvilOrigin.RemoteAddr = "100.64.0.9:51234"
+	reqEvilOrigin.Header.Set("Origin", "https://evil.example")
+	recEvilOrigin := httptest.NewRecorder()
+	gw.ServeHTTP(recEvilOrigin, reqEvilOrigin)
+	if recEvilOrigin.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on cross-origin Origin, got %d: %s", recEvilOrigin.Code, recEvilOrigin.Body.String())
+	}
+
+	// 2. Cross-site / non-loopback same-site Sec-Fetch-Site -> 403 Forbidden.
+	for _, sfs := range []string{"cross-site", "same-site"} {
+		reqSFS := authedReq(http.MethodPost, "/v1/chat/completions", body)
+		reqSFS.Host = "headlamp.ts.net"
+		reqSFS.RemoteAddr = "100.64.0.9:51234"
+		reqSFS.Header.Set("Sec-Fetch-Site", sfs)
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, reqSFS)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 on non-loopback Sec-Fetch-Site=%q, got %d", sfs, rec.Code)
+		}
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("CSRF-blocked requests must never hit upstream (got %d hits)", hits.Load())
+	}
+
+	// 3. Same-origin browser request -> 200 OK.
+	reqSame := authedReq(http.MethodPost, "/v1/chat/completions", body)
+	reqSame.Host = "headlamp.ts.net"
+	reqSame.RemoteAddr = "100.64.0.9:51234"
+	reqSame.Header.Set("Origin", "https://headlamp.ts.net")
+	reqSame.Header.Set("Sec-Fetch-Site", "same-origin")
+	recSame := httptest.NewRecorder()
+	gw.ServeHTTP(recSame, reqSame)
+	if recSame.Code != http.StatusOK {
+		t.Fatalf("expected 200 on same-origin request, got %d: %s", recSame.Code, recSame.Body.String())
+	}
+
+	// 4. Loopback Vite dev-proxy equivalence -> 200 OK.
+	reqLoop := authedReq(http.MethodPost, "/v1/chat/completions", body)
+	reqLoop.Host = "127.0.0.1:8080"
+	reqLoop.RemoteAddr = "127.0.0.1:54321"
+	reqLoop.Header.Set("Origin", "http://localhost:5173")
+	reqLoop.Header.Set("Sec-Fetch-Site", "same-site")
+	recLoop := httptest.NewRecorder()
+	gw.ServeHTTP(recLoop, reqLoop)
+	if recLoop.Code != http.StatusOK {
+		t.Fatalf("expected 200 on loopback dev-proxy request, got %d: %s", recLoop.Code, recLoop.Body.String())
+	}
+
+	// 5. Non-browser CLI/SDK request (no Origin/Sec-Fetch-Site) -> 200 OK.
+	recCLI := httptest.NewRecorder()
+	gw.ServeHTTP(recCLI, authedReq(http.MethodPost, "/v1/chat/completions", body))
+	if recCLI.Code != http.StatusOK {
+		t.Fatalf("expected 200 on non-browser CLI request, got %d", recCLI.Code)
+	}
+}
+
+func TestProxyResponseHeadersExposeWinningFallbackProviderAndModel(t *testing.T) {
+	failPrimary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"message":"overloaded"}}`))
+	}))
+	defer failPrimary.Close()
+
+	winFallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(raw), `"stream":true`) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fb\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n"))
+			_, _ = w.Write([]byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"))
+			_, _ = w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"))
+			_, _ = w.Write([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n"))
+			_, _ = w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_fb","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2}}`))
+	}))
+	defer winFallback.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "openai", Type: config.ProviderTypeOpenAI, BaseURL: failPrimary.URL, APIKey: "k1", Enabled: true,
+	})
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "anthropic", Type: config.ProviderTypeAnthropic, BaseURL: winFallback.URL, APIKey: "k2", Enabled: true,
+	})
+	_ = st.UpsertModelRoute(context.Background(), store.ModelRoute{
+		Alias:         "team/cost-check",
+		ProviderName:  "openai",
+		UpstreamModel: "gpt-5",
+		Fallbacks:     []store.RouteTarget{{Provider: "anthropic", Model: "claude-sonnet-4-6"}},
+		Enabled:       true,
+	})
+
+	gw, err := NewGateway(GatewayConfig{Store: st})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Non-streaming fallback response exposes winning provider type and upstream model.
+	recJSON := httptest.NewRecorder()
+	gw.ServeHTTP(recJSON, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"team/cost-check","messages":[{"role":"user","content":"hi"}]}`))
+	if recJSON.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recJSON.Code, recJSON.Body.String())
+	}
+	if recJSON.Header().Get("X-Headlamp-Provider-Type") != config.ProviderTypeAnthropic ||
+		recJSON.Header().Get("X-Headlamp-Upstream-Model") != "claude-sonnet-4-6" {
+		t.Fatalf("unexpected winning fallback headers on JSON response: provider=%q model=%q",
+			recJSON.Header().Get("X-Headlamp-Provider-Type"), recJSON.Header().Get("X-Headlamp-Upstream-Model"))
+	}
+
+	// Streaming fallback response also exposes winning provider type and upstream model.
+	recStream := httptest.NewRecorder()
+	gw.ServeHTTP(recStream, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"team/cost-check","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if recStream.Code != http.StatusOK {
+		t.Fatalf("expected 200 on stream, got %d: %s", recStream.Code, recStream.Body.String())
+	}
+	if recStream.Header().Get("X-Headlamp-Provider-Type") != config.ProviderTypeAnthropic ||
+		recStream.Header().Get("X-Headlamp-Upstream-Model") != "claude-sonnet-4-6" {
+		t.Fatalf("unexpected winning fallback headers on SSE response: provider=%q model=%q",
+			recStream.Header().Get("X-Headlamp-Provider-Type"), recStream.Header().Get("X-Headlamp-Upstream-Model"))
+	}
+}

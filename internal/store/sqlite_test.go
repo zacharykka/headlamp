@@ -1057,3 +1057,240 @@ mcp_servers:
 		t.Fatalf("expected cascade delete of chat_messages, found %d remaining", orphanMsgs)
 	}
 }
+
+func TestSQLiteFixedWidthTimestampsMidnightComparison(t *testing.T) {
+	st, _ := newTestStore(t, ":memory:")
+	ctx := context.Background()
+
+	dayStart := time.Date(2026, 11, 27, 0, 0, 0, 0, time.UTC)
+	midSec := time.Date(2026, 11, 27, 0, 0, 0, 500_000_000, time.UTC)
+	beforeMidnight := dayStart.Add(-time.Nanosecond)
+
+	if got := formatTime(dayStart); got != "2026-11-27T00:00:00.000000000Z" {
+		t.Fatalf("formatTime(dayStart) = %q, want fixed 9-digit nanoseconds", got)
+	}
+	if got := formatTime(midSec); got != "2026-11-27T00:00:00.500000000Z" {
+		t.Fatalf("formatTime(midSec) = %q, want fixed 9-digit nanoseconds", got)
+	}
+	if !(formatTime(midSec) >= formatTime(dayStart)) {
+		t.Fatalf("expected lexical comparison %q >= %q to be true", formatTime(midSec), formatTime(dayStart))
+	}
+
+	// parseTime must remain backward-compatible with legacy RFC3339 and variable-width RFC3339Nano.
+	if got := parseTime("2026-11-27T00:00:00Z"); !got.Equal(dayStart) {
+		t.Fatalf("parseTime(RFC3339) = %v, want %v", got, dayStart)
+	}
+	if got := parseTime("2026-11-27T00:00:00.5Z"); !got.Equal(midSec) {
+		t.Fatalf("parseTime(RFC3339Nano) = %v, want %v", got, midSec)
+	}
+	if got := parseTime(formatTime(midSec)); !got.Equal(midSec) {
+		t.Fatalf("parseTime(fixed) = %v, want %v", got, midSec)
+	}
+
+	for _, log := range []UsageLog{
+		{ID: "u-prev", CreatedAt: beforeMidnight, Subject: "alice", ProviderName: "openai", RequestedModel: "gpt-5", TotalTokens: 50, CostUSD: 0.01, StatusCode: 200},
+		{ID: "u-zero", CreatedAt: dayStart, Subject: "alice", ProviderName: "openai", RequestedModel: "gpt-5", TotalTokens: 100, CostUSD: 0.02, StatusCode: 200},
+		{ID: "u-half", CreatedAt: midSec, Subject: "alice", ProviderName: "openai", RequestedModel: "gpt-5", TotalTokens: 200, CostUSD: 0.03, StatusCode: 200},
+	} {
+		if err := st.InsertUsageLog(ctx, log); err != nil {
+			t.Fatalf("InsertUsageLog(%s): %v", log.ID, err)
+		}
+	}
+
+	sum, err := st.SummarizeUsage(ctx, UsageFilter{Subject: "alice", Since: dayStart})
+	if err != nil {
+		t.Fatalf("SummarizeUsage(Since=dayStart): %v", err)
+	}
+	if sum.RequestCount != 2 || sum.TotalTokens != 300 || math.Abs(sum.CostUSD-0.05) > 1e-9 {
+		t.Fatalf("SummarizeUsage(Since=dayStart) = %+v, want 2 requests / 300 tokens / $0.05", sum)
+	}
+
+	// Same-second chat message ordering must keep .000000000Z before .200000000Z.
+	sess, err := st.CreateChatSession(ctx, ChatSession{Subject: "alice", Title: "Order", Model: "gpt-5"})
+	if err != nil {
+		t.Fatalf("CreateChatSession: %v", err)
+	}
+	if _, err := st.InsertChatMessage(ctx, "alice", ChatMessage{
+		ID: "msg-later", SessionID: sess.ID, Role: "assistant", Content: "second", CreatedAt: dayStart.Add(200 * time.Millisecond),
+	}); err != nil {
+		t.Fatalf("InsertChatMessage(later): %v", err)
+	}
+	if _, err := st.InsertChatMessage(ctx, "alice", ChatMessage{
+		ID: "msg-exact", SessionID: sess.ID, Role: "user", Content: "first", CreatedAt: dayStart,
+	}); err != nil {
+		t.Fatalf("InsertChatMessage(exact): %v", err)
+	}
+	msgs, err := st.ListChatMessages(ctx, "alice", sess.ID)
+	if err != nil || len(msgs) != 2 || msgs[0].ID != "msg-exact" || msgs[1].ID != "msg-later" {
+		t.Fatalf("ListChatMessages same-second order = (%+v, %v), want [msg-exact, msg-later]", msgs, err)
+	}
+}
+
+func TestDeleteChatMessageOwnershipAndRollback(t *testing.T) {
+	st, _ := newTestStore(t, ":memory:")
+	ctx := context.Background()
+
+	sAlice, err := st.CreateChatSession(ctx, ChatSession{Subject: "alice", Title: "Alice", Model: "gpt-5"})
+	if err != nil {
+		t.Fatalf("CreateChatSession(alice): %v", err)
+	}
+	sBob, err := st.CreateChatSession(ctx, ChatSession{Subject: "bob", Title: "Bob", Model: "gpt-5"})
+	if err != nil {
+		t.Fatalf("CreateChatSession(bob): %v", err)
+	}
+
+	m1, err := st.InsertChatMessage(ctx, "alice", ChatMessage{SessionID: sAlice.ID, Role: "user", Content: "orphan-turn"})
+	if err != nil {
+		t.Fatalf("InsertChatMessage(m1): %v", err)
+	}
+	m2, err := st.InsertChatMessage(ctx, "alice", ChatMessage{SessionID: sAlice.ID, Role: "user", Content: "keep-turn"})
+	if err != nil {
+		t.Fatalf("InsertChatMessage(m2): %v", err)
+	}
+
+	// Cross-subject and wrong-session deletion must fail with ErrNotFound.
+	if err := st.DeleteChatMessage(ctx, "bob", sAlice.ID, m1.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("bob DeleteChatMessage(alice) = %v, want ErrNotFound", err)
+	}
+	if err := st.DeleteChatMessage(ctx, "alice", sBob.ID, m1.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("alice DeleteChatMessage(wrong session) = %v, want ErrNotFound", err)
+	}
+	if err := st.DeleteChatMessage(ctx, "alice", sAlice.ID, "missing-id"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("alice DeleteChatMessage(missing) = %v, want ErrNotFound", err)
+	}
+
+	// Owner deletion succeeds and removes only the targeted message.
+	if err := st.DeleteChatMessage(ctx, "alice", sAlice.ID, m1.ID); err != nil {
+		t.Fatalf("alice DeleteChatMessage(m1): %v", err)
+	}
+	if err := st.DeleteChatMessage(ctx, "alice", sAlice.ID, m1.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second DeleteChatMessage(m1) = %v, want ErrNotFound", err)
+	}
+	msgs, err := st.ListChatMessages(ctx, "alice", sAlice.ID)
+	if err != nil || len(msgs) != 1 || msgs[0].ID != m2.ID {
+		t.Fatalf("ListChatMessages after rollback = (%+v, %v), want only %s", msgs, err, m2.ID)
+	}
+}
+
+func TestSyncConfigMCPAuthNoneClearsSecretAndIsolatesLocalToken(t *testing.T) {
+	st, _ := newTestStore(t, ":memory:")
+	ctx := context.Background()
+
+	// 1. Seed config MCP server with bearer token, then switch to auth_type: none -> token must be cleared.
+	cfgBearer, err := config.LoadFromBytes([]byte(`
+mcp_servers:
+  - name: docs
+    url: "https://docs.internal/mcp"
+    auth_type: bearer
+    auth_token: "yaml-secret-token"
+`))
+	if err != nil {
+		t.Fatalf("LoadFromBytes cfgBearer: %v", err)
+	}
+	if err := st.SyncConfig(ctx, cfgBearer); err != nil {
+		t.Fatalf("SyncConfig cfgBearer: %v", err)
+	}
+	got, err := st.GetMCPServer(ctx, "docs")
+	if err != nil || got.AuthToken != "yaml-secret-token" {
+		t.Fatalf("GetMCPServer(docs) = (%+v, %v)", got, err)
+	}
+
+	cfgNone, err := config.LoadFromBytes([]byte(`
+mcp_servers:
+  - name: docs
+    url: "https://docs.internal/mcp"
+    auth_type: none
+`))
+	if err != nil {
+		t.Fatalf("LoadFromBytes cfgNone: %v", err)
+	}
+	if err := st.SyncConfig(ctx, cfgNone); err != nil {
+		t.Fatalf("SyncConfig cfgNone: %v", err)
+	}
+	gotNone, err := st.GetMCPServer(ctx, "docs")
+	if err != nil || gotNone.AuthType != config.MCPAuthNone || gotNone.AuthToken != "" {
+		t.Fatalf("expected cleared token when switching to auth_type=none, got (%+v, %v)", gotNone, err)
+	}
+	var rawEnc string
+	if err := st.DB().QueryRowContext(ctx, `SELECT auth_token_enc FROM mcp_servers WHERE name = ?`, "docs").Scan(&rawEnc); err != nil {
+		t.Fatalf("query raw auth_token_enc: %v", err)
+	}
+	if rawEnc != "" {
+		t.Fatalf("expected empty auth_token_enc in DB when auth_type=none, got %q", rawEnc)
+	}
+
+	// 2. Existing source='local' server token MUST NOT be inherited when YAML takes over the same name without auth_token.
+	if err := st.UpsertMCPServer(ctx, MCPServer{
+		Name:      "shared-name",
+		URL:       "https://local.internal/mcp",
+		Transport: config.MCPTransportStreamableHTTP,
+		AuthType:  config.MCPAuthBearer,
+		AuthToken: "local-only-secret",
+		Enabled:   true,
+		Source:    SourceLocal,
+	}); err != nil {
+		t.Fatalf("UpsertMCPServer(shared-name): %v", err)
+	}
+	cfgTakeover, err := config.LoadFromBytes([]byte(`
+mcp_servers:
+  - name: shared-name
+    url: "https://config.internal/mcp"
+    auth_type: bearer
+`))
+	if err != nil {
+		t.Fatalf("LoadFromBytes cfgTakeover: %v", err)
+	}
+	if err := st.SyncConfig(ctx, cfgTakeover); err != nil {
+		t.Fatalf("SyncConfig cfgTakeover: %v", err)
+	}
+	taken, err := st.GetMCPServer(ctx, "shared-name")
+	if err != nil || taken.Source != SourceConfig || taken.AuthToken != "" {
+		t.Fatalf("expected source=config takeover NOT to inherit source=local token, got (%+v, %v)", taken, err)
+	}
+}
+
+func TestPaginationTieBreakerAndExtendedSummaryTx(t *testing.T) {
+	st, _ := newTestStore(t, ":memory:")
+	ctx := context.Background()
+
+	ts := time.Date(2026, 11, 27, 15, 0, 0, 0, time.UTC)
+	for _, id := range []string{"id-a", "id-c", "id-b"} {
+		if err := st.InsertUsageLog(ctx, UsageLog{
+			ID: id, CreatedAt: ts, Subject: "alice", ProviderName: "openai",
+			RequestedModel: "gpt-5", TotalTokens: 10, CostUSD: 0.01, LatencyMS: 100, StatusCode: 200,
+		}); err != nil {
+			t.Fatalf("InsertUsageLog(%s): %v", id, err)
+		}
+		if err := st.InsertMCPAuditLog(ctx, MCPAuditLog{
+			ID: id, CreatedAt: ts, Subject: "alice", ServerName: "docs", Method: "tools/call", ToolName: "search", Status: "ok",
+		}); err != nil {
+			t.Fatalf("InsertMCPAuditLog(%s): %v", id, err)
+		}
+		if _, err := st.CreateChatSession(ctx, ChatSession{
+			ID: id, Subject: "alice", Title: id, Model: "gpt-5", CreatedAt: ts, UpdatedAt: ts,
+		}); err != nil {
+			t.Fatalf("CreateChatSession(%s): %v", id, err)
+		}
+	}
+
+	wantOrder := []string{"id-c", "id-b", "id-a"}
+	for i, wantID := range wantOrder {
+		uPage, err := st.QueryUsageLogs(ctx, UsageFilter{Limit: 1, Offset: i})
+		if err != nil || len(uPage) != 1 || uPage[0].ID != wantID {
+			t.Fatalf("QueryUsageLogs page %d = (%+v, %v), want %s", i, uPage, err, wantID)
+		}
+		mPage, err := st.QueryMCPAuditLogs(ctx, MCPAuditFilter{Limit: 1, Offset: i})
+		if err != nil || len(mPage) != 1 || mPage[0].ID != wantID {
+			t.Fatalf("QueryMCPAuditLogs page %d = (%+v, %v), want %s", i, mPage, err, wantID)
+		}
+		cPage, err := st.ListChatSessions(ctx, "alice", 1, i)
+		if err != nil || len(cPage) != 1 || cPage[0].ID != wantID {
+			t.Fatalf("ListChatSessions page %d = (%+v, %v), want %s", i, cPage, err, wantID)
+		}
+	}
+
+	ext, err := st.SummarizeUsageExtended(ctx, UsageFilter{Subject: "alice"})
+	if err != nil || ext.RequestCount != 3 || ext.P95LatencyMS != 100 || math.Abs(ext.CostUSD-0.03) > 1e-9 {
+		t.Fatalf("SummarizeUsageExtended = (%+v, %v)", ext, err)
+	}
+}

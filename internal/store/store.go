@@ -367,6 +367,7 @@ type Store interface {
 	DeleteChatSession(ctx context.Context, subject, id string) error
 	InsertChatMessage(ctx context.Context, subject string, msg ChatMessage) (*ChatMessage, error)
 	ListChatMessages(ctx context.Context, subject, sessionID string) ([]ChatMessage, error)
+	DeleteChatMessage(ctx context.Context, subject, sessionID, messageID string) error
 
 	// Runtime settings
 	GetAuditSettings(ctx context.Context) (*AuditSettings, error)

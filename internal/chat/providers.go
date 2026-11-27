@@ -133,7 +133,7 @@ func (s *Service) runOpenAIChatLoop(
 			return outcome, fmt.Errorf("chat: marshal openai request: %w", err)
 		}
 
-		streamReader, closeStream, err := s.invokeGatewayStream(ctx, p, "/v1/chat/completions", reqBytes)
+		streamReader, respHeaders, closeStream, err := s.invokeGatewayStream(ctx, p, "/v1/chat/completions", reqBytes)
 		if err != nil {
 			outcome.content = contentBuf.String()
 			return outcome, err
@@ -228,6 +228,11 @@ func (s *Service) runOpenAIChatLoop(
 
 		closeStream()
 		addUsage(&outcome.usage, roundUsage)
+		outcome.rounds = append(outcome.rounds, roundMetrics{
+			providerType:  respHeaders.Get(headerProviderType),
+			upstreamModel: respHeaders.Get(headerUpstreamModel),
+			usage:         roundUsage,
+		})
 
 		if streamErr != nil {
 			outcome.content = contentBuf.String()
@@ -430,7 +435,7 @@ func (s *Service) runGeminiChatLoop(
 			return outcome, fmt.Errorf("chat: marshal gemini request: %w", err)
 		}
 
-		streamReader, closeStream, err := s.invokeGatewayStream(ctx, p, geminiPath, reqBytes)
+		streamReader, respHeaders, closeStream, err := s.invokeGatewayStream(ctx, p, geminiPath, reqBytes)
 		if err != nil {
 			outcome.content = contentBuf.String()
 			return outcome, err
@@ -492,10 +497,14 @@ func (s *Service) runGeminiChatLoop(
 					if part.Text != "" && !part.Thought {
 						contentBuf.WriteString(part.Text)
 						_ = emitter.Emit("delta", map[string]string{"text": part.Text})
-						modelParts = append(modelParts, geminiPart{Text: part.Text})
-					} else if part.FunctionCall != nil {
-						modelParts = append(modelParts, part)
+					}
+					if part.FunctionCall != nil {
 						funcCalls = append(funcCalls, *part.FunctionCall)
+					}
+					// Preserve all non-empty parts verbatim in modelParts (including Thought and
+					// ThoughtSignature) so Gemini 2.5/3 thinking models succeed across tool rounds.
+					if part.Text != "" || part.Thought || part.ThoughtSignature != "" || part.FunctionCall != nil {
+						modelParts = append(modelParts, part)
 					}
 				}
 			}
@@ -503,6 +512,11 @@ func (s *Service) runGeminiChatLoop(
 
 		closeStream()
 		addUsage(&outcome.usage, roundUsage)
+		outcome.rounds = append(outcome.rounds, roundMetrics{
+			providerType:  respHeaders.Get(headerProviderType),
+			upstreamModel: respHeaders.Get(headerUpstreamModel),
+			usage:         roundUsage,
+		})
 
 		if streamErr != nil {
 			outcome.content = contentBuf.String()
@@ -513,10 +527,7 @@ func (s *Service) runGeminiChatLoop(
 			break
 		}
 
-		contents = append(contents, geminiContent{
-			Role:  "model",
-			Parts: modelParts,
-		})
+		contents = appendGeminiContent(contents, "model", modelParts...)
 
 		respParts := make([]geminiPart, 0, len(funcCalls))
 		for _, fc := range funcCalls {
@@ -543,10 +554,7 @@ func (s *Service) runGeminiChatLoop(
 			})
 		}
 
-		contents = append(contents, geminiContent{
-			Role:  "user",
-			Parts: respParts,
-		})
+		contents = appendGeminiContent(contents, "user", respParts...)
 	}
 
 	outcome.content = contentBuf.String()
@@ -568,16 +576,26 @@ func buildGeminiContents(history []store.ChatMessage, userPrompt string) []gemin
 		default:
 			continue
 		}
-		contents = append(contents, geminiContent{
-			Role:  role,
-			Parts: []geminiPart{{Text: m.Content}},
-		})
+		contents = appendGeminiContent(contents, role, geminiPart{Text: m.Content})
 	}
-	contents = append(contents, geminiContent{
-		Role:  "user",
-		Parts: []geminiPart{{Text: userPrompt}},
-	})
+	contents = appendGeminiContent(contents, "user", geminiPart{Text: userPrompt})
 	return contents
+}
+
+// appendGeminiContent appends parts to contents while merging adjacent turns that share
+// the same Gemini role ("user" or "model") so Gemini never rejects consecutive same-role turns.
+func appendGeminiContent(contents []geminiContent, role string, parts ...geminiPart) []geminiContent {
+	if len(parts) == 0 {
+		return contents
+	}
+	if n := len(contents); n > 0 && contents[n-1].Role == role {
+		contents[n-1].Parts = append(contents[n-1].Parts, parts...)
+		return contents
+	}
+	return append(contents, geminiContent{
+		Role:  role,
+		Parts: parts,
+	})
 }
 
 // --- Shared MCP Tool Execution & Usage Helpers ---

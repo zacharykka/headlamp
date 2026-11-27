@@ -29,7 +29,22 @@ const (
 	DefaultMaxToolRounds = 8
 	maxAutoTitleRunes    = 60
 	maxErrorBodyBytes    = 256 * 1024
+
+	headerProviderType  = "X-Headlamp-Provider-Type"
+	headerUpstreamModel = "X-Headlamp-Upstream-Model"
 )
+
+// GuardrailInspector optionally inspects user chat input before persistence so blocked
+// secrets never hit chat_messages and redacted content is persisted cleanly.
+type GuardrailInspector interface {
+	InspectText(ctx context.Context, text string) (action, redacted, reason string, err error)
+}
+
+// messageDeleter is an optional store capability used to roll back an orphaned user
+// message if Round 0 fails at proxy.Gateway before any assistant output or tool call occurs.
+type messageDeleter interface {
+	DeleteChatMessage(ctx context.Context, subject, sessionID, messageID string) error
+}
 
 // Authorizer checks which models a Principal may list and invoke.
 // Satisfied directly by *policy.Evaluator.
@@ -90,20 +105,29 @@ type Config struct {
 	Pricing       *metering.PricingTable
 	Gateway       http.Handler
 	MCP           MCPBridge
+	Guardrails    GuardrailInspector
 	MaxToolRounds int
 	Logf          func(format string, args ...any)
+}
+
+type sessionLockEntry struct {
+	sem  chan struct{}
+	refs int
 }
 
 // Service orchestrates Team Web Chat sessions, model listing, MCP tool execution,
 // and zero-bypass LLM streaming through Headlamp's own proxy.Gateway.
 type Service struct {
-	store         store.Store
-	authorizer    Authorizer
-	pricing       *metering.PricingTable
-	gateway       http.Handler
-	mcp           MCPBridge
-	maxToolRounds int
-	logf          func(format string, args ...any)
+	store          store.Store
+	authorizer     Authorizer
+	pricing        *metering.PricingTable
+	gateway        http.Handler
+	mcp            MCPBridge
+	guardrails     GuardrailInspector
+	maxToolRounds  int
+	logf           func(format string, args ...any)
+	sessionLocksMu sync.Mutex
+	sessionLocks   map[string]*sessionLockEntry
 }
 
 // NewService constructs a Chat Service.
@@ -128,9 +152,48 @@ func NewService(cfg Config) (*Service, error) {
 		pricing:       cfg.Pricing,
 		gateway:       cfg.Gateway,
 		mcp:           cfg.MCP,
+		guardrails:    cfg.Guardrails,
 		maxToolRounds: maxRounds,
 		logf:          logf,
+		sessionLocks:  make(map[string]*sessionLockEntry),
 	}, nil
+}
+
+// lockSession serializes turns for a single (subject, sessionID) pair and cleans up
+// idle entries via reference counting so the map never leaks memory.
+func (s *Service) lockSession(ctx context.Context, key string) (func(), error) {
+	s.sessionLocksMu.Lock()
+	if s.sessionLocks == nil {
+		s.sessionLocks = make(map[string]*sessionLockEntry)
+	}
+	entry, ok := s.sessionLocks[key]
+	if !ok {
+		entry = &sessionLockEntry{sem: make(chan struct{}, 1)}
+		s.sessionLocks[key] = entry
+	}
+	entry.refs++
+	s.sessionLocksMu.Unlock()
+
+	select {
+	case entry.sem <- struct{}{}:
+		return func() {
+			<-entry.sem
+			s.sessionLocksMu.Lock()
+			entry.refs--
+			if entry.refs == 0 {
+				delete(s.sessionLocks, key)
+			}
+			s.sessionLocksMu.Unlock()
+		}, nil
+	case <-ctx.Done():
+		s.sessionLocksMu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(s.sessionLocks, key)
+		}
+		s.sessionLocksMu.Unlock()
+		return nil, ctx.Err()
+	}
 }
 
 type routeCandidate struct {
@@ -325,6 +388,12 @@ func (s *Service) StreamMessage(ctx context.Context, w http.ResponseWriter, p *a
 		return errors.New("chat: message content is required")
 	}
 
+	unlockSession, err := s.lockSession(ctx, p.Subject+"\x00"+sessionID)
+	if err != nil {
+		return err
+	}
+	defer unlockSession()
+
 	session, err := s.store.GetChatSession(ctx, p.Subject, sessionID)
 	if err != nil {
 		return err
@@ -336,6 +405,33 @@ func (s *Service) StreamMessage(ctx context.Context, w http.ResponseWriter, p *a
 	}
 	if model == "" {
 		return errors.New("chat: session model is required")
+	}
+
+	// Pre-persist guardrail inspection: prevent raw secrets from being stored in chat_messages
+	// (or session titles) and ensure redacted prompts are stored in redacted form.
+	userContent := req.Content
+	if s.guardrails != nil {
+		action, redacted, reason, gErr := s.guardrails.InspectText(ctx, userContent)
+		if gErr != nil {
+			return fmt.Errorf("chat: inspect message guardrails: %w", gErr)
+		}
+		switch strings.ToLower(strings.TrimSpace(action)) {
+		case "block":
+			emitter := startSSE(w)
+			errMsg := strings.TrimSpace(reason)
+			if errMsg == "" {
+				errMsg = "message blocked by guardrail policy"
+			}
+			_ = emitter.Emit("error", map[string]string{
+				"type":    "guardrail_blocked",
+				"message": errMsg,
+			})
+			return nil
+		case "redact", "modify":
+			if redacted != "" {
+				userContent = redacted
+			}
+		}
 	}
 
 	mcpServers := session.MCPServers
@@ -355,7 +451,7 @@ func (s *Service) StreamMessage(ctx context.Context, w http.ResponseWriter, p *a
 
 	trimmedTitle := strings.TrimSpace(session.Title)
 	if trimmedTitle == "" || strings.EqualFold(trimmedTitle, "New Chat") {
-		session.Title = deriveSessionTitle(content)
+		session.Title = deriveSessionTitle(strings.TrimSpace(userContent))
 		sessionChanged = true
 	}
 
@@ -379,7 +475,7 @@ func (s *Service) StreamMessage(ctx context.Context, w http.ResponseWriter, p *a
 		ID:        uuid.NewString(),
 		SessionID: session.ID,
 		Role:      "user",
-		Content:   req.Content,
+		Content:   userContent,
 		Model:     model,
 	})
 	if err != nil {
@@ -387,14 +483,7 @@ func (s *Service) StreamMessage(ctx context.Context, w http.ResponseWriter, p *a
 	}
 
 	// Commit SSE headers and emit initial message_start frame.
-	h := w.Header()
-	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
-	h.Set("Connection", "keep-alive")
-	h.Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-
-	emitter := newSSEEmitter(w)
+	emitter := startSSE(w)
 	_ = emitter.Emit("message_start", map[string]any{
 		"user_message": userMsg,
 		"session":      session,
@@ -411,15 +500,23 @@ func (s *Service) StreamMessage(ctx context.Context, w http.ResponseWriter, p *a
 		runErr  error
 	)
 	if dispatch.useGemini {
-		outcome, runErr = s.runGeminiChatLoop(ctx, p, model, session.SystemPrompt, history, req.Content, tools, toolLookup, emitter)
+		outcome, runErr = s.runGeminiChatLoop(ctx, p, model, session.SystemPrompt, history, userContent, tools, toolLookup, emitter)
 	} else {
-		outcome, runErr = s.runOpenAIChatLoop(ctx, p, model, session.SystemPrompt, history, req.Content, tools, toolLookup, emitter)
+		outcome, runErr = s.runOpenAIChatLoop(ctx, p, model, session.SystemPrompt, history, userContent, tools, toolLookup, emitter)
 	}
 
 	if runErr != nil {
+		hasAssistantProgress := outcome != nil && (outcome.content != "" || len(outcome.toolEvents) > 0)
+		if !hasAssistantProgress {
+			// Roll back the orphaned user message when Round 0 fails (e.g. policy 403,
+			// sync_review webhook block, quota 429, or pre-delta failure) so the session
+			// is never permanently poisoned by an unanswered/blocked turn.
+			s.rollbackOrphanUserMessage(p.Subject, session.ID, userMsg.ID)
+		}
+
 		// If canceled by caller (Stop button), persist any partial output already streamed.
 		if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) || ctx.Err() != nil {
-			if outcome != nil && (outcome.content != "" || len(outcome.toolEvents) > 0) {
+			if hasAssistantProgress {
 				s.persistAssistantMessage(p.Subject, session.ID, model, dispatch, outcome)
 			}
 			return nil
@@ -432,7 +529,7 @@ func (s *Service) StreamMessage(ctx context.Context, w http.ResponseWriter, p *a
 			"message": errMsg,
 		})
 		// If partial content or tool executions happened before the error, persist them so history stays intact.
-		if outcome != nil && (outcome.content != "" || len(outcome.toolEvents) > 0) {
+		if hasAssistantProgress {
 			s.persistAssistantMessage(p.Subject, session.ID, model, dispatch, outcome)
 		}
 		return nil
@@ -456,10 +553,39 @@ func (s *Service) StreamMessage(ctx context.Context, w http.ResponseWriter, p *a
 	return nil
 }
 
+func startSSE(w http.ResponseWriter) *sseEmitter {
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	return newSSEEmitter(w)
+}
+
+func (s *Service) rollbackOrphanUserMessage(subject, sessionID, messageID string) {
+	del, ok := s.store.(messageDeleter)
+	if !ok || messageID == "" {
+		return
+	}
+	delCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := del.DeleteChatMessage(delCtx, subject, sessionID, messageID); err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.logf("chat: rollback orphan user message %s for session %s failed: %v", messageID, sessionID, err)
+	}
+}
+
+type roundMetrics struct {
+	providerType  string
+	upstreamModel string
+	usage         metering.Usage
+}
+
 type turnOutcome struct {
 	content    string
 	toolEvents []store.ChatToolEvent
 	usage      metering.Usage
+	rounds     []roundMetrics
 }
 
 func (s *Service) persistAssistantMessage(subject, sessionID, model string, dispatch modelDispatchInfo, outcome *turnOutcome) (*store.ChatMessage, error) {
@@ -467,24 +593,39 @@ func (s *Service) persistAssistantMessage(subject, sessionID, model string, disp
 		outcome = &turnOutcome{}
 	}
 
-	var costUSD float64
-	if s.pricing != nil {
-		costUsage := outcome.usage
-		// OpenAI /v1/chat/completions SSE reports prompt_tokens inclusive of cached_tokens
-		// even when translated from Anthropic; adjust to Anthropic-exclusive input before pricing.
-		if !dispatch.useGemini && dispatch.providerType == config.ProviderTypeAnthropic && costUsage.CacheReadTokens > 0 {
-			if costUsage.InputTokens >= costUsage.CacheReadTokens {
-				costUsage.InputTokens -= costUsage.CacheReadTokens
-			} else {
-				costUsage.InputTokens = 0
+	var (
+		costUSD      float64
+		outputTokens int64
+	)
+
+	if len(outcome.rounds) > 0 {
+		for _, rm := range outcome.rounds {
+			provType := strings.TrimSpace(rm.providerType)
+			if provType == "" {
+				provType = dispatch.providerType
+			}
+			upModel := strings.TrimSpace(rm.upstreamModel)
+			if upModel == "" {
+				upModel = dispatch.upstreamModel
+			}
+			if s.pricing != nil {
+				costUsage := adjustUsageForPricing(dispatch.useGemini, provType, rm.usage)
+				costUSD += s.pricing.CalculateCost(provType, upModel, costUsage, dispatch.costOverride)
+			}
+			outputTokens += rm.usage.OutputTokens
+			if provType == config.ProviderTypeGemini {
+				outputTokens += rm.usage.ReasoningTokens
 			}
 		}
-		costUSD = s.pricing.CalculateCost(dispatch.providerType, dispatch.upstreamModel, costUsage, dispatch.costOverride)
-	}
-
-	outputTokens := outcome.usage.OutputTokens
-	if dispatch.providerType == config.ProviderTypeGemini {
-		outputTokens += outcome.usage.ReasoningTokens
+	} else {
+		if s.pricing != nil {
+			costUsage := adjustUsageForPricing(dispatch.useGemini, dispatch.providerType, outcome.usage)
+			costUSD = s.pricing.CalculateCost(dispatch.providerType, dispatch.upstreamModel, costUsage, dispatch.costOverride)
+		}
+		outputTokens = outcome.usage.OutputTokens
+		if dispatch.providerType == config.ProviderTypeGemini {
+			outputTokens += outcome.usage.ReasoningTokens
+		}
 	}
 
 	saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -501,6 +642,19 @@ func (s *Service) persistAssistantMessage(subject, sessionID, model string, disp
 		OutputTokens: outputTokens,
 		CostUSD:      costUSD,
 	})
+}
+
+func adjustUsageForPricing(useGemini bool, providerType string, usage metering.Usage) metering.Usage {
+	// OpenAI /v1/chat/completions SSE reports prompt_tokens inclusive of cached_tokens
+	// even when translated from Anthropic; adjust to Anthropic-exclusive input before pricing.
+	if !useGemini && providerType == config.ProviderTypeAnthropic && usage.CacheReadTokens > 0 {
+		if usage.InputTokens >= usage.CacheReadTokens {
+			usage.InputTokens -= usage.CacheReadTokens
+		} else {
+			usage.InputTokens = 0
+		}
+	}
+	return usage
 }
 
 type toolBinding struct {
@@ -682,10 +836,10 @@ func (e *gatewayHTTPError) Error() string {
 // invokeGatewayStream dispatches a synthetic HTTP POST directly into Headlamp's proxy.Gateway
 // using an io.Pipe so streaming SSE chunks flow immediately without buffering while preserving
 // the full policy, guardrail, quota, metering, and audit_payloads pipeline.
-func (s *Service) invokeGatewayStream(ctx context.Context, p *auth.Principal, path string, body []byte) (io.Reader, func(), error) {
+func (s *Service) invokeGatewayStream(ctx context.Context, p *auth.Principal, path string, body []byte) (io.Reader, http.Header, func(), error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://headlamp.internal"+path, bytes.NewReader(body))
 	if err != nil {
-		return nil, nil, fmt.Errorf("chat: build gateway request: %w", err)
+		return nil, nil, nil, fmt.Errorf("chat: build gateway request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if p.NodeIP != "" {
@@ -714,26 +868,28 @@ func (s *Service) invokeGatewayStream(ctx context.Context, p *auth.Principal, pa
 	case <-rw.headerCh:
 	case <-ctx.Done():
 		closeStream()
-		return nil, nil, ctx.Err()
+		return nil, nil, nil, ctx.Err()
 	}
 
 	status := rw.StatusCode()
+	respHeaders := rw.ResponseHeader()
 	if status < 200 || status >= 300 {
 		rawErr, _ := io.ReadAll(io.LimitReader(pr, maxErrorBodyBytes))
 		closeStream()
 		errType, errMsg := parseGatewayErrorBody(status, rawErr)
-		return nil, nil, &gatewayHTTPError{
+		return nil, nil, nil, &gatewayHTTPError{
 			StatusCode: status,
 			Type:       errType,
 			Message:    errMsg,
 		}
 	}
 
-	return pr, closeStream, nil
+	return pr, respHeaders, closeStream, nil
 }
 
 type pipeResponseWriter struct {
 	header      http.Header
+	headerSnap  http.Header
 	pw          *io.PipeWriter
 	mu          sync.Mutex
 	statusCode  int
@@ -758,6 +914,7 @@ func (w *pipeResponseWriter) WriteHeader(code int) {
 	w.mu.Lock()
 	if !w.wroteHeader {
 		w.statusCode = code
+		w.headerSnap = w.header.Clone()
 		w.wroteHeader = true
 	}
 	w.mu.Unlock()
@@ -769,6 +926,7 @@ func (w *pipeResponseWriter) Write(p []byte) (int, error) {
 	needHeader := !w.wroteHeader
 	if needHeader {
 		w.statusCode = http.StatusOK
+		w.headerSnap = w.header.Clone()
 		w.wroteHeader = true
 	}
 	w.mu.Unlock()
@@ -785,6 +943,7 @@ func (w *pipeResponseWriter) Finish() {
 	w.mu.Lock()
 	if !w.wroteHeader {
 		w.statusCode = http.StatusOK
+		w.headerSnap = w.header.Clone()
 		w.wroteHeader = true
 	}
 	w.mu.Unlock()
@@ -799,6 +958,15 @@ func (w *pipeResponseWriter) StatusCode() int {
 		return http.StatusOK
 	}
 	return w.statusCode
+}
+
+func (w *pipeResponseWriter) ResponseHeader() http.Header {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.headerSnap == nil {
+		return make(http.Header)
+	}
+	return w.headerSnap
 }
 
 type sseEmitter struct {
@@ -948,35 +1116,108 @@ func normalizeToolSchema(raw json.RawMessage) json.RawMessage {
 	return trimmed
 }
 
-// sanitizeGeminiSchema strips JSON Schema fields rejected by Google's Gemini functionDeclarations
-// validator (such as $schema, additionalProperties, title, and default).
+// sanitizeGeminiSchema resolves local JSON Schema $ref pointers (against $defs/definitions)
+// and strips JSON Schema keywords rejected by Google's Gemini functionDeclarations validator
+// without stripping user-defined parameter names inside "properties" maps.
 func sanitizeGeminiSchema(raw json.RawMessage) any {
 	var obj map[string]any
 	if err := json.Unmarshal(normalizeToolSchema(raw), &obj); err != nil {
 		return map[string]any{"type": "object", "properties": map[string]any{}}
 	}
-	return cleanGeminiSchemaNode(obj)
+	return cleanGeminiSchemaNode(obj, obj, false, make(map[string]bool))
 }
 
-func cleanGeminiSchemaNode(node any) any {
+func cleanGeminiSchemaNode(node any, root map[string]any, inPropertiesMap bool, visiting map[string]bool) any {
 	switch v := node.(type) {
 	case map[string]any:
+		if inPropertiesMap {
+			// Inside a "properties" object, keys are user-defined parameter names (such as
+			// "default" or "definitions") and MUST NOT be stripped; recurse into each
+			// parameter's child schema at schema-object level.
+			out := make(map[string]any, len(v))
+			for propName, propSchema := range v {
+				out[propName] = cleanGeminiSchemaNode(propSchema, root, false, visiting)
+			}
+			return out
+		}
+
+		// Inline local $ref nodes before stripping $defs / definitions.
+		if refRaw, hasRef := v["$ref"]; hasRef {
+			refStr, _ := refRaw.(string)
+			refStr = strings.TrimSpace(refStr)
+			var resolved map[string]any
+			if refStr != "" && !visiting[refStr] {
+				if target, ok := resolveGeminiSchemaRef(root, refStr); ok {
+					visiting[refStr] = true
+					cleaned := cleanGeminiSchemaNode(target, root, false, visiting)
+					delete(visiting, refStr)
+					if m, ok := cleaned.(map[string]any); ok {
+						resolved = m
+					}
+				}
+			}
+			if resolved == nil {
+				// Cyclic or unresolvable $ref: fall back cleanly so Gemini never sees a dangling $ref.
+				resolved = map[string]any{"type": "string"}
+			}
+			// Preserve allowed sibling schema fields (such as "description") alongside $ref.
+			for k, val := range v {
+				switch k {
+				case "$ref", "$schema", "additionalProperties", "$defs", "definitions", "default":
+					continue
+				case "properties":
+					resolved[k] = cleanGeminiSchemaNode(val, root, true, visiting)
+				default:
+					resolved[k] = cleanGeminiSchemaNode(val, root, false, visiting)
+				}
+			}
+			return resolved
+		}
+
 		out := make(map[string]any, len(v))
 		for k, val := range v {
 			switch k {
 			case "$schema", "additionalProperties", "$defs", "definitions", "default":
 				continue
+			case "properties":
+				out[k] = cleanGeminiSchemaNode(val, root, true, visiting)
+			default:
+				out[k] = cleanGeminiSchemaNode(val, root, false, visiting)
 			}
-			out[k] = cleanGeminiSchemaNode(val)
 		}
 		return out
 	case []any:
 		out := make([]any, len(v))
 		for i, item := range v {
-			out[i] = cleanGeminiSchemaNode(item)
+			out[i] = cleanGeminiSchemaNode(item, root, false, visiting)
 		}
 		return out
 	default:
 		return v
 	}
+}
+
+// resolveGeminiSchemaRef resolves a local JSON Pointer (such as "#/$defs/Repo" or
+// "#/definitions/Filter") within root, applying RFC 6901 unescaping.
+func resolveGeminiSchemaRef(root map[string]any, ref string) (map[string]any, bool) {
+	if !strings.HasPrefix(ref, "#/") {
+		return nil, false
+	}
+	segments := strings.Split(ref[2:], "/")
+	var cur any = root
+	for _, seg := range segments {
+		seg = strings.ReplaceAll(seg, "~1", "/")
+		seg = strings.ReplaceAll(seg, "~0", "~")
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		next, exists := m[seg]
+		if !exists {
+			return nil, false
+		}
+		cur = next
+	}
+	target, ok := cur.(map[string]any)
+	return target, ok
 }

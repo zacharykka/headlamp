@@ -845,3 +845,19 @@ func TestStreamingIDPrefixDeduplication(t *testing.T) {
 		t.Fatalf("msg_ prefix duplicated: %s", rec2.Body.String())
 	}
 }
+
+func TestReadSSEEventMultiLineDataAccumulationLimit(t *testing.T) {
+	// Each individual line is 1 MiB (< 16 MiB line limit), but 17 consecutive data: lines
+	// without a blank event separator exceed MaxSSELineBytes (16 MiB) in aggregate.
+	chunk := "data: " + strings.Repeat("a", 1024*1024) + "\n"
+	var sb strings.Builder
+	for range 17 {
+		sb.WriteString(chunk)
+	}
+	sb.WriteByte('\n')
+
+	_, err := ReadSSEEvent(bufio.NewReader(strings.NewReader(sb.String())))
+	if !errors.Is(err, ErrSSELineTooLong) {
+		t.Fatalf("expected ErrSSELineTooLong for >16 MiB multi-line SSE data accumulation, got %v", err)
+	}
+}

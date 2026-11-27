@@ -44,7 +44,7 @@ func (ep *EffectivePolicy) IsModelDenied(model string) (denied bool, reason stri
 	if ep == nil {
 		return false, ""
 	}
-	return matchDenyRule(model, "model", ep.DenyModels)
+	return matchDenyRule(model, "model", ep.DenyModels, matchPattern)
 }
 
 // AllowsModel evaluates model access with Explicit Deny Wins semantics.
@@ -52,7 +52,7 @@ func (ep *EffectivePolicy) AllowsModel(model string) (allowed bool, reason strin
 	if ep == nil {
 		return false, "no effective policy"
 	}
-	return evaluateResource(model, "model", ep.AllowModels, ep.DenyModels, ep.GrantsApplied)
+	return evaluateResource(model, "model", ep.AllowModels, ep.DenyModels, ep.GrantsApplied, matchPattern)
 }
 
 // IsMCPToolDenied reports whether tool matches any explicit DenyMCPTools rule.
@@ -60,7 +60,7 @@ func (ep *EffectivePolicy) IsMCPToolDenied(tool string) (denied bool, reason str
 	if ep == nil {
 		return false, ""
 	}
-	return matchDenyRule(tool, "mcp tool", ep.DenyMCPTools)
+	return matchDenyRule(tool, "mcp tool", ep.DenyMCPTools, matchMCPPattern)
 }
 
 // AllowsMCPTool evaluates MCP tool access with Explicit Deny Wins semantics.
@@ -68,35 +68,65 @@ func (ep *EffectivePolicy) AllowsMCPTool(tool string) (allowed bool, reason stri
 	if ep == nil {
 		return false, "no effective policy"
 	}
-	return evaluateResource(tool, "mcp tool", ep.AllowMCPTools, ep.DenyMCPTools, ep.GrantsApplied)
+	return evaluateResource(tool, "mcp tool", ep.AllowMCPTools, ep.DenyMCPTools, ep.GrantsApplied, matchMCPPattern)
 }
 
-func matchDenyRule(target, kind string, denies []string) (bool, string) {
+// AllowsMCPServer reports whether at least one MCP tool under serverName could be permitted
+// by the effective policy (respecting blanket DenyMCPTools rules and MCP server prefix matching).
+func (ep *EffectivePolicy) AllowsMCPServer(serverName string) (allowed bool, reason string) {
+	if ep == nil {
+		return false, "no effective policy"
+	}
+	srv := strings.TrimSpace(serverName)
+	if srv == "" {
+		return false, "mcp server name is empty"
+	}
+
+	// Explicit Deny Wins: if any deny rule blanket-denies every tool on serverName, deny server access.
+	for _, pat := range ep.DenyMCPTools {
+		if isBlanketDenyForServer(pat, srv) {
+			return false, fmt.Sprintf("mcp server %q explicitly denied by rule %q", srv, pat)
+		}
+	}
+
+	for _, pat := range ep.AllowMCPTools {
+		if patternMatchesMCPServer(pat, srv) && !isAllowPatternShadowedByDeny(pat, ep.DenyMCPTools) {
+			return true, fmt.Sprintf("mcp server %q allowed by rule %q", srv, pat)
+		}
+	}
+
+	if !ep.GrantsApplied {
+		return false, fmt.Sprintf("mcp server %q denied: no matching grants", srv)
+	}
+	return false, fmt.Sprintf("mcp server %q not permitted by any grant rule", srv)
+}
+
+func matchDenyRule(target, kind string, denies []string, matcher func(pattern, target string) bool) (bool, string) {
 	name := strings.TrimSpace(target)
 	if name == "" {
 		return false, ""
 	}
 	for _, pat := range denies {
-		if matchPattern(pat, name) {
+		if matcher(pat, name) {
 			return true, fmt.Sprintf("%s %q explicitly denied by rule %q", kind, name, pat)
 		}
 	}
 	return false, ""
 }
 
-func evaluateResource(target, kind string, allows, denies []string, grantsApplied bool) (bool, string) {
+func evaluateResource(target, kind string, allows, denies []string, grantsApplied bool, matcher func(pattern, target string) bool) (bool, string) {
 	name := strings.TrimSpace(target)
 	if name == "" {
 		return false, fmt.Sprintf("%s name is empty", kind)
 	}
 
 	// Explicit Deny Wins: evaluate all deny patterns before any allow pattern.
-	if denied, reason := matchDenyRule(name, kind, denies); denied {
+	if denied, reason := matchDenyRule(name, kind, denies, matcher); denied {
 		return false, reason
 	}
 
 	for _, pat := range allows {
-		if matchPattern(pat, name) {
+		if matcher(pat, name) {
 			return true, fmt.Sprintf("%s %q allowed by rule %q", kind, name, pat)
 		}
 	}
@@ -206,7 +236,17 @@ func (e *Evaluator) AuthorizeMCPTool(ctx context.Context, p *auth.Principal, too
 	return allowed, reason, nil
 }
 
-// matchPattern matches a model or MCP tool identifier against a doublestar glob pattern.
+// AuthorizeMCPServer checks whether p is allowed to access at least one tool on serverName.
+func (e *Evaluator) AuthorizeMCPServer(ctx context.Context, p *auth.Principal, serverName string) (allowed bool, reason string, err error) {
+	ep, err := e.Evaluate(ctx, p)
+	if err != nil {
+		return false, "", err
+	}
+	allowed, reason = ep.AllowsMCPServer(serverName)
+	return allowed, reason, nil
+}
+
+// matchPattern matches an LLM model identifier against a doublestar glob pattern.
 //
 // Rules:
 //   - "*" and "**" match any non-empty target (so grant wildcards like "*" match both
@@ -233,6 +273,105 @@ func matchPattern(pattern, target string) bool {
 			if ok, err := doublestar.Match(pat, bare); err == nil && ok {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// normalizeMCPPattern normalizes MCP tool glob patterns so that a trailing "/*"
+// matches arbitrary slash depths under that prefix (equivalent to "/**"), preventing
+// multi-segment tool names such as "github/repos/delete" from bypassing "github/*".
+func normalizeMCPPattern(pattern string) string {
+	pat := strings.TrimSpace(pattern)
+	if strings.HasSuffix(pat, "/*") {
+		return strings.TrimSuffix(pat, "/*") + "/**"
+	}
+	return pat
+}
+
+// matchMCPPattern matches an MCP tool identifier ("<server>/<tool>") against a glob pattern.
+//
+// Rules:
+//   - "*" and "**" match any non-empty target.
+//   - A trailing "/*" (e.g. "github/*") is treated identically to "/**" so tools with
+//     embedded slashes (e.g. "github/repos/delete") are matched consistently.
+//   - Bare patterns without "/" NEVER perform cross-server suffix matching against
+//     "<server>/<tool>" targets (e.g. "github" will NOT match "other/github").
+func matchMCPPattern(pattern, target string) bool {
+	pat := normalizeMCPPattern(pattern)
+	if pat == "" || target == "" {
+		return false
+	}
+	if pat == "*" || pat == "**" {
+		return true
+	}
+	ok, err := doublestar.Match(pat, target)
+	return err == nil && ok
+}
+
+// isBlanketDenyForServer reports whether pattern denies every possible tool on serverName.
+func isBlanketDenyForServer(pattern, serverName string) bool {
+	pat := normalizeMCPPattern(pattern)
+	if pat == "" || serverName == "" {
+		return false
+	}
+	if pat == "*" || pat == "**" {
+		return true
+	}
+	serverPat, toolPat, hasSlash := strings.Cut(pat, "/")
+	if !hasSlash {
+		return false
+	}
+	if toolPat != "*" && toolPat != "**" {
+		return false
+	}
+	if serverPat == "*" || serverPat == "**" {
+		return true
+	}
+	ok, err := doublestar.Match(serverPat, serverName)
+	return err == nil && ok
+}
+
+// patternMatchesMCPServer reports whether an AllowMCPTools pattern can match at least one
+// "<serverName>/<tool>" identifier.
+func patternMatchesMCPServer(pattern, serverName string) bool {
+	pat := normalizeMCPPattern(pattern)
+	if pat == "" || serverName == "" {
+		return false
+	}
+	if pat == "*" || pat == "**" {
+		return true
+	}
+	serverPat, toolPat, hasSlash := strings.Cut(pat, "/")
+	if !hasSlash || toolPat == "" {
+		return false
+	}
+	if serverPat == "*" || serverPat == "**" {
+		return true
+	}
+	ok, err := doublestar.Match(serverPat, serverName)
+	return err == nil && ok
+}
+
+// isAllowPatternShadowedByDeny reports whether an AllowMCPTools pattern is completely negated
+// by an explicit DenyMCPTools rule (either exact normalized pattern equality, or a literal
+// non-glob allow pattern matched by a deny rule).
+func isAllowPatternShadowedByDeny(allowPat string, denies []string) bool {
+	normAllow := normalizeMCPPattern(allowPat)
+	if normAllow == "" {
+		return true
+	}
+	hasGlobMeta := strings.ContainsAny(normAllow, "*?[{\\")
+	for _, deny := range denies {
+		normDeny := normalizeMCPPattern(deny)
+		if normDeny == "" {
+			continue
+		}
+		if normDeny == normAllow {
+			return true
+		}
+		if !hasGlobMeta && matchMCPPattern(deny, strings.TrimSpace(allowPat)) {
+			return true
 		}
 	}
 	return false

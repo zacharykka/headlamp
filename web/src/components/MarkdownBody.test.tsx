@@ -34,10 +34,41 @@ describe('MarkdownBody XSS-safe renderer', () => {
     expect(screen.getByText('tailscaled').tagName).toBe('CODE');
     expect(screen.getByText('Audited over Tailnet mesh')).toBeTruthy();
 
-    // Fenced code block uses CodeBlock with language header & Copy button
     expect(screen.getByText('bash')).toBeTruthy();
     expect(screen.getByText('curl -sS http://headlamp/v1/models')).toBeTruthy();
     expect(screen.getByRole('button', { name: /Copy/i })).toBeTruthy();
+  });
+
+  it('supports special language tags (c#, c++), info attributes, and 4-backtick fences wrapping 3-backtick blocks (P2-7)', () => {
+    const md = [
+      '```c#',
+      'Console.WriteLine("hello");',
+      '```',
+      '',
+      '```ts title="src/gateway.ts"',
+      'export const ready = true;',
+      '```',
+      '',
+      '````markdown',
+      'Nested example:',
+      '```go',
+      'fmt.Println("inside")',
+      '```',
+      'Still inside outer block',
+      '````',
+      '',
+      'Outside paragraph.',
+    ].join('\n');
+
+    render(<MarkdownBody content={md} />);
+
+    expect(screen.getByText('c#')).toBeTruthy();
+    expect(screen.getByText('Console.WriteLine("hello");')).toBeTruthy();
+    expect(screen.getByText('ts')).toBeTruthy();
+    expect(screen.getByText('export const ready = true;')).toBeTruthy();
+    expect(screen.getByText('markdown')).toBeTruthy();
+    expect(screen.getByText(/Still inside outer block/)).toBeTruthy();
+    expect(screen.getByText('Outside paragraph.').tagName).toBe('P');
   });
 
   it('allows http/https links and neutralizes javascript/data URLs', () => {
@@ -71,7 +102,6 @@ describe('MarkdownBody XSS-safe renderer', () => {
     expect(container.querySelector('iframe')).toBeNull();
     expect(container.querySelector('svg')).toBeNull();
 
-    // Raw HTML tags appear strictly as harmless literal text
     expect(container.textContent).toContain('<script>window.__xss = 1</script>');
     expect(container.textContent).toContain('<img src="x" onerror="alert(1)" />');
   });

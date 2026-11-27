@@ -205,6 +205,7 @@ func runServe(args []string, _, stderr io.Writer) error {
 		Pricing:    pricing,
 		Gateway:    gw,
 		MCP:        &chatMCPAdapter{gw: mcpGw},
+		Guardrails: &chatGuardrailAdapter{engine: grEngine},
 		Logf:       logger.Printf,
 	})
 	if err != nil {
@@ -809,6 +810,39 @@ func (a *mcpGuardrailAdapter) Inspect(ctx context.Context, req mcp.GuardrailRequ
 		Reason:       dec.Reason,
 		StatusCode:   dec.StatusCode,
 	}, nil
+}
+
+// chatGuardrailAdapter bridges *guardrail.Engine to chat.GuardrailInspector.
+type chatGuardrailAdapter struct {
+	engine *guardrail.Engine
+}
+
+func (a *chatGuardrailAdapter) InspectText(ctx context.Context, text string) (action, redacted, reason string, err error) {
+	res, err := a.engine.TestText(ctx, text)
+	if err != nil || res == nil {
+		return "", text, "", err
+	}
+	if res.Action == guardrail.ActionBlock {
+		var blocked []string
+		for _, m := range res.Matches {
+			if m.Action != guardrail.ActionBlock {
+				continue
+			}
+			label := strings.TrimSpace(m.RuleName)
+			if label == "" {
+				label = strings.TrimSpace(m.RuleID)
+			}
+			if label != "" {
+				blocked = append(blocked, label)
+			}
+		}
+		if len(blocked) > 0 {
+			reason = "blocked by guardrail rule: " + strings.Join(blocked, ", ")
+		} else {
+			reason = "blocked by guardrail policy"
+		}
+	}
+	return res.Action, res.RedactedText, reason, nil
 }
 
 // chatMCPAdapter bridges *mcp.Gateway to chat.MCPBridge.

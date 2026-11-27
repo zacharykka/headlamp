@@ -69,6 +69,13 @@ func ReadSSEEvent(r *bufio.Reader) (SSEEvent, error) {
 				eventName = value
 				hasEvent = true
 			case "data":
+				extra := len(value)
+				if hasData {
+					extra++ // newline separator between multi-line data: fields
+				}
+				if dataBuf.Len()+extra > MaxSSELineBytes {
+					return SSEEvent{}, fmt.Errorf("%w (%d bytes)", ErrSSELineTooLong, MaxSSELineBytes)
+				}
 				if hasData {
 					dataBuf.WriteByte('\n')
 				}

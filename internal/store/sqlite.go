@@ -470,29 +470,36 @@ ON CONFLICT(id) DO UPDATE SET
 	for _, m := range cfg.MCPServers {
 		mcpServerNames = append(mcpServerNames, m.Name)
 
+		transport := m.Transport
+		if transport == "" {
+			transport = config.MCPTransportStreamableHTTP
+		}
+		authType := strings.ToLower(strings.TrimSpace(m.AuthType))
+		if authType == "" {
+			authType = config.MCPAuthNone
+		}
+
 		tokenEnc := ""
-		if m.AuthToken != "" {
+		switch {
+		case authType == config.MCPAuthNone:
+			tokenEnc = ""
+		case m.AuthToken != "":
 			tokenEnc, err = s.cipher.EncryptString(m.AuthToken)
 			if err != nil {
 				return fmt.Errorf("store: encrypt auth token for mcp server %q: %w", m.Name, err)
 			}
-		} else {
+		default:
 			var existingEnc string
-			err := tx.QueryRowContext(ctx, `SELECT auth_token_enc FROM mcp_servers WHERE name = ?`, m.Name).Scan(&existingEnc)
+			err := tx.QueryRowContext(
+				ctx,
+				`SELECT auth_token_enc FROM mcp_servers WHERE name = ? AND source = ?`,
+				m.Name, SourceConfig,
+			).Scan(&existingEnc)
 			if err == nil {
 				tokenEnc = existingEnc
 			} else if !errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("store: lookup existing mcp server %q: %w", m.Name, err)
 			}
-		}
-
-		transport := m.Transport
-		if transport == "" {
-			transport = config.MCPTransportStreamableHTTP
-		}
-		authType := m.AuthType
-		if authType == "" {
-			authType = config.MCPAuthNone
 		}
 
 		_, err = tx.ExecContext(ctx, `
@@ -1472,7 +1479,7 @@ func (s *SQLiteStore) UpsertMCPServer(ctx context.Context, srv MCPServer) error 
 	}
 
 	tokenEnc := ""
-	if srv.AuthToken != "" {
+	if authType != config.MCPAuthNone && srv.AuthToken != "" {
 		var err error
 		tokenEnc, err = s.cipher.EncryptString(srv.AuthToken)
 		if err != nil {
@@ -1617,7 +1624,7 @@ func (s *SQLiteStore) QueryMCPAuditLogs(ctx context.Context, filter MCPAuditFilt
 SELECT id, created_at, request_id, subject, display_name, node_name, node_ip,
        tags_json, auth_source, server_name, method, tool_name, status,
        latency_ms, error_message, arguments_preview
-FROM mcp_audit_logs` + where + ` ORDER BY created_at DESC`
+FROM mcp_audit_logs` + where + ` ORDER BY created_at DESC, id DESC`
 
 	if filter.Limit > 0 {
 		query += ` LIMIT ?`
@@ -1770,7 +1777,7 @@ func (s *SQLiteStore) ListChatSessions(ctx context.Context, subject string, limi
 	}
 	query := `
 SELECT id, subject, title, model, mcp_servers_json, system_prompt, created_at, updated_at
-FROM chat_sessions WHERE subject = ? ORDER BY updated_at DESC, created_at DESC`
+FROM chat_sessions WHERE subject = ? ORDER BY updated_at DESC, created_at DESC, id DESC`
 	args := []any{subject}
 	if limit > 0 {
 		query += ` LIMIT ?`
@@ -1924,6 +1931,25 @@ FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC`, ses
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+func (s *SQLiteStore) DeleteChatMessage(ctx context.Context, subject, sessionID, messageID string) error {
+	subject = strings.TrimSpace(subject)
+	sessionID = strings.TrimSpace(sessionID)
+	messageID = strings.TrimSpace(messageID)
+	if subject == "" || sessionID == "" || messageID == "" {
+		return ErrNotFound
+	}
+	res, err := s.db.ExecContext(ctx, `
+DELETE FROM chat_messages
+WHERE id = ? AND session_id = ?
+  AND EXISTS (SELECT 1 FROM chat_sessions WHERE id = ? AND subject = ?)`,
+		messageID, sessionID, sessionID, subject,
+	)
+	if err != nil {
+		return fmt.Errorf("store: delete chat message %q: %w", messageID, err)
+	}
+	return checkAffected(res)
 }
 
 func scanChatSession(sc scanner) (ChatSession, error) {
@@ -2122,7 +2148,7 @@ SELECT id, created_at, request_id, subject, display_name, node_name, node_ip,
        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
        reasoning_tokens, total_tokens, cost_usd, latency_ms, ttft_ms,
        status_code, error_message, guardrail_action, guardrail_hits_json
-FROM usage_logs` + where + ` ORDER BY created_at DESC`
+FROM usage_logs` + where + ` ORDER BY created_at DESC, id DESC`
 
 	if filter.Limit > 0 {
 		query += ` LIMIT ?`
@@ -2188,8 +2214,14 @@ SELECT COUNT(*),
        COALESCE(SUM(CASE WHEN status_code >= 400 OR status_code = 0 OR error_message != '' THEN 1 ELSE 0 END), 0)
 FROM usage_logs` + where
 
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return UsageExtendedSummary{}, fmt.Errorf("store: begin summarize usage extended tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	var ext UsageExtendedSummary
-	if err := s.db.QueryRowContext(ctx, query, args...).Scan(
+	if err := tx.QueryRowContext(ctx, query, args...).Scan(
 		&ext.RequestCount, &ext.InputTokens, &ext.OutputTokens,
 		&ext.CacheReadTokens, &ext.CacheWriteTokens, &ext.ReasoningTokens,
 		&ext.TotalTokens, &ext.CostUSD, &ext.ErrorCount,
@@ -2209,9 +2241,13 @@ FROM usage_logs` + where
 		p95Args = append(p95Args, args...)
 		p95Args = append(p95Args, offset)
 		p95Query := `SELECT latency_ms FROM usage_logs` + where + ` ORDER BY latency_ms ASC LIMIT 1 OFFSET ?`
-		if err := s.db.QueryRowContext(ctx, p95Query, p95Args...).Scan(&ext.P95LatencyMS); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if err := tx.QueryRowContext(ctx, p95Query, p95Args...).Scan(&ext.P95LatencyMS); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return UsageExtendedSummary{}, fmt.Errorf("store: compute p95 latency: %w", err)
 		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return UsageExtendedSummary{}, fmt.Errorf("store: commit summarize usage extended tx: %w", err)
 	}
 
 	return ext, nil
@@ -2538,14 +2574,19 @@ func checkAffected(res sql.Result) error {
 	return nil
 }
 
+const sqliteTimeLayout = "2006-01-02T15:04:05.000000000Z"
+
 func formatTime(t time.Time) string {
-	return t.UTC().Format(time.RFC3339Nano)
+	return t.UTC().Format(sqliteTimeLayout)
 }
 
 func parseTime(s string) time.Time {
 	t, err := time.Parse(time.RFC3339Nano, s)
 	if err != nil {
-		return time.Time{}
+		t, err = time.Parse(time.RFC3339, s)
+		if err != nil {
+			return time.Time{}
+		}
 	}
 	return t.UTC()
 }

@@ -1300,6 +1300,7 @@ audit:
 		Pricing:    pricing,
 		Gateway:    gw,
 		MCP:        &chatMCPAdapter{gw: mcpGw},
+		Guardrails: &chatGuardrailAdapter{engine: grEngine},
 	})
 	if err != nil {
 		t.Fatalf("chat.NewService: %v", err)
@@ -1409,6 +1410,40 @@ audit:
 	}
 	mcpMu.Unlock()
 
+	// (c2) P0-1 regression: case-folding key-smuggling payload on /mcp/docs MUST fail closed (-32600/-32602) without reaching upstream.
+	recSmuggle := doReq("100.64.0.10:51001", http.MethodPost, "/mcp/docs",
+		`{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"delete","Name":"search","arguments":{}}}`, nil)
+	if recSmuggle.Code != http.StatusOK && recSmuggle.Code != http.StatusBadRequest {
+		t.Fatalf("P0-1 smuggling status = %d: %s", recSmuggle.Code, recSmuggle.Body.String())
+	}
+	if !strings.Contains(recSmuggle.Body.String(), "-32600") && !strings.Contains(recSmuggle.Body.String(), "-32602") {
+		t.Fatalf("P0-1 smuggling expected JSON-RPC -32600/-32602 error, got %d: %s", recSmuggle.Code, recSmuggle.Body.String())
+	}
+	mcpMu.Lock()
+	if slices.Contains(gotMCPCalls, "delete") {
+		mcpMu.Unlock()
+		t.Fatalf("P0-1 smuggled 'delete' reached upstream: %v", gotMCPCalls)
+	}
+	mcpMu.Unlock()
+
+	// (c3) P0-2 regression: cross-site browser CSRF and non-JSON Content-Type on POST /mcp/docs MUST be rejected (403 / 415).
+	recCSRF := doReq("100.64.0.10:51001", http.MethodPost, "/mcp/docs",
+		`{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"search","arguments":{"query":"csrf"}}}`,
+		map[string]string{
+			"Origin":         "https://evil.example",
+			"Sec-Fetch-Site": "cross-site",
+			"Content-Type":   "text/plain",
+		})
+	if recCSRF.Code != http.StatusForbidden && recCSRF.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("P0-2 cross-site CSRF on /mcp/docs = %d, want 403 or 415: %s", recCSRF.Code, recCSRF.Body.String())
+	}
+	recPlain := doReq("100.64.0.10:51001", http.MethodPost, "/mcp/docs",
+		`{"jsonrpc":"2.0","id":11,"method":"tools/list","params":{}}`,
+		map[string]string{"Content-Type": "text/plain"})
+	if recPlain.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("P0-2 text/plain on POST /mcp/docs = %d, want 415: %s", recPlain.Code, recPlain.Body.String())
+	}
+
 	// (d) Admin MCP Gateway REST API: YAML source=config 409 lock, /test discovery, and /logs.
 	if r := doReq("100.64.0.1:51002", http.MethodPut, "/api/v1/admin/mcp/servers/docs", `{"enabled":false}`, sameOrigin); r.Code != http.StatusConflict {
 		t.Fatalf("PUT yaml mcp server = %d, want 409: %s", r.Code, r.Body.String())
@@ -1443,7 +1478,44 @@ audit:
 		t.Fatalf("Admin GET Alice chat session = %d, want 404", r.Code)
 	}
 
-	// Stream live SSE turn through proxy.Gateway + MCP tool loop.
+	// (e2) P1-3 regression: sending a PEM private key triggers pre-persist guardrail block,
+	// emits SSE error (guardrail_blocked), persists ZERO user message into chat_messages,
+	// and does NOT poison the session for subsequent normal turns!
+	const chatPEMSecret = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA9876543210secretpemmaterial\n-----END RSA PRIVATE KEY-----"
+	pemPayload, _ := json.Marshal(map[string]string{
+		"content": "Please analyze this key:\n" + chatPEMSecret,
+	})
+	recBlocked := doReq("100.64.0.10:51001", http.MethodPost, "/api/v1/chat/sessions/"+sess.ID+"/messages",
+		string(pemPayload), sameOrigin)
+	if recBlocked.Code != http.StatusOK || !strings.Contains(recBlocked.Header().Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("P1-3 blocked chat SSE = %d ct=%q body=%s", recBlocked.Code, recBlocked.Header().Get("Content-Type"), recBlocked.Body.String())
+	}
+	blockedSSE := recBlocked.Body.String()
+	if !strings.Contains(blockedSSE, "event: error") || !strings.Contains(blockedSSE, `"guardrail_blocked"`) {
+		t.Fatalf("P1-3 blocked chat SSE missing guardrail_blocked error event:\n%s", blockedSSE)
+	}
+	if strings.Contains(blockedSSE, "MIIEpAIBAAKCAQEA9876543210") {
+		t.Fatalf("P1-3 blocked chat SSE leaked raw secret:\n%s", blockedSSE)
+	}
+	recAfterBlock := doReq("100.64.0.10:51001", http.MethodGet, "/api/v1/chat/sessions/"+sess.ID, "", nil)
+	if recAfterBlock.Code != http.StatusOK {
+		t.Fatalf("GET chat session after guardrail block = %d: %s", recAfterBlock.Code, recAfterBlock.Body.String())
+	}
+	var afterBlockDetail struct {
+		Session  store.ChatSession   `json:"session"`
+		Messages []store.ChatMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(recAfterBlock.Body.Bytes(), &afterBlockDetail); err != nil {
+		t.Fatalf("decode after-block session detail: %v", err)
+	}
+	if len(afterBlockDetail.Messages) != 0 {
+		t.Fatalf("P1-3 expected 0 persisted chat_messages after guardrail block, got %d: %+v", len(afterBlockDetail.Messages), afterBlockDetail.Messages)
+	}
+	if afterBlockDetail.Session.Title != "New Chat" {
+		t.Fatalf("P1-3 expected blocked message not to overwrite session title, got %q", afterBlockDetail.Session.Title)
+	}
+
+	// Stream live SSE turn in the exact same session through proxy.Gateway + MCP tool loop.
 	recStream := doReq("100.64.0.10:51001", http.MethodPost, "/api/v1/chat/sessions/"+sess.ID+"/messages",
 		`{"content":"How do Headscale grants work?"}`, sameOrigin)
 	if recStream.Code != http.StatusOK || !strings.Contains(recStream.Header().Get("Content-Type"), "text/event-stream") {

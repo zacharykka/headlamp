@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { SSEParser, consumeSSEStream, type SSEEventFrame } from './sse';
 
 describe('SSEParser and consumeSSEStream', () => {
@@ -39,7 +39,6 @@ describe('SSEParser and consumeSSEStream', () => {
       'event: delta\ndata: {"text":"Tailnet 🚀 网关"}\n\nevent: message_done\ndata: {"done":true}\n\n';
     const bytes = new TextEncoder().encode(payload);
 
-    // Split right inside multi-byte UTF-8 characters
     const slices: Uint8Array[] = [];
     for (let i = 0; i < bytes.length; i += 5) {
       slices.push(bytes.slice(i, i + 5));
@@ -61,5 +60,29 @@ describe('SSEParser and consumeSSEStream', () => {
       { event: 'delta', data: '{"text":"Tailnet 🚀 网关"}' },
       { event: 'message_done', data: '{"done":true}' },
     ]);
+  });
+
+  it('calls reader.cancel() and releases lock when consumer throws early (P3-4)', async () => {
+    const cancelSpy = vi.fn().mockResolvedValue(undefined);
+    const enc = new TextEncoder();
+
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(enc.encode('event: delta\ndata: {"text":"chunk-1"}\n\n'));
+        controller.enqueue(enc.encode('event: delta\ndata: {"text":"chunk-2"}\n\n'));
+      },
+      cancel(reason) {
+        return cancelSpy(reason);
+      },
+    });
+
+    await expect(
+      consumeSSEStream(stream, () => {
+        throw new Error('consumer aborted');
+      }),
+    ).rejects.toThrow('consumer aborted');
+
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
+    expect(stream.locked).toBe(false);
   });
 });

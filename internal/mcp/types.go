@@ -19,6 +19,7 @@ const (
 	// JSON-RPC 2.0 error codes returned by Headlamp's MCP gateway.
 	CodeParseError     = -32700
 	CodeInvalidRequest = -32600
+	CodeInvalidParams  = -32602
 	CodeInternalError  = -32603
 	CodeUnauthorized   = -32001
 	CodeToolDenied     = -32003
@@ -32,10 +33,11 @@ const (
 	defaultMaxRequestBodyBytes  = 16 << 20 // 16 MiB
 	defaultMaxResponseBodyBytes = 16 << 20 // 16 MiB
 	defaultClientTimeout        = 30 * time.Second
-	maxAuditArgsPreviewBytes = 2048
-	blockedArgsPlaceholder   = "[BLOCKED BY GUARDRAIL]"
-	deniedArgsPlaceholder    = "[DENIED BY POLICY]"
-	authErrorArgsPlaceholder = "[REDACTED]"
+	defaultSessionTTL           = 30 * time.Minute
+	maxAuditArgsPreviewBytes    = 2048
+	blockedArgsPlaceholder      = "[BLOCKED BY GUARDRAIL]"
+	deniedArgsPlaceholder       = "[DENIED BY POLICY]"
+	authErrorArgsPlaceholder    = "[REDACTED]"
 )
 
 var (
@@ -49,9 +51,11 @@ var (
 	ErrToolBlocked = errors.New("mcp: tool blocked by guardrail")
 )
 
-// Authorizer checks whether a principal is permitted to view or invoke a namespaced
-// MCP tool ("<server_name>/<tool_name>"). Satisfied directly by *policy.Evaluator.
+// Authorizer checks whether a principal is permitted to access an MCP server
+// or view/invoke a namespaced MCP tool ("<server_name>/<tool_name>").
+// Satisfied directly by *policy.Evaluator.
 type Authorizer interface {
+	AuthorizeMCPServer(ctx context.Context, p *auth.Principal, serverName string) (allowed bool, reason string, err error)
 	AuthorizeMCPTool(ctx context.Context, p *auth.Principal, tool string) (allowed bool, reason string, err error)
 }
 
@@ -88,6 +92,7 @@ type GatewayConfig struct {
 	MaxRequestBodyBytes  int64
 	MaxResponseBodyBytes int64
 	ClientTimeout        time.Duration
+	SessionTTL           time.Duration
 	Logf                 func(format string, args ...any)
 }
 

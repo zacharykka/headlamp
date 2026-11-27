@@ -100,18 +100,21 @@ function parseBlocks(src: string): BlockNode[] {
       continue;
     }
 
-    // Fenced code block ```lang
-    const fenceMatch = /^```([\w.+-]*)\s*$/.exec(line.trim());
-    if (fenceMatch) {
-      const lang = fenceMatch[1] || '';
+    // Fenced code block: 3+ backticks with arbitrary info string (e.g. ```c#, ```c++, ```ts title="x", ````md)
+    const fenceMatch = /^\s*(`{3,})(.*)$/.exec(line);
+    if (fenceMatch && !fenceMatch[2].includes('`')) {
+      const fenceTicks = fenceMatch[1];
+      const infoString = fenceMatch[2].trim();
+      const lang = infoString.split(/\s+/)[0] || '';
+      const closeFenceRe = new RegExp(`^\\s*\`{${fenceTicks.length},}\\s*$`);
       const codeLines: string[] = [];
       i += 1;
-      while (i < lines.length && !/^```\s*$/.test(lines[i].trim())) {
+      while (i < lines.length && !closeFenceRe.test(lines[i])) {
         codeLines.push(lines[i]);
         i += 1;
       }
       if (i < lines.length) {
-        i += 1; // skip closing ```
+        i += 1; // skip closing fence
       }
       blocks.push({ kind: 'code', lang, code: codeLines.join('\n') });
       continue;
@@ -175,7 +178,7 @@ function parseBlocks(src: string): BlockNode[] {
     while (
       i < lines.length &&
       lines[i].trim() !== '' &&
-      !/^```/.test(lines[i].trim()) &&
+      !/^\s*`{3,}(?!.*`)/.test(lines[i]) &&
       !/^(#{1,4})\s+/.test(lines[i]) &&
       !/^>\s?/.test(lines[i]) &&
       !/^\s*[-*]\s+/.test(lines[i]) &&

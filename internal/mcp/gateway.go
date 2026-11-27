@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"net/url"
 	"slices"
@@ -19,6 +20,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/zacharykka/headlamp/internal/auth"
+	"github.com/zacharykka/headlamp/internal/config"
 	"github.com/zacharykka/headlamp/internal/store"
 	"github.com/zacharykka/headlamp/internal/translate"
 )
@@ -30,6 +32,7 @@ type Gateway struct {
 	authorizer           Authorizer
 	guardrails           GuardrailInspector
 	httpClient           *http.Client
+	sessions             *sessionStore
 	maxRequestBodyBytes  int64
 	maxResponseBodyBytes int64
 	clientTimeout        time.Duration
@@ -68,6 +71,7 @@ func NewGateway(cfg GatewayConfig) (*Gateway, error) {
 		authorizer:           cfg.Authorizer,
 		guardrails:           cfg.Guardrails,
 		httpClient:           client,
+		sessions:             newSessionStore(cfg.SessionTTL),
 		maxRequestBodyBytes:  maxReq,
 		maxResponseBodyBytes: maxResp,
 		clientTimeout:        clientTimeout,
@@ -77,6 +81,14 @@ func NewGateway(cfg GatewayConfig) (*Gateway, error) {
 
 // ServeHTTP handles incoming MCP requests mounted under /mcp/{server_name} and /mcp/{server_name}/{subpath...}.
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// P0-2: Block cross-origin browser CSRF on mutating MCP requests.
+	if isMutatingMethod(r.Method) {
+		if err := checkSameOriginCSRF(r); err != nil {
+			writeJSONRPCStatus(w, http.StatusForbidden, nil, CodeToolDenied, err.Error())
+			return
+		}
+	}
+
 	principal, ok := auth.FromContext(r.Context())
 	if !ok || principal == nil {
 		writeJSONRPCStatus(w, http.StatusUnauthorized, nil, CodeUnauthorized, "unauthenticated request")
@@ -104,13 +116,30 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// P1-1: Server-level access gate BEFORE forwarding any method/transport traffic.
+	if g.authorizer != nil {
+		allowed, reason, authErr := g.authorizer.AuthorizeMCPServer(r.Context(), principal, srv.Name)
+		if authErr != nil {
+			g.logf("headlamp mcp: authorize server %q failed: %v", srv.Name, authErr)
+			writeJSONRPCStatus(w, http.StatusInternalServerError, nil, CodeInternalError, "authorization check failed")
+			return
+		}
+		if !allowed {
+			if reason == "" {
+				reason = fmt.Sprintf("access to MCP server %q denied by policy", srv.Name)
+			}
+			writeJSONRPCStatus(w, http.StatusForbidden, nil, CodeToolDenied, reason)
+			return
+		}
+	}
+
 	switch r.Method {
 	case http.MethodPost:
 		g.handleJSONRPC(w, r, principal, *srv, subpath)
 	case http.MethodGet:
 		g.handleSSEGet(w, r, principal, *srv, subpath)
 	case http.MethodDelete:
-		g.handleSessionDelete(w, r, *srv, subpath)
+		g.handleSessionDelete(w, r, principal, *srv, subpath)
 	default:
 		w.Header().Set("Allow", "GET, POST, DELETE")
 		writeJSONRPCStatus(w, http.StatusMethodNotAllowed, nil, CodeInvalidRequest, "method not allowed")
@@ -139,6 +168,17 @@ func parseMCPPath(reqPath string) (serverName, subpath string, ok bool) {
 	return name, "", true
 }
 
+func parseSSECallbackClientID(subpath string) (string, bool) {
+	if !strings.HasPrefix(subpath, sseCallbackPathPrefix) {
+		return "", false
+	}
+	id := strings.TrimPrefix(subpath, sseCallbackPathPrefix)
+	if id == "" || strings.Contains(id, "/") {
+		return "", false
+	}
+	return id, true
+}
+
 type trackedToolCall struct {
 	requestID   string
 	toolName    string
@@ -147,7 +187,80 @@ type trackedToolCall struct {
 	recorded    bool
 }
 
+func (g *Gateway) resolvePostUpstreamTarget(r *http.Request, p *auth.Principal, srv store.MCPServer, subpath string) (targetURL, incomingClientSID, upstreamSID string, allowLastEventID bool, statusCode int, errMsg string) {
+	isSSE := strings.EqualFold(strings.TrimSpace(srv.Transport), config.MCPTransportSSE)
+
+	// P1-1: Subpath lockdown — streamable_http forbids all subpaths; sse permits ONLY issued /_sse/<clientID>.
+	if subpath != "" {
+		if !isSSE {
+			return "", "", "", false, http.StatusNotFound, "subpaths are not allowed on streamable_http MCP servers"
+		}
+		cbClientID, ok := parseSSECallbackClientID(subpath)
+		if !ok {
+			return "", "", "", false, http.StatusNotFound, "invalid MCP SSE callback path"
+		}
+		sess, err := g.sessions.lookup(cbClientID, p.Subject, srv.Name)
+		if err != nil {
+			if errors.Is(err, errSessionForbidden) {
+				return "", "", "", false, http.StatusForbidden, "MCP SSE session does not belong to caller"
+			}
+			return "", "", "", false, http.StatusNotFound, "unknown or expired MCP SSE session"
+		}
+		if sess.sseCallbackPath == "" {
+			return "", "", "", false, http.StatusNotFound, "session does not have an SSE callback endpoint"
+		}
+		u, err := buildUpstreamCallbackURL(srv, sess.sseCallbackPath)
+		if err != nil {
+			return "", "", "", false, http.StatusBadGateway, err.Error()
+		}
+		return u, cbClientID, sess.upstreamID, true, 0, ""
+	}
+
+	// Root /mcp/{server_name} POST: validate optional Mcp-Session-Id ownership.
+	clientSID := strings.TrimSpace(r.Header.Get("Mcp-Session-Id"))
+	if clientSID != "" {
+		sess, err := g.sessions.lookup(clientSID, p.Subject, srv.Name)
+		if err != nil {
+			if errors.Is(err, errSessionForbidden) {
+				return "", "", "", false, http.StatusForbidden, "MCP session does not belong to caller"
+			}
+			return "", "", "", false, http.StatusNotFound, "unknown or expired MCP session"
+		}
+		u, err := buildUpstreamBaseURL(srv, r.URL.RawQuery)
+		if err != nil {
+			return "", "", "", false, http.StatusBadGateway, err.Error()
+		}
+		return u, clientSID, sess.upstreamID, true, 0, ""
+	}
+
+	u, err := buildUpstreamBaseURL(srv, r.URL.RawQuery)
+	if err != nil {
+		return "", "", "", false, http.StatusBadGateway, err.Error()
+	}
+	return u, "", "", false, 0, ""
+}
+
 func (g *Gateway) handleJSONRPC(w http.ResponseWriter, r *http.Request, p *auth.Principal, srv store.MCPServer, subpath string) {
+	// P0-2: Require Content-Type: application/json on POST /mcp/* to block simple-request browser CSRF.
+	ctHeader := strings.TrimSpace(r.Header.Get("Content-Type"))
+	mediaType, _, ctErr := mime.ParseMediaType(ctHeader)
+	if ctErr != nil || !strings.EqualFold(mediaType, "application/json") {
+		writeJSONRPCStatus(w, http.StatusUnsupportedMediaType, nil, CodeInvalidRequest, "Content-Type must be application/json")
+		return
+	}
+
+	targetURL, incomingClientSID, upstreamSID, allowLastEventID, targetStatus, targetErr := g.resolvePostUpstreamTarget(r, p, srv, subpath)
+	if targetStatus != 0 {
+		code := CodeInvalidRequest
+		if targetStatus == http.StatusForbidden {
+			code = CodeToolDenied
+		} else if targetStatus >= 500 {
+			code = CodeInternalError
+		}
+		writeJSONRPCStatus(w, targetStatus, nil, code, targetErr)
+		return
+	}
+
 	body, err := g.readLimitedBody(r)
 	if err != nil {
 		if errors.Is(err, errBodyTooLarge) {
@@ -187,121 +300,179 @@ func (g *Gateway) handleJSONRPC(w http.ResponseWriter, r *http.Request, p *auth.
 	}
 
 	var (
-		forwardItems    = make([]json.RawMessage, 0, len(rawItems))
-		localErrors     = make([]json.RawMessage, 0)
-		toolsListIDs    = make(map[string]struct{})
-		trackedCalls    = make(map[string]*trackedToolCall)
-		unkeyedCalls    = make([]*trackedToolCall, 0)
-		anyBodyModified = false
+		forwardItems = make([]json.RawMessage, 0, len(rawItems))
+		localErrors  = make([]json.RawMessage, 0)
+		toolsListIDs = make(map[string]struct{})
+		trackedCalls = make(map[string][]*trackedToolCall)
+		unkeyedCalls = make([]*trackedToolCall, 0)
 	)
 
 	for _, rawItem := range rawItems {
-		var msg jsonRPCMessage
-		if err := json.Unmarshal(rawItem, &msg); err != nil {
-			localErrors = append(localErrors, makeJSONRPCErrorBytes(nil, CodeParseError, "invalid JSON-RPC message"))
-			anyBodyModified = true
+		// P0-1: Strict JSON-RPC envelope parsing rejecting duplicate & case-folded colliding keys.
+		env, envErr := parseStrictRPCRequest(rawItem)
+		if envErr != nil {
+			localErrors = append(localErrors, makeJSONRPCErrorBytes(nil, CodeInvalidRequest, envErr.Error()))
 			continue
 		}
 
-		switch msg.Method {
-		case "tools/list":
-			if cid := canonicalRPCID(msg.ID); cid != "" {
+		if env.IsResponse {
+			canonical, err := env.marshalCanonical(nil)
+			if err != nil {
+				localErrors = append(localErrors, makeJSONRPCErrorBytes(env.ID, CodeInvalidRequest, "failed to canonicalize JSON-RPC response"))
+				continue
+			}
+			forwardItems = append(forwardItems, canonical)
+			continue
+		}
+
+		switch {
+		case env.Method == "tools/list":
+			canonical, err := env.marshalCanonical(nil)
+			if err != nil {
+				if env.hasID() {
+					localErrors = append(localErrors, makeJSONRPCErrorBytes(env.ID, CodeInternalError, "failed to encode tools/list request"))
+				}
+				continue
+			}
+			if cid := canonicalRPCID(env.ID); cid != "" {
 				toolsListIDs[cid] = struct{}{}
 			}
-			forwardItems = append(forwardItems, rawItem)
+			forwardItems = append(forwardItems, canonical)
 
-		case "tools/call":
+		case env.Method == "tools/call":
 			callStart := time.Now()
 			reqID := uuid.NewString()
-			toolName, rawArgs, parseErr := extractToolCallParams(msg.Params)
-			if parseErr != nil || toolName == "" {
-				// Let upstream validate malformed params or return invalid params.
-				forwardItems = append(forwardItems, rawItem)
+
+			// P0-1: Fail-Closed strict params parsing (rejects case collisions, duplicates, empty/non-string name, non-object arguments).
+			tcParams, paramErr := parseStrictToolCallParams(env.Params)
+			if paramErr != nil {
+				if env.hasID() {
+					localErrors = append(localErrors, makeJSONRPCErrorBytes(env.ID, CodeInvalidParams, paramErr.Error()))
+				}
 				continue
 			}
 
 			// 1. Policy authorization BEFORE contacting upstream.
 			if g.authorizer != nil {
-				allowed, reason, authErr := g.authorizer.AuthorizeMCPTool(r.Context(), p, srv.Name+"/"+toolName)
+				allowed, reason, authErr := g.authorizer.AuthorizeMCPTool(r.Context(), p, srv.Name+"/"+tcParams.Name)
 				if authErr != nil {
-					g.logf("headlamp mcp: authorize %s/%s failed: %v", srv.Name, toolName, authErr)
-					g.recordAudit(p, srv.Name, "tools/call", toolName, reqID, AuditStatusError, time.Since(callStart).Milliseconds(), "authorization check failed", authErrorArgsPlaceholder)
-					if msg.hasID() {
-						localErrors = append(localErrors, makeJSONRPCErrorBytes(msg.ID, CodeInternalError, "authorization check failed"))
+					g.logf("headlamp mcp: authorize %s/%s failed: %v", srv.Name, tcParams.Name, authErr)
+					g.recordAudit(p, srv.Name, "tools/call", tcParams.Name, reqID, AuditStatusError, time.Since(callStart).Milliseconds(), "authorization check failed", authErrorArgsPlaceholder)
+					if env.hasID() {
+						localErrors = append(localErrors, makeJSONRPCErrorBytes(env.ID, CodeInternalError, "authorization check failed"))
 					}
-					anyBodyModified = true
 					continue
 				}
 				if !allowed {
 					if reason == "" {
-						reason = fmt.Sprintf("access to tool %q denied", srv.Name+"/"+toolName)
+						reason = fmt.Sprintf("access to tool %q denied", srv.Name+"/"+tcParams.Name)
 					}
-					g.recordAudit(p, srv.Name, "tools/call", toolName, reqID, AuditStatusDenied, time.Since(callStart).Milliseconds(), reason, deniedArgsPlaceholder)
-					if msg.hasID() {
-						localErrors = append(localErrors, makeJSONRPCErrorBytes(msg.ID, CodeToolDenied, "tool not permitted by policy: "+reason))
+					g.recordAudit(p, srv.Name, "tools/call", tcParams.Name, reqID, AuditStatusDenied, time.Since(callStart).Milliseconds(), reason, deniedArgsPlaceholder)
+					if env.hasID() {
+						localErrors = append(localErrors, makeJSONRPCErrorBytes(env.ID, CodeToolDenied, "tool not permitted by policy: "+reason))
 					}
-					anyBodyModified = true
 					continue
 				}
 			}
 
-			// 2. Guardrail inspection on params.arguments BEFORE contacting upstream.
-			effectiveArgs := rawArgs
-			updatedItem := rawItem
-			if g.guardrails != nil && len(bytes.TrimSpace(rawArgs)) > 0 {
-				action, modifiedArgs, blockReason, gErr := g.inspectToolArguments(r.Context(), reqID, p, srv.Name, toolName, rawArgs)
+			// 2. Guardrail inspection on normalized params.arguments (P2-3: runs even when arguments was omitted!).
+			effectiveArgs := tcParams.Arguments
+			if g.guardrails != nil {
+				action, modifiedArgs, blockReason, gErr := g.inspectToolArguments(r.Context(), reqID, p, srv.Name, tcParams.Name, effectiveArgs)
 				if gErr != nil {
-					g.logf("headlamp mcp: guardrail inspect %s/%s failed: %v", srv.Name, toolName, gErr)
-					g.recordAudit(p, srv.Name, "tools/call", toolName, reqID, AuditStatusError, time.Since(callStart).Milliseconds(), "guardrail inspection failed", blockedArgsPlaceholder)
-					if msg.hasID() {
-						localErrors = append(localErrors, makeJSONRPCErrorBytes(msg.ID, CodeInternalError, "guardrail inspection failed"))
+					g.logf("headlamp mcp: guardrail inspect %s/%s failed: %v", srv.Name, tcParams.Name, gErr)
+					g.recordAudit(p, srv.Name, "tools/call", tcParams.Name, reqID, AuditStatusError, time.Since(callStart).Milliseconds(), "guardrail inspection failed", blockedArgsPlaceholder)
+					if env.hasID() {
+						localErrors = append(localErrors, makeJSONRPCErrorBytes(env.ID, CodeInternalError, "guardrail inspection failed"))
 					}
-					anyBodyModified = true
 					continue
 				}
 				if action == "block" {
 					if blockReason == "" {
 						blockReason = "tool call blocked by guardrail policy"
 					}
-					g.recordAudit(p, srv.Name, "tools/call", toolName, reqID, AuditStatusBlocked, time.Since(callStart).Milliseconds(), blockReason, blockedArgsPlaceholder)
-					if msg.hasID() {
-						localErrors = append(localErrors, makeJSONRPCErrorBytes(msg.ID, CodeToolDenied, blockReason))
+					g.recordAudit(p, srv.Name, "tools/call", tcParams.Name, reqID, AuditStatusBlocked, time.Since(callStart).Milliseconds(), blockReason, blockedArgsPlaceholder)
+					if env.hasID() {
+						localErrors = append(localErrors, makeJSONRPCErrorBytes(env.ID, CodeToolDenied, blockReason))
 					}
-					anyBodyModified = true
 					continue
 				}
 				if (action == "redact" || action == "modify") && len(modifiedArgs) > 0 {
-					rewritten, rwErr := replaceToolCallArguments(rawItem, modifiedArgs)
-					if rwErr != nil {
-						g.logf("headlamp mcp: rewrite redacted arguments for %s/%s failed: %v", srv.Name, toolName, rwErr)
-						g.recordAudit(p, srv.Name, "tools/call", toolName, reqID, AuditStatusError, time.Since(callStart).Milliseconds(), "failed to apply guardrail redaction", blockedArgsPlaceholder)
-						if msg.hasID() {
-							localErrors = append(localErrors, makeJSONRPCErrorBytes(msg.ID, CodeInternalError, "failed to apply guardrail redaction"))
-						}
-						anyBodyModified = true
-						continue
-					}
-					updatedItem = rewritten
 					effectiveArgs = modifiedArgs
-					anyBodyModified = true
 				}
+			}
+
+			// P0-1: Always re-serialize validated tools/call canonically from checked lowercase fields.
+			canonicalParams, err := tcParams.marshalCanonical(effectiveArgs)
+			if err != nil {
+				g.recordAudit(p, srv.Name, "tools/call", tcParams.Name, reqID, AuditStatusError, time.Since(callStart).Milliseconds(), "failed to encode tool params", blockedArgsPlaceholder)
+				if env.hasID() {
+					localErrors = append(localErrors, makeJSONRPCErrorBytes(env.ID, CodeInternalError, "failed to encode tool params"))
+				}
+				continue
+			}
+			canonicalReq, err := env.marshalCanonical(canonicalParams)
+			if err != nil {
+				g.recordAudit(p, srv.Name, "tools/call", tcParams.Name, reqID, AuditStatusError, time.Since(callStart).Milliseconds(), "failed to encode tool request", blockedArgsPlaceholder)
+				if env.hasID() {
+					localErrors = append(localErrors, makeJSONRPCErrorBytes(env.ID, CodeInternalError, "failed to encode tool request"))
+				}
+				continue
 			}
 
 			tc := &trackedToolCall{
 				requestID:   reqID,
-				toolName:    toolName,
+				toolName:    tcParams.Name,
 				argsPreview: truncatePreview(effectiveArgs),
 				startTime:   callStart,
 			}
-			if cid := canonicalRPCID(msg.ID); cid != "" {
-				trackedCalls[cid] = tc
+			if cid := canonicalRPCID(env.ID); cid != "" {
+				trackedCalls[cid] = append(trackedCalls[cid], tc)
 			} else {
 				unkeyedCalls = append(unkeyedCalls, tc)
 			}
-			forwardItems = append(forwardItems, updatedItem)
+			forwardItems = append(forwardItems, canonicalReq)
+
+		case strings.HasPrefix(env.Method, "resources/") || strings.HasPrefix(env.Method, "prompts/"):
+			// P1-1: Require server-wide tool grant (<server>/*) for resources/* and prompts/* data methods.
+			if g.authorizer != nil {
+				allowed, reason, authErr := g.authorizer.AuthorizeMCPTool(r.Context(), p, srv.Name+"/*")
+				if authErr != nil {
+					g.logf("headlamp mcp: authorize %s %s failed: %v", srv.Name, env.Method, authErr)
+					if env.hasID() {
+						localErrors = append(localErrors, makeJSONRPCErrorBytes(env.ID, CodeInternalError, "authorization check failed"))
+					}
+					continue
+				}
+				if !allowed {
+					if reason == "" {
+						reason = fmt.Sprintf("method %q requires %s/* grant", env.Method, srv.Name)
+					}
+					g.recordAudit(p, srv.Name, env.Method, "", uuid.NewString(), AuditStatusDenied, 0, reason, deniedArgsPlaceholder)
+					if env.hasID() {
+						localErrors = append(localErrors, makeJSONRPCErrorBytes(env.ID, CodeToolDenied, "method not permitted by policy: "+reason))
+					}
+					continue
+				}
+			}
+			canonical, err := env.marshalCanonical(nil)
+			if err != nil {
+				if env.hasID() {
+					localErrors = append(localErrors, makeJSONRPCErrorBytes(env.ID, CodeInternalError, "failed to encode request"))
+				}
+				continue
+			}
+			forwardItems = append(forwardItems, canonical)
 
 		default:
-			forwardItems = append(forwardItems, rawItem)
+			canonical, err := env.marshalCanonical(nil)
+			if err != nil {
+				if env.hasID() {
+					localErrors = append(localErrors, makeJSONRPCErrorBytes(env.ID, CodeInternalError, "failed to encode request"))
+				}
+				continue
+			}
+			forwardItems = append(forwardItems, canonical)
 		}
 	}
 
@@ -321,21 +492,12 @@ func (g *Gateway) handleJSONRPC(w http.ResponseWriter, r *http.Request, p *auth.
 		return
 	}
 
-	// Reconstruct forwarded body only when items were filtered or redacted.
+	// P0-1: Always forward canonically re-serialized JSON bytes, never raw unvalidated client bytes.
 	var upBody []byte
-	if !anyBodyModified {
-		upBody = body
-	} else if isBatch {
+	if isBatch {
 		upBody = marshalRawArray(forwardItems)
 	} else {
 		upBody = forwardItems[0]
-	}
-
-	targetURL, err := buildUpstreamURL(srv, subpath, r.URL.RawQuery)
-	if err != nil {
-		g.finalizePendingCalls(p, srv.Name, trackedCalls, unkeyedCalls, AuditStatusError, err.Error())
-		writeJSONRPCStatus(w, http.StatusBadGateway, nil, CodeInternalError, err.Error())
-		return
 	}
 
 	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(upBody))
@@ -345,11 +507,17 @@ func (g *Gateway) handleJSONRPC(w http.ResponseWriter, r *http.Request, p *auth.
 		return
 	}
 	copyMCPRequestHeaders(upReq.Header, r.Header)
-	if upReq.Header.Get("Content-Type") == "" {
-		upReq.Header.Set("Content-Type", "application/json")
-	}
+	upReq.Header.Set("Content-Type", "application/json")
 	if upReq.Header.Get("Accept") == "" {
 		upReq.Header.Set("Accept", "application/json, text/event-stream")
+	}
+	if upstreamSID != "" {
+		upReq.Header.Set("Mcp-Session-Id", upstreamSID)
+	}
+	if allowLastEventID {
+		if lastEv := strings.TrimSpace(r.Header.Get("Last-Event-ID")); lastEv != "" {
+			upReq.Header.Set("Last-Event-ID", lastEv)
+		}
 	}
 	applyUpstreamAuth(upReq, srv)
 
@@ -362,18 +530,28 @@ func (g *Gateway) handleJSONRPC(w http.ResponseWriter, r *http.Request, p *auth.
 	}
 	defer resp.Body.Close()
 
+	// Translate upstream Mcp-Session-Id into a per-user opaque Headlamp session ID.
+	setClientSessionHeader := func(dst http.Header) {
+		if upRespSID := strings.TrimSpace(resp.Header.Get("Mcp-Session-Id")); upRespSID != "" {
+			clientSID := g.sessions.bindUpstreamID(incomingClientSID, p.Subject, srv.Name, upRespSID)
+			dst.Set("Mcp-Session-Id", clientSID)
+		}
+	}
+
 	// Accepted / No Content (e.g. MCP notifications or legacy SSE async callback POSTs).
 	if resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusNoContent {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, g.maxResponseBodyBytes))
 		g.finalizePendingCalls(p, srv.Name, trackedCalls, unkeyedCalls, AuditStatusOK, "")
 		if len(localErrors) > 0 && isBatch {
 			copyResponseHeaders(w.Header(), resp.Header)
+			setClientSessionHeader(w.Header())
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(marshalRawArray(localErrors))
 			return
 		}
 		copyResponseHeaders(w.Header(), resp.Header)
+		setClientSessionHeader(w.Header())
 		w.WriteHeader(resp.StatusCode)
 		if len(respBody) > 0 {
 			_, _ = w.Write(respBody)
@@ -386,6 +564,7 @@ func (g *Gateway) handleJSONRPC(w http.ResponseWriter, r *http.Request, p *auth.
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, g.maxResponseBodyBytes))
 		g.finalizePendingCalls(p, srv.Name, trackedCalls, unkeyedCalls, AuditStatusError, fmt.Sprintf("upstream returned HTTP %d", resp.StatusCode))
 		copyResponseHeaders(w.Header(), resp.Header)
+		setClientSessionHeader(w.Header())
 		if w.Header().Get("Content-Type") == "" {
 			w.Header().Set("Content-Type", "application/json")
 		}
@@ -396,22 +575,33 @@ func (g *Gateway) handleJSONRPC(w http.ResponseWriter, r *http.Request, p *auth.
 
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 	if strings.Contains(contentType, "text/event-stream") {
-		g.relayStreamableHTTPSSE(w, r.Context(), resp, p, srv, toolsListIDs, trackedCalls, unkeyedCalls, localErrors)
+		g.relayStreamableHTTPSSE(w, r.Context(), resp, p, srv, incomingClientSID, toolsListIDs, trackedCalls, unkeyedCalls, localErrors)
 		return
 	}
 
-	// Standard application/json response.
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, g.maxResponseBodyBytes))
+	// P1-2: Read with maxResponseBodyBytes+1 so oversized bodies fail closed (502) instead of silently truncating.
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, g.maxResponseBodyBytes+1))
 	if err != nil {
 		g.finalizePendingCalls(p, srv.Name, trackedCalls, unkeyedCalls, AuditStatusError, err.Error())
 		writeJSONRPCStatus(w, http.StatusBadGateway, nil, CodeInternalError, "failed to read upstream MCP response")
 		return
 	}
+	if int64(len(respBody)) > g.maxResponseBodyBytes {
+		g.finalizePendingCalls(p, srv.Name, trackedCalls, unkeyedCalls, AuditStatusError, "upstream MCP response exceeds gateway limit")
+		writeJSONRPCStatus(w, http.StatusBadGateway, nil, CodeInternalError, "upstream MCP response exceeds gateway limit")
+		return
+	}
 
-	outBody := g.processJSONRPCResponseBytes(r.Context(), respBody, p, srv.Name, toolsListIDs, trackedCalls, localErrors, isBatch)
+	outBody, filterErr := g.processJSONRPCResponseBytes(r.Context(), respBody, p, srv.Name, toolsListIDs, trackedCalls, localErrors, isBatch)
+	if filterErr != nil {
+		g.finalizePendingCalls(p, srv.Name, trackedCalls, unkeyedCalls, AuditStatusError, filterErr.Error())
+		writeJSONRPCStatus(w, http.StatusBadGateway, nil, CodeInternalError, "failed to filter upstream MCP response")
+		return
+	}
 	g.finalizePendingCalls(p, srv.Name, trackedCalls, unkeyedCalls, AuditStatusOK, "")
 
 	copyResponseHeaders(w.Header(), resp.Header)
+	setClientSessionHeader(w.Header())
 	if w.Header().Get("Content-Type") == "" {
 		w.Header().Set("Content-Type", "application/json")
 	}
@@ -425,13 +615,18 @@ func (g *Gateway) relayStreamableHTTPSSE(
 	resp *http.Response,
 	p *auth.Principal,
 	srv store.MCPServer,
+	incomingClientSID string,
 	toolsListIDs map[string]struct{},
-	trackedCalls map[string]*trackedToolCall,
+	trackedCalls map[string][]*trackedToolCall,
 	unkeyedCalls []*trackedToolCall,
 	localErrors []json.RawMessage,
 ) {
 	flusher, _ := w.(http.Flusher)
 	copyResponseHeaders(w.Header(), resp.Header)
+	if upRespSID := strings.TrimSpace(resp.Header.Get("Mcp-Session-Id")); upRespSID != "" {
+		clientSID := g.sessions.bindUpstreamID(incomingClientSID, p.Subject, srv.Name, upRespSID)
+		w.Header().Set("Mcp-Session-Id", clientSID)
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -459,7 +654,12 @@ func (g *Gateway) relayStreamableHTTPSSE(
 			break
 		}
 		if len(bytes.TrimSpace(frame.Data)) > 0 {
-			frame.Data = g.processJSONRPCResponseBytes(ctx, frame.Data, p, srv.Name, toolsListIDs, trackedCalls, nil, false)
+			filtered, fErr := g.processJSONRPCResponseBytes(ctx, frame.Data, p, srv.Name, toolsListIDs, trackedCalls, nil, false)
+			if fErr != nil {
+				streamErr = fErr
+				break
+			}
+			frame.Data = filtered
 		}
 		if writeErr := writeSSEFrame(w, frame); writeErr != nil {
 			streamErr = writeErr
@@ -478,7 +678,33 @@ func (g *Gateway) relayStreamableHTTPSSE(
 }
 
 func (g *Gateway) handleSSEGet(w http.ResponseWriter, r *http.Request, p *auth.Principal, srv store.MCPServer, subpath string) {
-	targetURL, err := buildUpstreamURL(srv, subpath, r.URL.RawQuery)
+	// P1-1: GET never accepts arbitrary subpaths (neither streamable_http nor sse).
+	if subpath != "" {
+		writeJSONRPCStatus(w, http.StatusNotFound, nil, CodeInvalidRequest, "subpaths are not allowed on MCP GET endpoints")
+		return
+	}
+
+	var (
+		incomingClientSID string
+		upstreamSID       string
+		allowLastEventID  bool
+	)
+	if clientSID := strings.TrimSpace(r.Header.Get("Mcp-Session-Id")); clientSID != "" {
+		sess, err := g.sessions.lookup(clientSID, p.Subject, srv.Name)
+		if err != nil {
+			if errors.Is(err, errSessionForbidden) {
+				writeJSONRPCStatus(w, http.StatusForbidden, nil, CodeToolDenied, "MCP session does not belong to caller")
+				return
+			}
+			writeJSONRPCStatus(w, http.StatusNotFound, nil, CodeInvalidRequest, "unknown or expired MCP session")
+			return
+		}
+		incomingClientSID = clientSID
+		upstreamSID = sess.upstreamID
+		allowLastEventID = true
+	}
+
+	targetURL, err := buildUpstreamBaseURL(srv, r.URL.RawQuery)
 	if err != nil {
 		writeJSONRPCStatus(w, http.StatusBadGateway, nil, CodeInternalError, err.Error())
 		return
@@ -492,6 +718,14 @@ func (g *Gateway) handleSSEGet(w http.ResponseWriter, r *http.Request, p *auth.P
 	copyMCPRequestHeaders(upReq.Header, r.Header)
 	if upReq.Header.Get("Accept") == "" {
 		upReq.Header.Set("Accept", "text/event-stream")
+	}
+	if upstreamSID != "" {
+		upReq.Header.Set("Mcp-Session-Id", upstreamSID)
+	}
+	if allowLastEventID {
+		if lastEv := strings.TrimSpace(r.Header.Get("Last-Event-ID")); lastEv != "" {
+			upReq.Header.Set("Last-Event-ID", lastEv)
+		}
 	}
 	applyUpstreamAuth(upReq, srv)
 
@@ -512,6 +746,10 @@ func (g *Gateway) handleSSEGet(w http.ResponseWriter, r *http.Request, p *auth.P
 
 	flusher, _ := w.(http.Flusher)
 	copyResponseHeaders(w.Header(), resp.Header)
+	if upRespSID := strings.TrimSpace(resp.Header.Get("Mcp-Session-Id")); upRespSID != "" {
+		clientSID := g.sessions.bindUpstreamID(incomingClientSID, p.Subject, srv.Name, upRespSID)
+		w.Header().Set("Mcp-Session-Id", clientSID)
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -528,15 +766,23 @@ func (g *Gateway) handleSSEGet(w http.ResponseWriter, r *http.Request, p *auth.P
 			return
 		}
 		if frame.Event == "endpoint" {
-			rewritten, rwErr := rewriteSSEEndpoint(srv, string(frame.Data))
-			if rwErr != nil {
-				g.logf("headlamp mcp: rejected unsafe SSE endpoint from %q: %v", srv.Name, rwErr)
+			resolved, resErr := resolveSameOriginEndpoint(srv, string(frame.Data))
+			if resErr != nil {
+				g.logf("headlamp mcp: rejected unsafe SSE endpoint from %q: %v", srv.Name, resErr)
 				return
 			}
+			cbPath := formatRecordedCallbackPath(resolved)
+			clientID := g.sessions.createSSECallback(p.Subject, srv.Name, cbPath)
+			rewritten := "/mcp/" + url.PathEscape(srv.Name) + sseCallbackPathPrefix + clientID
 			frame.Data = []byte(rewritten)
 		} else if len(bytes.TrimSpace(frame.Data)) > 0 {
 			// Also filter tools/list responses delivered asynchronously over legacy SSE streams.
-			frame.Data = g.processJSONRPCResponseBytes(r.Context(), frame.Data, p, srv.Name, nil, nil, nil, false)
+			filtered, fErr := g.processJSONRPCResponseBytes(r.Context(), frame.Data, p, srv.Name, nil, nil, nil, false)
+			if fErr != nil {
+				g.logf("headlamp mcp: aborting SSE stream on filter error for %q: %v", srv.Name, fErr)
+				return
+			}
+			frame.Data = filtered
 		}
 		if err := writeSSEFrame(w, frame); err != nil {
 			return
@@ -547,8 +793,47 @@ func (g *Gateway) handleSSEGet(w http.ResponseWriter, r *http.Request, p *auth.P
 	}
 }
 
-func (g *Gateway) handleSessionDelete(w http.ResponseWriter, r *http.Request, srv store.MCPServer, subpath string) {
-	targetURL, err := buildUpstreamURL(srv, subpath, r.URL.RawQuery)
+func (g *Gateway) handleSessionDelete(w http.ResponseWriter, r *http.Request, p *auth.Principal, srv store.MCPServer, subpath string) {
+	isSSE := strings.EqualFold(strings.TrimSpace(srv.Transport), config.MCPTransportSSE)
+
+	if subpath != "" {
+		if !isSSE {
+			writeJSONRPCStatus(w, http.StatusNotFound, nil, CodeInvalidRequest, "subpaths are not allowed on streamable_http MCP servers")
+			return
+		}
+		cbClientID, ok := parseSSECallbackClientID(subpath)
+		if !ok {
+			writeJSONRPCStatus(w, http.StatusNotFound, nil, CodeInvalidRequest, "invalid MCP SSE session path")
+			return
+		}
+		if _, err := g.sessions.delete(cbClientID, p.Subject, srv.Name); err != nil {
+			if errors.Is(err, errSessionForbidden) {
+				writeJSONRPCStatus(w, http.StatusForbidden, nil, CodeToolDenied, "MCP SSE session does not belong to caller")
+				return
+			}
+			writeJSONRPCStatus(w, http.StatusNotFound, nil, CodeInvalidRequest, "unknown or expired MCP SSE session")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	clientSID := strings.TrimSpace(r.Header.Get("Mcp-Session-Id"))
+	if clientSID == "" {
+		writeJSONRPCStatus(w, http.StatusBadRequest, nil, CodeInvalidRequest, "Mcp-Session-Id header is required")
+		return
+	}
+	sess, err := g.sessions.delete(clientSID, p.Subject, srv.Name)
+	if err != nil {
+		if errors.Is(err, errSessionForbidden) {
+			writeJSONRPCStatus(w, http.StatusForbidden, nil, CodeToolDenied, "MCP session does not belong to caller")
+			return
+		}
+		writeJSONRPCStatus(w, http.StatusNotFound, nil, CodeInvalidRequest, "unknown or expired MCP session")
+		return
+	}
+
+	targetURL, err := buildUpstreamBaseURL(srv, r.URL.RawQuery)
 	if err != nil {
 		writeJSONRPCStatus(w, http.StatusBadGateway, nil, CodeInternalError, err.Error())
 		return
@@ -560,6 +845,9 @@ func (g *Gateway) handleSessionDelete(w http.ResponseWriter, r *http.Request, sr
 		return
 	}
 	copyMCPRequestHeaders(upReq.Header, r.Header)
+	if sess.upstreamID != "" {
+		upReq.Header.Set("Mcp-Session-Id", sess.upstreamID)
+	}
 	applyUpstreamAuth(upReq, srv)
 
 	resp, err := g.httpClient.Do(upReq)
@@ -583,26 +871,36 @@ func (g *Gateway) processJSONRPCResponseBytes(
 	p *auth.Principal,
 	serverName string,
 	toolsListIDs map[string]struct{},
-	trackedCalls map[string]*trackedToolCall,
+	trackedCalls map[string][]*trackedToolCall,
 	localErrors []json.RawMessage,
 	isBatchRequest bool,
-) []byte {
+) ([]byte, error) {
+	mustFilterTools := g.authorizer != nil && len(toolsListIDs) > 0
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
-		if len(localErrors) > 0 && isBatchRequest {
-			return marshalRawArray(localErrors)
+		if mustFilterTools {
+			return nil, errors.New("empty upstream response for tools/list")
 		}
-		return raw
+		if len(localErrors) > 0 && isBatchRequest {
+			return marshalRawArray(localErrors), nil
+		}
+		return raw, nil
 	}
 
 	if trimmed[0] == '[' {
 		var items []json.RawMessage
 		if err := json.Unmarshal(trimmed, &items); err != nil {
-			return raw
+			if mustFilterTools {
+				return nil, fmt.Errorf("malformed batch JSON response for tools/list: %w", err)
+			}
+			return raw, nil
 		}
 		modified := false
 		for i, item := range items {
-			updated, changed := g.processSingleRPCResponse(ctx, item, p, serverName, toolsListIDs, trackedCalls)
+			updated, changed, err := g.processSingleRPCResponse(ctx, item, p, serverName, toolsListIDs, trackedCalls)
+			if err != nil {
+				return nil, err
+			}
 			if changed {
 				items[i] = updated
 				modified = true
@@ -613,24 +911,30 @@ func (g *Gateway) processJSONRPCResponseBytes(
 			modified = true
 		}
 		if !modified {
-			return raw
+			return raw, nil
 		}
-		return marshalRawArray(items)
+		return marshalRawArray(items), nil
 	}
 
 	if trimmed[0] == '{' {
-		updated, changed := g.processSingleRPCResponse(ctx, trimmed, p, serverName, toolsListIDs, trackedCalls)
+		updated, changed, err := g.processSingleRPCResponse(ctx, trimmed, p, serverName, toolsListIDs, trackedCalls)
+		if err != nil {
+			return nil, err
+		}
 		if len(localErrors) > 0 && isBatchRequest {
 			merged := append([]json.RawMessage{updated}, localErrors...)
-			return marshalRawArray(merged)
+			return marshalRawArray(merged), nil
 		}
 		if !changed {
-			return raw
+			return raw, nil
 		}
-		return updated
+		return updated, nil
 	}
 
-	return raw
+	if mustFilterTools {
+		return nil, errors.New("non-JSON upstream response for tools/list")
+	}
+	return raw, nil
 }
 
 func (g *Gateway) processSingleRPCResponse(
@@ -639,63 +943,84 @@ func (g *Gateway) processSingleRPCResponse(
 	p *auth.Principal,
 	serverName string,
 	toolsListIDs map[string]struct{},
-	trackedCalls map[string]*trackedToolCall,
-) (json.RawMessage, bool) {
+	trackedCalls map[string][]*trackedToolCall,
+) (json.RawMessage, bool, error) {
 	var msg jsonRPCMessage
 	if err := json.Unmarshal(rawItem, &msg); err != nil {
-		return rawItem, false
+		if g.authorizer != nil && len(toolsListIDs) > 0 {
+			return nil, false, fmt.Errorf("invalid JSON-RPC response for tools/list: %w", err)
+		}
+		return rawItem, false, nil
 	}
 
 	cid := canonicalRPCID(msg.ID)
 
-	// Record audit outcome for tracked tools/call responses.
+	// P2-3: Pop FIFO tracked tools/call per id so duplicate IDs in a batch never clobber audit logs.
 	if trackedCalls != nil && cid != "" {
-		if tc, ok := trackedCalls[cid]; ok && !tc.recorded {
-			tc.recorded = true
-			status, errMsg := classifyToolCallResponse(msg)
-			g.recordAudit(p, serverName, "tools/call", tc.toolName, tc.requestID, status, time.Since(tc.startTime).Milliseconds(), errMsg, tc.argsPreview)
+		if queue := trackedCalls[cid]; len(queue) > 0 {
+			tc := queue[0]
+			trackedCalls[cid] = queue[1:]
+			if !tc.recorded {
+				tc.recorded = true
+				status, errMsg := classifyToolCallResponse(msg)
+				g.recordAudit(p, serverName, "tools/call", tc.toolName, tc.requestID, status, time.Since(tc.startTime).Milliseconds(), errMsg, tc.argsPreview)
+			}
 		}
 	}
 
-	// Filter tools/list responses so unauthorized tools are completely invisible.
+	// Filter tools/list responses so unauthorized tools are completely invisible (Fail-Closed).
 	if g.authorizer == nil || len(bytes.TrimSpace(msg.Result)) == 0 {
-		return rawItem, false
+		return rawItem, false, nil
 	}
-	shouldFilter := false
-	if _, matchedID := toolsListIDs[cid]; matchedID {
-		shouldFilter = true
-	} else if resultHasToolsArray(msg.Result) {
-		shouldFilter = true
-	}
-	if !shouldFilter {
-		return rawItem, false
+	_, matchedToolsListID := toolsListIDs[cid]
+	hasToolsArr := resultHasToolsArray(msg.Result)
+	if !matchedToolsListID && !hasToolsArr {
+		return rawItem, false, nil
 	}
 
-	filteredItem, changed := g.filterToolsListResponse(ctx, rawItem, p, serverName)
-	return filteredItem, changed
+	filteredItem, changed, err := g.filterToolsListResponse(ctx, rawItem, p, serverName, matchedToolsListID)
+	if err != nil {
+		return nil, false, err
+	}
+	return filteredItem, changed, nil
 }
 
-func (g *Gateway) filterToolsListResponse(ctx context.Context, rawItem json.RawMessage, p *auth.Principal, serverName string) (json.RawMessage, bool) {
+func (g *Gateway) filterToolsListResponse(
+	ctx context.Context,
+	rawItem json.RawMessage,
+	p *auth.Principal,
+	serverName string,
+	strict bool,
+) (json.RawMessage, bool, error) {
 	var env map[string]json.RawMessage
 	if err := json.Unmarshal(rawItem, &env); err != nil {
-		return rawItem, false
+		if strict {
+			return nil, false, fmt.Errorf("failed to parse tools/list envelope: %w", err)
+		}
+		return rawItem, false, nil
 	}
 	rawResult, ok := env["result"]
 	if !ok {
-		return rawItem, false
+		return rawItem, false, nil
 	}
 	var resultObj map[string]json.RawMessage
 	if err := json.Unmarshal(rawResult, &resultObj); err != nil {
-		return rawItem, false
+		if strict {
+			return nil, false, fmt.Errorf("failed to parse tools/list result object: %w", err)
+		}
+		return rawItem, false, nil
 	}
 	rawTools, hasTools := resultObj["tools"]
 	if !hasTools {
-		return rawItem, false
+		return rawItem, false, nil
 	}
 
 	var toolEntries []json.RawMessage
 	if err := json.Unmarshal(rawTools, &toolEntries); err != nil {
-		return rawItem, false
+		if strict {
+			return nil, false, fmt.Errorf("failed to parse tools/list tools array: %w", err)
+		}
+		return rawItem, false, nil
 	}
 
 	allowed := make([]json.RawMessage, 0, len(toolEntries))
@@ -716,20 +1041,20 @@ func (g *Gateway) filterToolsListResponse(ctx context.Context, rawItem json.RawM
 		allowed = append(allowed, entry)
 	}
 	if !removed {
-		return rawItem, false
+		return rawItem, false, nil
 	}
 
 	resultObj["tools"] = marshalRawArray(allowed)
 	encodedResult, err := json.Marshal(resultObj)
 	if err != nil {
-		return rawItem, false
+		return nil, false, err
 	}
 	env["result"] = encodedResult
 	encodedEnv, err := json.Marshal(env)
 	if err != nil {
-		return rawItem, false
+		return nil, false, err
 	}
-	return encodedEnv, true
+	return encodedEnv, true, nil
 }
 
 func resultHasToolsArray(rawResult json.RawMessage) bool {
@@ -787,8 +1112,8 @@ func (g *Gateway) inspectToolArguments(
 	rawArgs json.RawMessage,
 ) (action string, modifiedArgs json.RawMessage, reason string, err error) {
 	trimmed := bytes.TrimSpace(rawArgs)
-	if len(trimmed) == 0 {
-		return "allow", rawArgs, "", nil
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		trimmed = json.RawMessage(`{}`)
 	}
 	wrapped, err := json.Marshal(struct {
 		Arguments json.RawMessage `json:"arguments"`
@@ -805,7 +1130,7 @@ func (g *Gateway) inspectToolArguments(
 		Body:      wrapped,
 	})
 	if err != nil || dec == nil {
-		return "allow", rawArgs, "", err
+		return "allow", trimmed, "", err
 	}
 
 	if dec.Action == "block" {
@@ -822,58 +1147,24 @@ func (g *Gateway) inspectToolArguments(
 			return dec.Action, bytes.Clone(dec.ModifiedBody), "", nil
 		}
 	}
-	return dec.Action, rawArgs, dec.Reason, nil
-}
-
-func extractToolCallParams(rawParams json.RawMessage) (toolName string, args json.RawMessage, err error) {
-	var p struct {
-		Name      string          `json:"name"`
-		Arguments json.RawMessage `json:"arguments"`
-	}
-	if err := json.Unmarshal(rawParams, &p); err != nil {
-		return "", nil, err
-	}
-	return strings.TrimSpace(p.Name), p.Arguments, nil
-}
-
-func replaceToolCallArguments(rawMsg json.RawMessage, newArgs json.RawMessage) (json.RawMessage, error) {
-	var msgMap map[string]json.RawMessage
-	if err := json.Unmarshal(rawMsg, &msgMap); err != nil {
-		return nil, err
-	}
-	var paramsMap map[string]json.RawMessage
-	if err := json.Unmarshal(msgMap["params"], &paramsMap); err != nil {
-		return nil, err
-	}
-	if paramsMap == nil {
-		paramsMap = make(map[string]json.RawMessage)
-	}
-	paramsMap["arguments"] = newArgs
-	encodedParams, err := json.Marshal(paramsMap)
-	if err != nil {
-		return nil, err
-	}
-	msgMap["params"] = encodedParams
-	encodedMsg, err := json.Marshal(msgMap)
-	if err != nil {
-		return nil, err
-	}
-	return encodedMsg, nil
+	return dec.Action, trimmed, dec.Reason, nil
 }
 
 func (g *Gateway) finalizePendingCalls(
 	p *auth.Principal,
 	serverName string,
-	tracked map[string]*trackedToolCall,
+	tracked map[string][]*trackedToolCall,
 	unkeyed []*trackedToolCall,
 	status, errMsg string,
 ) {
-	for _, tc := range tracked {
-		if tc.recorded {
-			continue
+	for _, queue := range tracked {
+		for _, tc := range queue {
+			if tc.recorded {
+				continue
+			}
+			tc.recorded = true
+			g.recordAudit(p, serverName, "tools/call", tc.toolName, tc.requestID, status, time.Since(tc.startTime).Milliseconds(), errMsg, tc.argsPreview)
 		}
-		tc.recorded = true
-		g.recordAudit(p, serverName, "tools/call", tc.toolName, tc.requestID, status, time.Since(tc.startTime).Milliseconds(), errMsg, tc.argsPreview)
 	}
 	for _, tc := range unkeyed {
 		if tc.recorded {
@@ -1046,6 +1337,14 @@ func readSSEFrame(r *bufio.Reader) (sseFrame, error) {
 				frame.Retry = value
 				hasAny = true
 			case "data":
+				// P1-2: Bound total multi-line data accumulation to MaxSSELineBytes to prevent OOM.
+				extra := len(value)
+				if hasData {
+					extra++
+				}
+				if dataBuf.Len()+extra > translate.MaxSSELineBytes {
+					return sseFrame{}, fmt.Errorf("%w (%d bytes)", translate.ErrSSELineTooLong, translate.MaxSSELineBytes)
+				}
 				if hasData {
 					dataBuf.WriteByte('\n')
 				}

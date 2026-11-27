@@ -94,6 +94,8 @@ func (g *Gateway) ListAuthorizedToolsForPrincipal(ctx context.Context, p *auth.P
 		}
 	}
 
+	isAdmin := g.isAdminPrincipal(ctx, p)
+
 	targets := make([]store.MCPServer, 0, len(allServers))
 	for _, srv := range allServers {
 		if !srv.Enabled {
@@ -101,6 +103,13 @@ func (g *Gateway) ListAuthorizedToolsForPrincipal(ctx context.Context, p *auth.P
 		}
 		if allowSet != nil {
 			if _, ok := allowSet[srv.Name]; !ok {
+				continue
+			}
+		}
+		// P2-2: Never dial or probe MCP servers the caller has no grant for.
+		if g.authorizer != nil {
+			allowed, _, authErr := g.authorizer.AuthorizeMCPServer(ctx, p, srv.Name)
+			if authErr != nil || !allowed {
 				continue
 			}
 		}
@@ -122,7 +131,12 @@ func (g *Gateway) ListAuthorizedToolsForPrincipal(ctx context.Context, p *auth.P
 
 			discovered, _, discoverErr := g.DiscoverTools(ctx, server)
 			if discoverErr != nil {
-				entry.Error = sanitizeURLError(discoverErr)
+				// P2-2: Redact internal upstream URL/IP details for non-admin callers.
+				if isAdmin {
+					entry.Error = sanitizeURLError(discoverErr)
+				} else {
+					entry.Error = "upstream MCP server unavailable"
+				}
 				results[idx] = entry
 				return
 			}
@@ -142,6 +156,21 @@ func (g *Gateway) ListAuthorizedToolsForPrincipal(ctx context.Context, p *auth.P
 	wg.Wait()
 
 	return results, nil
+}
+
+func (g *Gateway) isAdminPrincipal(ctx context.Context, p *auth.Principal) bool {
+	if p == nil {
+		return false
+	}
+	if checker, ok := g.authorizer.(interface {
+		IsAdmin(context.Context, *auth.Principal) (bool, error)
+	}); ok {
+		if admin, err := checker.IsAdmin(ctx, p); err == nil {
+			return admin
+		}
+		return false
+	}
+	return p.IsAdmin()
 }
 
 // CallAuthorizedTool enforces policy + guardrails, invokes tools/call on the target
@@ -456,9 +485,12 @@ func (s *mcpClientSession) call(ctx context.Context, method string, params any) 
 		return readMatchingRPCFromSSE(resp.Body, wantID)
 	}
 
-	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, s.gw.maxResponseBodyBytes))
+	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, s.gw.maxResponseBodyBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(respBytes)) > s.gw.maxResponseBodyBytes {
+		return nil, fmt.Errorf("mcp: %s response exceeds gateway limit", method)
 	}
 	return parseMatchingRPCJSON(respBytes, wantID)
 }
