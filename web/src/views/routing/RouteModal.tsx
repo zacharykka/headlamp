@@ -22,7 +22,6 @@ export function parseOptionalNonNegativeNumber(
 }
 
 interface RouteModalProps {
-  open: boolean;
   editingRoute: ModelRouteItem | null;
   providers: ProviderItem[];
   onClose: () => void;
@@ -30,67 +29,46 @@ interface RouteModalProps {
 }
 
 export function RouteModal({
-  open,
   editingRoute,
   providers,
   onClose,
   onSaved,
 }: RouteModalProps) {
   const [modalError, setModalError] = useState<string | null>(null);
-  const [routeAlias, setRouteAlias] = useState('');
-  const [routeProvider, setRouteProvider] = useState('');
-  const [routeUpstreamModel, setRouteUpstreamModel] = useState('');
-  const [routeFallbacksText, setRouteFallbacksText] = useState('');
-  const [routeInputCost, setRouteInputCost] = useState('');
-  const [routeOutputCost, setRouteOutputCost] = useState('');
-  const [routeCacheReadCost, setRouteCacheReadCost] = useState('');
-  const [routeCacheWriteCost, setRouteCacheWriteCost] = useState('');
-  const [routeEnabled, setRouteEnabled] = useState(true);
+  const [routeAlias, setRouteAlias] = useState(editingRoute?.alias ?? '');
+  const [routeProvider, setRouteProvider] = useState(
+    editingRoute?.provider_name ?? providers[0]?.name ?? '',
+  );
+  const [routeUpstreamModel, setRouteUpstreamModel] = useState(
+    editingRoute?.upstream_model ?? '',
+  );
+  const [routeFallbacksText, setRouteFallbacksText] = useState(
+    editingRoute
+      ? (editingRoute.fallbacks ?? []).map((fb) => `${fb.provider}/${fb.model}`).join('\n')
+      : '',
+  );
+  const [routeInputCost, setRouteInputCost] = useState(
+    editingRoute?.input_cost_per_million != null
+      ? String(editingRoute.input_cost_per_million)
+      : '',
+  );
+  const [routeOutputCost, setRouteOutputCost] = useState(
+    editingRoute?.output_cost_per_million != null
+      ? String(editingRoute.output_cost_per_million)
+      : '',
+  );
+  const [routeCacheReadCost, setRouteCacheReadCost] = useState(
+    editingRoute?.cache_read_cost_per_million != null
+      ? String(editingRoute.cache_read_cost_per_million)
+      : '',
+  );
+  const [routeCacheWriteCost, setRouteCacheWriteCost] = useState(
+    editingRoute?.cache_write_cost_per_million != null
+      ? String(editingRoute.cache_write_cost_per_million)
+      : '',
+  );
+  const [routeEnabled, setRouteEnabled] = useState(editingRoute?.enabled ?? true);
   const [savingRoute, setSavingRoute] = useState(false);
-
-  useEffect(() => {
-    if (!open) return;
-    setModalError(null);
-    if (editingRoute) {
-      setRouteAlias(editingRoute.alias);
-      setRouteProvider(editingRoute.provider_name);
-      setRouteUpstreamModel(editingRoute.upstream_model);
-      setRouteFallbacksText(
-        (editingRoute.fallbacks ?? []).map((fb) => `${fb.provider}/${fb.model}`).join('\n'),
-      );
-      setRouteInputCost(
-        editingRoute.input_cost_per_million != null
-          ? String(editingRoute.input_cost_per_million)
-          : '',
-      );
-      setRouteOutputCost(
-        editingRoute.output_cost_per_million != null
-          ? String(editingRoute.output_cost_per_million)
-          : '',
-      );
-      setRouteCacheReadCost(
-        editingRoute.cache_read_cost_per_million != null
-          ? String(editingRoute.cache_read_cost_per_million)
-          : '',
-      );
-      setRouteCacheWriteCost(
-        editingRoute.cache_write_cost_per_million != null
-          ? String(editingRoute.cache_write_cost_per_million)
-          : '',
-      );
-      setRouteEnabled(editingRoute.enabled);
-    } else {
-      setRouteAlias('');
-      setRouteProvider(providers[0]?.name ?? '');
-      setRouteUpstreamModel('');
-      setRouteFallbacksText('');
-      setRouteInputCost('');
-      setRouteOutputCost('');
-      setRouteCacheReadCost('');
-      setRouteCacheWriteCost('');
-      setRouteEnabled(true);
-    }
-  }, [open, editingRoute]);
 
   useEffect(() => {
     if (!editingRoute) {
@@ -181,7 +159,7 @@ export function RouteModal({
 
   return (
     <Modal
-      open={open}
+      open
       title={editingRoute ? `Edit Route (${editingRoute.alias})` : 'Add Model Route'}
       onClose={onClose}
       maxWidth={620}

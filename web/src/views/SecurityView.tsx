@@ -292,12 +292,12 @@ export function SecurityView({
         </div>
       )}
 
-      {showGuardrails && (
-        <>
-          <GuardrailPlayground />
+      <div hidden={!showGuardrails}>
+        <GuardrailPlayground />
+      </div>
 
-          {/* Guardrail Rules Inventory */}
-          <section className="ap-card" aria-label="Guardrail rules">
+      {showGuardrails && (
+        <section className="ap-card" aria-label="Guardrail rules">
             <div className="ap-card-header">
               <div>
                 <h2 className="ap-card-title">Detector Rules ({filteredRules.length})</h2>
@@ -437,7 +437,6 @@ export function SecurityView({
               </table>
             </div>
           </section>
-        </>
       )}
 
       {showWebhooks && (
@@ -615,19 +614,21 @@ export function SecurityView({
         </section>
       )}
 
-      <GuardrailRuleModal
-        open={ruleModalOpen}
-        editingRule={editingRule}
-        onClose={() => setRuleModalOpen(false)}
-        onSaved={loadAll}
-      />
+      {ruleModalOpen && (
+        <GuardrailRuleModal
+          editingRule={editingRule}
+          onClose={() => setRuleModalOpen(false)}
+          onSaved={loadAll}
+        />
+      )}
 
-      <WebhookModal
-        open={whModalOpen}
-        editingWebhook={editingWebhook}
-        onClose={() => setWhModalOpen(false)}
-        onSaved={loadAll}
-      />
+      {whModalOpen && (
+        <WebhookModal
+          editingWebhook={editingWebhook}
+          onClose={() => setWhModalOpen(false)}
+          onSaved={loadAll}
+        />
+      )}
     </div>
   );
 }

@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useState, type FormEvent } from 'react';
 import { api } from '../../api/client';
 import { Modal, Toggle } from '../../components/Primitives';
 import type { ProviderItem, ProviderUpsertPayload } from '../../types/api';
@@ -11,52 +11,30 @@ export const DEFAULT_BASE_URLS: Record<string, string> = {
 };
 
 interface ProviderModalProps {
-  open: boolean;
   editingProvider: ProviderItem | null;
   onClose: () => void;
   onSaved: () => Promise<void>;
 }
 
 export function ProviderModal({
-  open,
   editingProvider,
   onClose,
   onSaved,
 }: ProviderModalProps) {
   const [modalError, setModalError] = useState<string | null>(null);
-  const [provName, setProvName] = useState('');
-  const [provType, setProvType] = useState('openai');
-  const [provBaseURL, setProvBaseURL] = useState(DEFAULT_BASE_URLS.openai);
+  const [provName, setProvName] = useState(editingProvider?.name ?? '');
+  const [provType, setProvType] = useState(editingProvider?.type ?? 'openai');
+  const [provBaseURL, setProvBaseURL] = useState(
+    editingProvider?.base_url ?? DEFAULT_BASE_URLS.openai,
+  );
   const [provAPIKey, setProvAPIKey] = useState('');
   const [provClearKey, setProvClearKey] = useState(false);
-  const [provModels, setProvModels] = useState('');
-  const [provPassthrough, setProvPassthrough] = useState(false);
-  const [provEnabled, setProvEnabled] = useState(true);
+  const [provModels, setProvModels] = useState(
+    editingProvider ? (editingProvider.models ?? []).join(', ') : '',
+  );
+  const [provPassthrough, setProvPassthrough] = useState(editingProvider?.passthrough ?? false);
+  const [provEnabled, setProvEnabled] = useState(editingProvider?.enabled ?? true);
   const [savingProvider, setSavingProvider] = useState(false);
-
-  useEffect(() => {
-    if (!open) return;
-    setModalError(null);
-    if (editingProvider) {
-      setProvName(editingProvider.name);
-      setProvType(editingProvider.type);
-      setProvBaseURL(editingProvider.base_url);
-      setProvAPIKey('');
-      setProvClearKey(false);
-      setProvModels((editingProvider.models ?? []).join(', '));
-      setProvPassthrough(editingProvider.passthrough);
-      setProvEnabled(editingProvider.enabled);
-    } else {
-      setProvName('');
-      setProvType('openai');
-      setProvBaseURL(DEFAULT_BASE_URLS.openai);
-      setProvAPIKey('');
-      setProvClearKey(false);
-      setProvModels('');
-      setProvPassthrough(false);
-      setProvEnabled(true);
-    }
-  }, [open, editingProvider]);
 
   const handleSaveProvider = async (event: FormEvent) => {
     event.preventDefault();
@@ -110,7 +88,7 @@ export function ProviderModal({
 
   return (
     <Modal
-      open={open}
+      open
       title={editingProvider ? `Edit Provider (${editingProvider.name})` : 'Add Provider'}
       onClose={onClose}
       error={modalError}

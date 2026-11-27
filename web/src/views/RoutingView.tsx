@@ -653,20 +653,22 @@ export function RoutingView({
         </section>
       )}
 
-      <ProviderModal
-        open={providerModalOpen}
-        editingProvider={editingProvider}
-        onClose={() => setProviderModalOpen(false)}
-        onSaved={loadAll}
-      />
+      {providerModalOpen && (
+        <ProviderModal
+          editingProvider={editingProvider}
+          onClose={() => setProviderModalOpen(false)}
+          onSaved={loadAll}
+        />
+      )}
 
-      <RouteModal
-        open={routeModalOpen}
-        editingRoute={editingRoute}
-        providers={providers}
-        onClose={() => setRouteModalOpen(false)}
-        onSaved={loadAll}
-      />
+      {routeModalOpen && (
+        <RouteModal
+          editingRoute={editingRoute}
+          providers={providers}
+          onClose={() => setRouteModalOpen(false)}
+          onSaved={loadAll}
+        />
+      )}
 
       {!onOpenPricing && (
         <PricingDrawer

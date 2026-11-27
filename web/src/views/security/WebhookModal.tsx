@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useState, type FormEvent } from 'react';
 import { api } from '../../api/client';
 import { Modal, Toggle } from '../../components/Primitives';
 import type { WebhookItem, WebhookUpsertPayload } from '../../types/api';
@@ -13,58 +13,30 @@ export const WEBHOOK_EVENTS = [
 ];
 
 interface WebhookModalProps {
-  open: boolean;
   editingWebhook: WebhookItem | null;
   onClose: () => void;
   onSaved: () => Promise<void>;
 }
 
 export function WebhookModal({
-  open,
   editingWebhook,
   onClose,
   onSaved,
 }: WebhookModalProps) {
   const [modalError, setModalError] = useState<string | null>(null);
-  const [whId, setWhId] = useState('');
-  const [whName, setWhName] = useState('');
-  const [whUrl, setWhUrl] = useState('');
-  const [whType, setWhType] = useState('async_event');
+  const [whId, setWhId] = useState(editingWebhook?.id ?? '');
+  const [whName, setWhName] = useState(editingWebhook?.name ?? '');
+  const [whUrl, setWhUrl] = useState(editingWebhook?.url ?? '');
+  const [whType, setWhType] = useState(editingWebhook?.type ?? 'async_event');
   const [whSecret, setWhSecret] = useState('');
   const [whClearSecret, setWhClearSecret] = useState(false);
-  const [whEvents, setWhEvents] = useState<string[]>(['guardrail.triggered', 'budget.exceeded']);
-  const [whTimeout, setWhTimeout] = useState('2000');
-  const [whFailOpen, setWhFailOpen] = useState(true);
-  const [whEnabled, setWhEnabled] = useState(true);
+  const [whEvents, setWhEvents] = useState<string[]>(
+    editingWebhook ? (editingWebhook.events ?? []) : ['guardrail.triggered', 'budget.exceeded'],
+  );
+  const [whTimeout, setWhTimeout] = useState(String(editingWebhook?.timeout_ms || 2000));
+  const [whFailOpen, setWhFailOpen] = useState(editingWebhook?.fail_open ?? true);
+  const [whEnabled, setWhEnabled] = useState(editingWebhook?.enabled ?? true);
   const [savingWebhook, setSavingWebhook] = useState(false);
-
-  useEffect(() => {
-    if (!open) return;
-    setModalError(null);
-    if (editingWebhook) {
-      setWhId(editingWebhook.id);
-      setWhName(editingWebhook.name);
-      setWhUrl(editingWebhook.url);
-      setWhType(editingWebhook.type);
-      setWhSecret('');
-      setWhClearSecret(false);
-      setWhEvents(editingWebhook.events ?? []);
-      setWhTimeout(String(editingWebhook.timeout_ms || 2000));
-      setWhFailOpen(editingWebhook.fail_open);
-      setWhEnabled(editingWebhook.enabled);
-    } else {
-      setWhId('');
-      setWhName('');
-      setWhUrl('');
-      setWhType('async_event');
-      setWhSecret('');
-      setWhClearSecret(false);
-      setWhEvents(['guardrail.triggered', 'budget.exceeded']);
-      setWhTimeout('2000');
-      setWhFailOpen(true);
-      setWhEnabled(true);
-    }
-  }, [open, editingWebhook]);
 
   const toggleWebhookEvent = (evt: string) => {
     setWhEvents((prev) =>
@@ -129,7 +101,7 @@ export function WebhookModal({
 
   return (
     <Modal
-      open={open}
+      open
       title={editingWebhook ? `Edit Webhook (${editingWebhook.name})` : 'Add Webhook'}
       onClose={onClose}
       maxWidth={600}

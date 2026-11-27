@@ -13,7 +13,6 @@ import { formatNumber } from '../../lib/format';
 import type { AuditSettings } from '../../types/api';
 
 interface AuditSettingsModalProps {
-  open: boolean;
   settings: AuditSettings;
   settingsDirtyRef: { current: boolean };
   onSettingsChange: Dispatch<SetStateAction<AuditSettings>>;
@@ -21,7 +20,6 @@ interface AuditSettingsModalProps {
 }
 
 export function AuditSettingsModal({
-  open,
   settings,
   settingsDirtyRef,
   onSettingsChange,
@@ -46,34 +44,33 @@ export function AuditSettingsModal({
     }
   };
 
-  useEffect(() => clearZeroPurgeTimer, []);
-
   useEffect(() => {
-    if (!open) return;
+    let active = true;
     settingsDirtyRef.current = false;
     clearZeroPurgeTimer();
-    setConfirmZeroPurge(false);
     const seq = ++settingsLoadSeqRef.current;
-    setModalError(null);
-    setPurgeNotice(null);
-    setRetentionDaysInput(String(settings.retention_days));
 
     void api
       .getAuditSettings()
       .then((current) => {
-        if (seq === settingsLoadSeqRef.current && !settingsDirtyRef.current) {
+        if (active && seq === settingsLoadSeqRef.current && !settingsDirtyRef.current) {
           onSettingsChange(current);
           setRetentionDaysInput(String(current.retention_days));
         }
       })
       .catch((err: unknown) => {
-        if (seq === settingsLoadSeqRef.current) {
+        if (active && seq === settingsLoadSeqRef.current) {
           setModalError(
             err instanceof Error ? err.message : 'Failed to load current audit settings',
           );
         }
       });
-  }, [open]);
+
+    return () => {
+      active = false;
+      clearZeroPurgeTimer();
+    };
+  }, []);
 
   const parseRetentionInput = (): { days: number; error: string | null } => {
     const trimmed = retentionDaysInput.trim();
@@ -149,7 +146,7 @@ export function AuditSettingsModal({
 
   return (
     <Modal
-      open={open}
+      open
       title="Audit Storage & Payload Retention"
       onClose={onClose}
       error={modalError}

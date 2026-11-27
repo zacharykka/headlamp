@@ -584,13 +584,14 @@ export function AuditLogsView({ focus }: AuditLogsViewProps) {
         onRetry={(log) => void inspectLog(log)}
       />
 
-      <AuditSettingsModal
-        open={settingsOpen}
-        settings={settings}
-        settingsDirtyRef={settingsDirtyRef}
-        onSettingsChange={setSettings}
-        onClose={() => setSettingsOpen(false)}
-      />
+      {settingsOpen && (
+        <AuditSettingsModal
+          settings={settings}
+          settingsDirtyRef={settingsDirtyRef}
+          onSettingsChange={setSettings}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
     </div>
   );
 }

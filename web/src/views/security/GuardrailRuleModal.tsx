@@ -1,50 +1,28 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useState, type FormEvent } from 'react';
 import { api } from '../../api/client';
 import { AlertIcon } from '../../components/ApertureIcons';
 import { Modal, Toggle } from '../../components/Primitives';
 import type { GuardrailRule, GuardrailUpsertPayload } from '../../types/api';
 
 interface GuardrailRuleModalProps {
-  open: boolean;
   editingRule: GuardrailRule | null;
   onClose: () => void;
   onSaved: () => Promise<void>;
 }
 
 export function GuardrailRuleModal({
-  open,
   editingRule,
   onClose,
   onSaved,
 }: GuardrailRuleModalProps) {
   const [modalError, setModalError] = useState<string | null>(null);
-  const [ruleId, setRuleId] = useState('');
-  const [ruleName, setRuleName] = useState('');
-  const [ruleCategory, setRuleCategory] = useState('custom');
-  const [rulePattern, setRulePattern] = useState('');
-  const [ruleAction, setRuleAction] = useState('redact');
-  const [ruleEnabled, setRuleEnabled] = useState(true);
+  const [ruleId, setRuleId] = useState(editingRule?.id ?? '');
+  const [ruleName, setRuleName] = useState(editingRule?.name ?? '');
+  const [ruleCategory, setRuleCategory] = useState(editingRule?.category ?? 'custom');
+  const [rulePattern, setRulePattern] = useState(editingRule?.pattern ?? '');
+  const [ruleAction, setRuleAction] = useState(editingRule?.action ?? 'redact');
+  const [ruleEnabled, setRuleEnabled] = useState(editingRule?.enabled ?? true);
   const [savingRule, setSavingRule] = useState(false);
-
-  useEffect(() => {
-    if (!open) return;
-    setModalError(null);
-    if (editingRule) {
-      setRuleId(editingRule.id);
-      setRuleName(editingRule.name);
-      setRuleCategory(editingRule.category);
-      setRulePattern(editingRule.pattern);
-      setRuleAction(editingRule.action);
-      setRuleEnabled(editingRule.enabled);
-    } else {
-      setRuleId('');
-      setRuleName('');
-      setRuleCategory('custom');
-      setRulePattern('');
-      setRuleAction('redact');
-      setRuleEnabled(true);
-    }
-  }, [open, editingRule]);
 
   const handleSaveRule = async (event: FormEvent) => {
     event.preventDefault();
@@ -111,7 +89,7 @@ export function GuardrailRuleModal({
 
   return (
     <Modal
-      open={open}
+      open
       title={editingRule ? `Edit Guardrail (${editingRule.name})` : 'Add Guardrail Rule'}
       onClose={onClose}
       error={modalError}

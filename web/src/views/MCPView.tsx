@@ -554,12 +554,13 @@ export function MCPView({
         />
       )}
 
-      <MCPServerModal
-        open={modalOpen}
-        editingServer={editingServer}
-        onClose={() => setModalOpen(false)}
-        onSaved={loadServers}
-      />
+      {modalOpen && (
+        <MCPServerModal
+          editingServer={editingServer}
+          onClose={() => setModalOpen(false)}
+          onSaved={loadServers}
+        />
+      )}
 
       <MCPDiscoveryDrawer
         serverName={inspectToolsServer}

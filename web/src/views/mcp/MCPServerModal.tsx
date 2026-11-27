@@ -1,55 +1,33 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useState, type FormEvent } from 'react';
 import { api } from '../../api/client';
 import { Modal, Toggle } from '../../components/Primitives';
 import type { MCPServerItem, MCPServerUpsertPayload } from '../../types/api';
 
 interface MCPServerModalProps {
-  open: boolean;
   editingServer: MCPServerItem | null;
   onClose: () => void;
   onSaved: () => Promise<void>;
 }
 
 export function MCPServerModal({
-  open,
   editingServer,
   onClose,
   onSaved,
 }: MCPServerModalProps) {
   const [modalError, setModalError] = useState<string | null>(null);
-  const [srvName, setSrvName] = useState('');
-  const [srvUrl, setSrvUrl] = useState('');
-  const [srvTransport, setSrvTransport] = useState('streamable_http');
-  const [srvAuthType, setSrvAuthType] = useState('none');
-  const [srvAuthHeader, setSrvAuthHeader] = useState('X-API-Key');
+  const [srvName, setSrvName] = useState(editingServer?.name ?? '');
+  const [srvUrl, setSrvUrl] = useState(editingServer?.url ?? '');
+  const [srvTransport, setSrvTransport] = useState(
+    editingServer?.transport || 'streamable_http',
+  );
+  const [srvAuthType, setSrvAuthType] = useState(editingServer?.auth_type || 'none');
+  const [srvAuthHeader, setSrvAuthHeader] = useState(
+    editingServer?.auth_header || 'X-API-Key',
+  );
   const [srvAuthToken, setSrvAuthToken] = useState('');
   const [srvClearToken, setSrvClearToken] = useState(false);
-  const [srvEnabled, setSrvEnabled] = useState(true);
+  const [srvEnabled, setSrvEnabled] = useState(editingServer?.enabled ?? true);
   const [savingServer, setSavingServer] = useState(false);
-
-  useEffect(() => {
-    if (!open) return;
-    setModalError(null);
-    if (editingServer) {
-      setSrvName(editingServer.name);
-      setSrvUrl(editingServer.url);
-      setSrvTransport(editingServer.transport || 'streamable_http');
-      setSrvAuthType(editingServer.auth_type || 'none');
-      setSrvAuthHeader(editingServer.auth_header || 'X-API-Key');
-      setSrvAuthToken('');
-      setSrvClearToken(false);
-      setSrvEnabled(editingServer.enabled);
-    } else {
-      setSrvName('');
-      setSrvUrl('');
-      setSrvTransport('streamable_http');
-      setSrvAuthType('none');
-      setSrvAuthHeader('X-API-Key');
-      setSrvAuthToken('');
-      setSrvClearToken(false);
-      setSrvEnabled(true);
-    }
-  }, [open, editingServer]);
 
   const handleSaveServer = async (e: FormEvent) => {
     e.preventDefault();
@@ -108,7 +86,7 @@ export function MCPServerModal({
 
   return (
     <Modal
-      open={open}
+      open
       title={
         editingServer
           ? `Edit MCP Server (${editingServer.name})`
