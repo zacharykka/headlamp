@@ -53,6 +53,59 @@ type ModelRoute struct {
 	UpdatedAt                time.Time     `json:"updated_at"`
 }
 
+// Budget configures rate limiting and USD spend limits for a scope ("*", "tag:<name>", or user subject).
+type Budget struct {
+	Scope         string    `json:"scope"`
+	RPM           int       `json:"rpm"`
+	TPM           int64     `json:"tpm"`
+	MaxConcurrent int       `json:"max_concurrent"`
+	DailyUSD      *float64  `json:"daily_usd"`
+	MonthlyUSD    *float64  `json:"monthly_usd"`
+	SoftAlertPct  int       `json:"soft_alert_pct"`
+	Enabled       bool      `json:"enabled"`
+	Source        string    `json:"source"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// GuardrailRule defines a built-in or custom regex secret/PII detection rule.
+type GuardrailRule struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Category  string    `json:"category"` // secret | pii | custom
+	Pattern   string    `json:"pattern"`
+	Action    string    `json:"action"` // log_only | redact | block
+	Builtin   bool      `json:"builtin"`
+	Enabled   bool      `json:"enabled"`
+	Source    string    `json:"source"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Webhook represents a synchronous pre-request review or asynchronous event webhook.
+// Secret is held in plaintext in memory and always stored encrypted at rest.
+type Webhook struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	URL       string    `json:"url"`
+	Type      string    `json:"type"` // sync_review | async_event
+	Secret    string    `json:"-"`
+	Events    []string  `json:"events"`
+	TimeoutMS int       `json:"timeout_ms"`
+	FailOpen  bool      `json:"fail_open"`
+	Enabled   bool      `json:"enabled"`
+	Source    string    `json:"source"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// AuditSettings holds runtime-editable audit payload retention settings persisted in runtime_settings.
+type AuditSettings struct {
+	StorePayloads bool      `json:"store_payloads"`
+	RetentionDays int       `json:"retention_days"`
+	UpdatedAt     time.Time `json:"updated_at,omitempty"`
+}
+
 // UsageLog records a single proxied LLM request for billing and telemetry.
 type UsageLog struct {
 	ID               string    `json:"id"`
@@ -83,17 +136,22 @@ type UsageLog struct {
 	TTFTMS           int64     `json:"ttft_ms"`
 	StatusCode       int       `json:"status_code"`
 	ErrorMessage     string    `json:"error_message"`
+	GuardrailAction  string    `json:"guardrail_action"`
+	GuardrailHits    []string  `json:"guardrail_hits"`
 }
 
 // UsageFilter scopes usage log queries and aggregate summaries.
 type UsageFilter struct {
-	Subject      string
-	ProviderName string
-	Model        string
-	Since        time.Time
-	Until        time.Time
-	Limit        int
-	Offset       int
+	Subject       string
+	Tag           string // Matches rows where subject == Tag or Tag is in tags_json
+	ProviderName  string
+	Model         string
+	StatusCode    int
+	GuardrailOnly bool
+	Since         time.Time
+	Until         time.Time
+	Limit         int
+	Offset        int
 }
 
 // UsageSummary holds aggregated token and cost totals matching a UsageFilter.
@@ -106,6 +164,39 @@ type UsageSummary struct {
 	ReasoningTokens  int64   `json:"reasoning_tokens"`
 	TotalTokens      int64   `json:"total_tokens"`
 	CostUSD          float64 `json:"cost_usd"`
+}
+
+// UsageExtendedSummary extends UsageSummary with error counts and P95 latency for dashboards.
+type UsageExtendedSummary struct {
+	UsageSummary
+	ErrorCount   int64 `json:"error_count"`
+	P95LatencyMS int64 `json:"p95_latency_ms"`
+}
+
+// UsageTimeBucket holds time-series metrics for one hour or day bucket.
+type UsageTimeBucket struct {
+	Bucket   string  `json:"bucket"`
+	Requests int64   `json:"requests"`
+	Tokens   int64   `json:"tokens"`
+	CostUSD  float64 `json:"cost_usd"`
+	Errors   int64   `json:"errors"`
+}
+
+// SubjectUsageStat holds aggregated usage for a single subject (user or tag).
+type SubjectUsageStat struct {
+	Subject  string  `json:"subject"`
+	Requests int64   `json:"requests"`
+	Tokens   int64   `json:"tokens"`
+	CostUSD  float64 `json:"cost_usd"`
+}
+
+// ModelUsageStat holds aggregated usage for a requested model and provider pair.
+type ModelUsageStat struct {
+	Model    string  `json:"model"`
+	Provider string  `json:"provider"`
+	Requests int64   `json:"requests"`
+	Tokens   int64   `json:"tokens"`
+	CostUSD  float64 `json:"cost_usd"`
 }
 
 // AuditPayload holds optional request/response bodies associated with a UsageLog.
@@ -138,11 +229,37 @@ type Store interface {
 	ListModelRoutes(ctx context.Context) ([]ModelRoute, error)
 	DeleteModelRoute(ctx context.Context, alias string) error
 
-	// Usage logs
+	// Budgets
+	UpsertBudget(ctx context.Context, b Budget) error
+	GetBudget(ctx context.Context, scope string) (*Budget, error)
+	ListBudgets(ctx context.Context) ([]Budget, error)
+	DeleteBudget(ctx context.Context, scope string) error
+
+	// Guardrail rules
+	UpsertGuardrailRule(ctx context.Context, r GuardrailRule) error
+	GetGuardrailRule(ctx context.Context, id string) (*GuardrailRule, error)
+	ListGuardrailRules(ctx context.Context) ([]GuardrailRule, error)
+	DeleteGuardrailRule(ctx context.Context, id string) error
+
+	// Webhooks
+	UpsertWebhook(ctx context.Context, w Webhook) error
+	GetWebhook(ctx context.Context, id string) (*Webhook, error)
+	ListWebhooks(ctx context.Context) ([]Webhook, error)
+	DeleteWebhook(ctx context.Context, id string) error
+
+	// Runtime settings
+	GetAuditSettings(ctx context.Context) (*AuditSettings, error)
+	SetAuditSettings(ctx context.Context, settings AuditSettings) error
+
+	// Usage logs & dashboard analytics
 	InsertUsageLog(ctx context.Context, log UsageLog) error
 	GetUsageLog(ctx context.Context, id string) (*UsageLog, error)
 	QueryUsageLogs(ctx context.Context, filter UsageFilter) ([]UsageLog, error)
 	SummarizeUsage(ctx context.Context, filter UsageFilter) (UsageSummary, error)
+	SummarizeUsageExtended(ctx context.Context, filter UsageFilter) (UsageExtendedSummary, error)
+	QueryUsageSeries(ctx context.Context, filter UsageFilter, bucket string) ([]UsageTimeBucket, error)
+	QueryTopSubjects(ctx context.Context, filter UsageFilter, limit int) ([]SubjectUsageStat, error)
+	QueryTopModels(ctx context.Context, filter UsageFilter, limit int) ([]ModelUsageStat, error)
 
 	// Audit payloads & retention
 	InsertAuditPayload(ctx context.Context, payload AuditPayload) error

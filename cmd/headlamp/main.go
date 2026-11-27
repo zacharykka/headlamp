@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -17,14 +18,18 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/zacharykka/headlamp/internal/api"
 	"github.com/zacharykka/headlamp/internal/auth"
 	"github.com/zacharykka/headlamp/internal/config"
 	"github.com/zacharykka/headlamp/internal/crypto"
+	"github.com/zacharykka/headlamp/internal/guardrail"
 	"github.com/zacharykka/headlamp/internal/metering"
 	"github.com/zacharykka/headlamp/internal/netts"
 	"github.com/zacharykka/headlamp/internal/policy"
 	"github.com/zacharykka/headlamp/internal/proxy"
+	"github.com/zacharykka/headlamp/internal/quota"
 	"github.com/zacharykka/headlamp/internal/store"
+	"github.com/zacharykka/headlamp/web"
 )
 
 var (
@@ -121,15 +126,43 @@ func runServe(args []string, _, stderr io.Writer) error {
 		return fmt.Errorf("sync config to store: %w", err)
 	}
 
+	activeAuditCfg, err := loadActiveAuditConfig(ctx, st, cfg.Audit)
+	if err != nil {
+		return fmt.Errorf("load audit settings: %w", err)
+	}
+
 	pricing, err := metering.LoadDefault()
 	if err != nil {
 		return fmt.Errorf("load default pricing: %w", err)
 	}
 
-	recorder := metering.NewRecorder(st, cfg.Audit, pricing, metering.RecorderOptions{
+	grEngine, err := guardrail.NewEngine(guardrail.EngineConfig{
+		Store: st,
+		Logf:  logger.Printf,
+	})
+	if err != nil {
+		return fmt.Errorf("init guardrail engine: %w", err)
+	}
+	// Shutdown order (LIFO defers): srv.Close -> recorder.Close -> grEngine.Close -> st.Close.
+	// Closing recorder before grEngine ensures any budget alerts triggered during final
+	// usage flushes are dispatched before the async webhook workers drain.
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := grEngine.Close(flushCtx); err != nil {
+			logger.Printf("drain guardrail webhooks: %v", err)
+		}
+	}()
+
+	quotaMgr := quota.NewManager(st, quota.WithOnAlert(func(ev quota.AlertEvent) {
+		grEngine.Emit(ev.EventType, ev)
+	}))
+
+	recorder := metering.NewRecorder(st, activeAuditCfg, pricing, metering.RecorderOptions{
 		OnError: func(err error) {
 			logger.Printf("metering error: %v", err)
 		},
+		OnRecorded: quotaMgr.OnUsageRecorded,
 	})
 	defer func() {
 		flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -140,6 +173,38 @@ func runServe(args []string, _, stderr io.Writer) error {
 	}()
 
 	eval := policy.NewEvaluator()
+
+	gw, err := proxy.NewGateway(proxy.GatewayConfig{
+		Store:      st,
+		Authorizer: eval,
+		Telemetry:  &telemetryAdapter{recorder: recorder},
+		Quota:      &quotaLimiterAdapter{mgr: quotaMgr},
+		Guardrails: &guardrailInspectorAdapter{engine: grEngine},
+		Events:     grEngine,
+		Logf:       logger.Printf,
+	})
+	if err != nil {
+		return fmt.Errorf("init proxy gateway: %w", err)
+	}
+
+	staticFS, err := web.DistFS()
+	if err != nil {
+		return fmt.Errorf("load embedded web assets: %w", err)
+	}
+
+	apiHandler, err := api.NewHandler(api.Config{
+		Store:           st,
+		Policy:          eval,
+		Pricing:         pricing,
+		AuditController: recorder,
+		BudgetReporter:  &budgetReporterAdapter{mgr: quotaMgr},
+		GuardrailTester: &guardrailTesterAdapter{engine: grEngine},
+		WebhookTester:   &webhookTesterAdapter{engine: grEngine},
+		StaticFS:        staticFS,
+	})
+	if err != nil {
+		return fmt.Errorf("init api handler: %w", err)
+	}
 
 	srv, err := netts.NewServer(cfg.Server, netts.WithUserLogf(logger.Printf))
 	if err != nil {
@@ -153,26 +218,15 @@ func runServe(args []string, _, stderr io.Writer) error {
 		return fmt.Errorf("start listeners: %w", err)
 	}
 
-	gw, err := proxy.NewGateway(proxy.GatewayConfig{
-		Store:      st,
-		Authorizer: eval,
-		Telemetry:  &telemetryAdapter{recorder: recorder},
-		Logf:       logger.Printf,
-	})
-	if err != nil {
-		_ = srv.Close(context.Background())
-		return fmt.Errorf("init proxy gateway: %w", err)
-	}
-
 	// P0-2 listener isolation:
 	// - Tailnet listener ONLY accepts Tailnet WhoIs identity (never static tokens or dev_mock).
 	// - Local listener ONLY uses static API tokens and/or loopback-restricted dev_mock.
 	var tailnetHandler, localHandler http.Handler
 	if cfg.Server.TSNet.Enabled {
-		tailnetHandler = buildHandler(gw, eval, srv.Authenticator())
+		tailnetHandler = buildHandler(gw, apiHandler, eval, srv.Authenticator())
 	}
 	if strings.TrimSpace(cfg.Server.LocalListen) != "" {
-		localHandler = buildHandler(gw, eval, buildLocalAuthChain(cfg.Server))
+		localHandler = buildHandler(gw, apiHandler, eval, buildLocalAuthChain(cfg.Server))
 	}
 
 	if addr := srv.TailnetAddr(); addr != "" {
@@ -318,7 +372,7 @@ func runUsage(args []string, stdout, stderr io.Writer) error {
 
 func openStore(ctx context.Context, cfg *config.Config) (store.Store, bool, string, error) {
 	if cfg.Storage.Driver != config.StorageDriverSQLite {
-		return nil, false, "", fmt.Errorf("storage driver %q is not yet implemented in M1 (use sqlite)", cfg.Storage.Driver)
+		return nil, false, "", fmt.Errorf("storage driver %q is not yet implemented (use sqlite)", cfg.Storage.Driver)
 	}
 
 	stateDir := cfg.Server.TSNet.StateDir
@@ -340,6 +394,25 @@ func openStore(ctx context.Context, cfg *config.Config) (store.Store, bool, stri
 		return nil, generated, keyPath, fmt.Errorf("open sqlite store: %w", err)
 	}
 	return st, generated, keyPath, nil
+}
+
+// loadActiveAuditConfig restores persisted UI audit settings when present,
+// falling back to YAML config defaults on first run.
+func loadActiveAuditConfig(ctx context.Context, st store.Store, fallback config.AuditConfig) (config.AuditConfig, error) {
+	saved, err := st.GetAuditSettings(ctx)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return fallback, nil
+		}
+		return config.AuditConfig{}, err
+	}
+	if saved == nil {
+		return fallback, nil
+	}
+	return config.AuditConfig{
+		StorePayloads: saved.StorePayloads,
+		RetentionDays: saved.RetentionDays,
+	}, nil
 }
 
 // buildLocalAuthChain builds the authenticator chain for the optional local HTTP listener.
@@ -371,7 +444,7 @@ func buildLocalAuthChain(cfg config.ServerConfig) auth.Authenticator {
 	return auth.NewChainAuthenticator(chain...)
 }
 
-func buildHandler(gw http.Handler, eval *policy.Evaluator, authenticator auth.Authenticator) http.Handler {
+func buildHandler(gw http.Handler, apiHandler http.Handler, eval *policy.Evaluator, authenticator auth.Authenticator) http.Handler {
 	whoami := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -404,11 +477,19 @@ func buildHandler(gw http.Handler, eval *policy.Evaluator, authenticator auth.Au
 		})
 	})
 
-	authedMux := http.NewServeMux()
-	authedMux.Handle("/whoami", whoami)
-	authedMux.Handle("/", gw)
+	authedRouter := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/whoami" {
+			whoami.ServeHTTP(w, r)
+			return
+		}
+		if api.IsGatewayReservedPath(r.URL.Path) || apiHandler == nil {
+			gw.ServeHTTP(w, r)
+			return
+		}
+		apiHandler.ServeHTTP(w, r)
+	})
 
-	protected := auth.Middleware(authenticator, proxy.AuthErrorHandler)(authedMux)
+	protected := auth.Middleware(authenticator, proxy.AuthErrorHandler)(authedRouter)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
@@ -418,6 +499,19 @@ func buildHandler(gw http.Handler, eval *policy.Evaluator, authenticator auth.Au
 		protected.ServeHTTP(w, r)
 	})
 }
+
+var (
+	_ proxy.TelemetryFactory   = (*telemetryAdapter)(nil)
+	_ proxy.StreamObserver     = (*observerAdapter)(nil)
+	_ proxy.TokenReporter      = (*observerAdapter)(nil)
+	_ proxy.QuotaLimiter       = (*quotaLimiterAdapter)(nil)
+	_ proxy.GuardrailInspector = (*guardrailInspectorAdapter)(nil)
+	_ proxy.EventDispatcher    = (*guardrail.Engine)(nil)
+	_ api.AuditController      = (*metering.Recorder)(nil)
+	_ api.BudgetReporter       = (*budgetReporterAdapter)(nil)
+	_ api.GuardrailTester      = (*guardrailTesterAdapter)(nil)
+	_ api.WebhookTester        = (*webhookTesterAdapter)(nil)
+)
 
 // telemetryAdapter bridges *metering.Recorder to proxy.TelemetryFactory.
 type telemetryAdapter struct {
@@ -438,26 +532,29 @@ func (a *telemetryAdapter) Start(ctx context.Context, info proxy.TelemetryStart)
 		}
 	}
 	obs := a.recorder.Start(ctx, metering.RequestInfo{
-		RequestID:      info.RequestID,
-		Timestamp:      info.Timestamp,
-		Principal:      info.Principal,
-		Protocol:       info.Protocol,
-		Endpoint:       info.Endpoint,
-		Provider:       info.Provider,
-		ProviderType:   info.ProviderType,
-		RequestedModel: info.RequestedModel,
-		UpstreamModel:  info.UpstreamModel,
-		Stream:         info.Stream,
-		Translated:     info.Translated,
-		RequestHeaders: flattenHeaders(info.RequestHeaders),
-		RequestBody:    info.RequestBody,
-		PriceOverride:  override,
+		RequestID:       info.RequestID,
+		Timestamp:       info.Timestamp,
+		Principal:       info.Principal,
+		Protocol:        info.Protocol,
+		Endpoint:        info.Endpoint,
+		Provider:        info.Provider,
+		ProviderType:    info.ProviderType,
+		RequestedModel:  info.RequestedModel,
+		UpstreamModel:   info.UpstreamModel,
+		Stream:          info.Stream,
+		Translated:      info.Translated,
+		RequestHeaders:  flattenHeaders(info.RequestHeaders),
+		RequestBody:     info.RequestBody,
+		PriceOverride:   override,
+		GuardrailAction: info.GuardrailAction,
+		GuardrailHits:   info.GuardrailHits,
 	})
-	return &observerAdapter{obs: obs}
+	return &observerAdapter{obs: obs, protocol: info.Protocol}
 }
 
 type observerAdapter struct {
-	obs *metering.RequestObserver
+	obs      *metering.RequestObserver
+	protocol string
 }
 
 func (o *observerAdapter) OnSSEEvent(eventName string, data []byte) {
@@ -472,8 +569,161 @@ func (o *observerAdapter) SetResponseHeaders(headers map[string]string) {
 	o.obs.SetResponseHeaders(headers)
 }
 
+func (o *observerAdapter) TotalTokens() int64 {
+	return o.obs.Usage().NormalizedTotal(o.protocol)
+}
+
 func (o *observerAdapter) Finish(fin proxy.TelemetryFinish) {
 	o.obs.Finish(fin.StatusCode, fin.LatencyMS, fin.TTFTMS, fin.ErrorMessage)
+}
+
+// quotaLimiterAdapter bridges *quota.Manager to proxy.QuotaLimiter.
+type quotaLimiterAdapter struct {
+	mgr *quota.Manager
+}
+
+func (a *quotaLimiterAdapter) Acquire(ctx context.Context, p *auth.Principal) (proxy.QuotaTicket, *proxy.QuotaRejection, error) {
+	ticket, rej, err := a.mgr.Acquire(ctx, p)
+	if err != nil {
+		return nil, nil, err
+	}
+	if rej != nil {
+		return nil, &proxy.QuotaRejection{
+			Scope:         rej.Scope,
+			Metric:        rej.Metric,
+			Reason:        rej.Reason,
+			RetryAfterSec: rej.RetryAfterSec,
+		}, nil
+	}
+	if ticket == nil {
+		return nil, nil, nil
+	}
+	return ticket, nil, nil
+}
+
+// guardrailInspectorAdapter bridges *guardrail.Engine to proxy.GuardrailInspector.
+type guardrailInspectorAdapter struct {
+	engine *guardrail.Engine
+}
+
+func (a *guardrailInspectorAdapter) Inspect(ctx context.Context, req proxy.GuardrailRequest) (*proxy.GuardrailDecision, error) {
+	in := guardrail.InspectInput{
+		RequestID: req.RequestID,
+		Protocol:  req.Protocol,
+		Model:     req.Model,
+		Body:      req.Body,
+	}
+	if req.Principal != nil {
+		in.Subject = req.Principal.Subject
+		in.NodeName = req.Principal.NodeName
+	}
+	dec, err := a.engine.InspectRequest(ctx, in)
+	if err != nil || dec == nil {
+		return nil, err
+	}
+	return &proxy.GuardrailDecision{
+		Action:       dec.Action,
+		ModifiedBody: dec.ModifiedBody,
+		Hits:         dec.Hits,
+		Reason:       dec.Reason,
+		StatusCode:   dec.StatusCode,
+	}, nil
+}
+
+// budgetReporterAdapter bridges *quota.Manager to api.BudgetReporter.
+type budgetReporterAdapter struct {
+	mgr *quota.Manager
+}
+
+func (a *budgetReporterAdapter) StatusForPrincipal(ctx context.Context, p *auth.Principal) ([]api.BudgetStatusItem, error) {
+	statuses, err := a.mgr.StatusForPrincipal(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]api.BudgetStatusItem, len(statuses))
+	for i, s := range statuses {
+		out[i] = api.BudgetStatusItem{
+			Scope:           s.Scope,
+			DailyUSD:        s.DailyUSD,
+			DailySpentUSD:   s.DailySpentUSD,
+			MonthlyUSD:      s.MonthlyUSD,
+			MonthlySpentUSD: s.MonthlySpentUSD,
+			RPM:             s.RPM,
+			TPM:             s.TPM,
+			MaxConcurrent:   s.MaxConcurrent,
+			SoftAlertPct:    s.SoftAlertPct,
+		}
+	}
+	return out, nil
+}
+
+func (a *budgetReporterAdapter) ListAllStatuses(ctx context.Context) ([]api.BudgetAdminItem, error) {
+	statuses, err := a.mgr.ListAllStatuses(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]api.BudgetAdminItem, len(statuses))
+	for i, s := range statuses {
+		out[i] = api.BudgetAdminItem{
+			Scope:           s.Scope,
+			RPM:             s.RPM,
+			TPM:             s.TPM,
+			MaxConcurrent:   s.MaxConcurrent,
+			DailyUSD:        s.DailyUSD,
+			MonthlyUSD:      s.MonthlyUSD,
+			DailySpentUSD:   s.DailySpentUSD,
+			MonthlySpentUSD: s.MonthlySpentUSD,
+			SoftAlertPct:    s.SoftAlertPct,
+			Enabled:         s.Enabled,
+			Source:          s.Source,
+			UpdatedAt:       s.UpdatedAt,
+		}
+	}
+	return out, nil
+}
+
+// guardrailTesterAdapter bridges *guardrail.Engine to api.GuardrailTester.
+type guardrailTesterAdapter struct {
+	engine *guardrail.Engine
+}
+
+func (a *guardrailTesterAdapter) TestText(ctx context.Context, text string) (*api.GuardrailTestResult, error) {
+	res, err := a.engine.TestText(ctx, text)
+	if err != nil || res == nil {
+		return nil, err
+	}
+	matches := make([]api.GuardrailMatch, len(res.Matches))
+	for i, m := range res.Matches {
+		matches[i] = api.GuardrailMatch{
+			RuleID:   m.RuleID,
+			RuleName: m.RuleName,
+			Category: m.Category,
+			Action:   m.Action,
+		}
+	}
+	return &api.GuardrailTestResult{
+		Action:       res.Action,
+		RedactedText: res.RedactedText,
+		Matches:      matches,
+	}, nil
+}
+
+// webhookTesterAdapter bridges *guardrail.Engine to api.WebhookTester.
+type webhookTesterAdapter struct {
+	engine *guardrail.Engine
+}
+
+func (a *webhookTesterAdapter) PingWebhook(ctx context.Context, wh store.Webhook) (*api.WebhookTestResult, error) {
+	res, err := a.engine.PingWebhook(ctx, wh)
+	if err != nil || res == nil {
+		return nil, err
+	}
+	return &api.WebhookTestResult{
+		OK:         res.OK,
+		StatusCode: res.StatusCode,
+		LatencyMS:  res.LatencyMS,
+		Message:    res.Message,
+	}, nil
 }
 
 func flattenHeaders(h http.Header) map[string]string {
@@ -501,7 +751,14 @@ server:
     auth_key: "${HEADLAMP_AUTH_KEY}"
     state_dir: "./data"
   tls:
+    # Supported modes: none | static | acme_dns01
     mode: none
+    # For automated HTTPS on Headscale via ACME DNS-01:
+    # mode: acme_dns01
+    # domain: "headlamp.internal.example.com"
+    # acme_email: "ops@example.com"
+    # dns_provider: cloudflare # cloudflare | webhook
+    # dns_api_token: "${HEADLAMP_TLS_DNS_API_TOKEN}"
   local_listen: "127.0.0.1:8080"
   dev_mode: true
   dev_user: "dev@local"
@@ -558,6 +815,41 @@ routes:
     fallbacks:
       - provider: openai
         model: "gpt-4.1"
+
+# Optional rate limits & USD spend budgets (scopes: "*", "tag:<name>", or user subject):
+# budgets:
+#   - scope: "*"
+#     rpm: 120
+#     tpm: 200000
+#     max_concurrent: 20
+#     daily_usd: 50.0
+#     monthly_usd: 500.0
+#     soft_alert_pct: 80
+
+guardrails:
+  builtin_defaults: true
+  # rules:
+  #   - id: custom-internal-token
+  #     name: Internal Service Token
+  #     category: secret
+  #     pattern: 'int_tok_[A-Za-z0-9]{24,}'
+  #     action: redact # log_only | redact | block
+
+# Optional sync_review or async_event webhooks (HMAC-SHA256 signed):
+# webhooks:
+#   - id: team-alerts
+#     name: Team Alert Webhook
+#     url: "https://hooks.example.com/headlamp"
+#     type: async_event # sync_review | async_event
+#     secret: "${HEADLAMP_WEBHOOK_SECRET}"
+#     events:
+#       - budget.threshold
+#       - budget.exceeded
+#       - guardrail.triggered
+#       - upstream.fallback
+#       - upstream.error
+#     timeout_ms: 2000
+#     fail_open: true
 
 audit:
   store_payloads: false

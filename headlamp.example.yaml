@@ -31,7 +31,14 @@ server:
     # Required when mode is "acme_dns01":
     domain: ""
     acme_email: ""
+    # Optional ACME directory override (defaults to Let's Encrypt production):
+    acme_directory_url: ""
+    # Supported DNS-01 solvers: cloudflare | webhook
     dns_provider: ""
+    # API token for Cloudflare or Authorization Bearer for webhook (or HEADLAMP_TLS_DNS_API_TOKEN):
+    dns_api_token: "${HEADLAMP_TLS_DNS_API_TOKEN}"
+    # Required when dns_provider is "webhook":
+    dns_webhook_url: ""
 
   # Optional local HTTP listener for development, /healthz, or non-tailnet callers.
   # Must bind a loopback host (127.0.0.1, ::1, or localhost) whenever dev_mode is true.
@@ -118,6 +125,43 @@ routes:
     fallbacks:
       - provider: openai
         model: "gpt-4.1-mini"
+
+# Rate limiting (RPM/TPM/concurrency) and daily/monthly USD spend budgets.
+# Scopes: "*" (global), "tag:<name>", or a specific user subject (e.g. "alice@example.com").
+budgets:
+  - scope: "*"
+    rpm: 120
+    tpm: 200000
+    max_concurrent: 20
+    daily_usd: 50.0
+    monthly_usd: 500.0
+    soft_alert_pct: 80
+
+# Local zero-latency secret/PII guardrail rules (seed built-in detectors by default).
+guardrails:
+  builtin_defaults: true
+  rules:
+    # - id: custom-internal-token
+    #   name: Internal Service Token
+    #   category: secret # secret | pii | custom
+    #   pattern: 'int_tok_[A-Za-z0-9]{24,}'
+    #   action: redact # log_only | redact | block
+
+# Optional synchronous review webhooks (sync_review) and asynchronous event alerts (async_event).
+webhooks:
+  # - id: team-alerts
+  #   name: Team Alert Webhook
+  #   url: "https://hooks.example.com/headlamp"
+  #   type: async_event # sync_review | async_event
+  #   secret: "${HEADLAMP_WEBHOOK_SECRET}"
+  #   events:
+  #     - budget.threshold
+  #     - budget.exceeded
+  #     - guardrail.triggered
+  #     - upstream.fallback
+  #     - upstream.error
+  #   timeout_ms: 2000
+  #   fail_open: true
 
 audit:
   # Privacy-minimal default: metadata in usage_logs only, full payloads disabled.

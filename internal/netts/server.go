@@ -42,11 +42,19 @@ func WithDebugLogf(fn LogFunc) Option {
 	}
 }
 
+// WithACMEOptions forwards ACME options (such as custom solvers or HTTP clients) when tls.mode is acme_dns01.
+func WithACMEOptions(opts ...ACMEOption) Option {
+	return func(s *Server) {
+		s.acmeOpts = append(s.acmeOpts, opts...)
+	}
+}
+
 // Server manages Headlamp's embedded Tailnet (tsnet) listener and optional local HTTP listener.
 type Server struct {
 	cfg       config.ServerConfig
 	userLogf  LogFunc
 	debugLogf LogFunc
+	acmeOpts  []ACMEOption
 
 	mu          sync.Mutex
 	started     bool
@@ -54,6 +62,7 @@ type Server struct {
 	tsSrv       *tsnet.Server
 	localClient *local.Client
 	status      *ipnstate.Status
+	acmeMgr     *ACMEManager
 	tailnetLn   net.Listener
 	localLn     net.Listener
 	tailnetHTTP *http.Server
@@ -66,6 +75,13 @@ func NewServer(cfg config.ServerConfig, opts ...Option) (*Server, error) {
 		return nil, errors.New("netts: at least one listener must be enabled (tsnet.enabled or local_listen)")
 	}
 
+	s := &Server{cfg: cfg}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+
 	if cfg.TSNet.Enabled {
 		if strings.TrimSpace(cfg.TSNet.Hostname) == "" {
 			return nil, errors.New("netts: tsnet.hostname is required when tsnet is enabled")
@@ -73,25 +89,20 @@ func NewServer(cfg config.ServerConfig, opts ...Option) (*Server, error) {
 		if strings.TrimSpace(cfg.TSNet.StateDir) == "" {
 			return nil, errors.New("netts: tsnet.state_dir is required when tsnet is enabled")
 		}
-		if err := validateTLSConfig(cfg.TLS); err != nil {
+		if err := validateTLSConfig(cfg.TLS, len(s.acmeOpts) > 0); err != nil {
 			return nil, err
 		}
 	}
 
-	s := &Server{cfg: cfg}
-	for _, opt := range opts {
-		if opt != nil {
-			opt(s)
-		}
-	}
 	return s, nil
 }
 
-// WrapTLSListener applies Headlamp's configured TLS mode to an existing TCP listener.
+// WrapTLSListener applies non-ACME TLS modes ("none" or "static") to an existing TCP listener.
+// For tls.mode "acme_dns01", use WrapTLSListenerWithACME (or Server.Start), which also manages
+// certificate persistence and background renewal.
 //
 // Headlamp intentionally never calls tsnet.Server.ListenTLS because Headscale does not provision
-// Tailscale MagicDNS HTTPS certificates (CertDomains is empty). Instead, callers wrap a plain
-// tsnet.Server.Listen("tcp", ...) listener via WrapTLSListener.
+// Tailscale MagicDNS HTTPS certificates (CertDomains is empty).
 func WrapTLSListener(ln net.Listener, tlsCfg config.TLSConfig) (net.Listener, error) {
 	if ln == nil {
 		return nil, errors.New("netts: nil listener")
@@ -108,16 +119,44 @@ func WrapTLSListener(ln net.Listener, tlsCfg config.TLSConfig) (net.Listener, er
 		}
 		return tls.NewListener(ln, tlsConfig), nil
 	case config.TLSModeACMEDNS01:
-		return nil, fmt.Errorf(
-			"netts: tls.mode %q (ACME DNS-01 automatic HTTPS) lands in M2 and is not yet available in M1; use %q or %q",
-			config.TLSModeACMEDNS01, config.TLSModeNone, config.TLSModeStatic,
-		)
+		return nil, errors.New("netts: tls.mode acme_dns01 requires stateDir and context; use WrapTLSListenerWithACME")
 	default:
 		return nil, fmt.Errorf("netts: unsupported tls.mode %q", tlsCfg.Mode)
 	}
 }
 
-func validateTLSConfig(tlsCfg config.TLSConfig) error {
+// WrapTLSListenerWithACME applies Headlamp's configured TLS mode ("none", "static", or "acme_dns01")
+// to an existing TCP listener. When tls.mode is "acme_dns01", it ensures a valid certificate is
+// loaded/issued via DNS-01, starts the background renewal loop, and wraps ln with tls.NewListener
+// using dynamic GetCertificate (never calling tsnet.Server.ListenTLS). Callers must Close the
+// returned *ACMEManager (when non-nil) on shutdown.
+func WrapTLSListenerWithACME(ctx context.Context, ln net.Listener, tlsCfg config.TLSConfig, stateDir string, opts ...ACMEOption) (net.Listener, *ACMEManager, error) {
+	if ln == nil {
+		return nil, nil, errors.New("netts: nil listener")
+	}
+
+	mode := normalizedTLSMode(tlsCfg.Mode)
+	switch mode {
+	case config.TLSModeNone, config.TLSModeStatic:
+		wrapped, err := WrapTLSListener(ln, tlsCfg)
+		return wrapped, nil, err
+	case config.TLSModeACMEDNS01:
+		mgr, err := NewACMEManager(tlsCfg, stateDir, opts...)
+		if err != nil {
+			return nil, nil, err
+		}
+		if _, err := mgr.EnsureCertificate(ctx); err != nil {
+			_ = mgr.Close()
+			return nil, nil, err
+		}
+		mgr.StartRenewalLoop()
+		return tls.NewListener(ln, mgr.TLSConfig()), mgr, nil
+	default:
+		return nil, nil, fmt.Errorf("netts: unsupported tls.mode %q", tlsCfg.Mode)
+	}
+}
+
+func validateTLSConfig(tlsCfg config.TLSConfig, hasCustomACMEOpts bool) error {
 	mode := normalizedTLSMode(tlsCfg.Mode)
 	switch mode {
 	case config.TLSModeNone:
@@ -128,10 +167,27 @@ func validateTLSConfig(tlsCfg config.TLSConfig) error {
 		}
 		return nil
 	case config.TLSModeACMEDNS01:
-		return fmt.Errorf(
-			"netts: tls.mode %q (ACME DNS-01 automatic HTTPS) lands in M2 and is not yet available in M1; use %q or %q",
-			config.TLSModeACMEDNS01, config.TLSModeNone, config.TLSModeStatic,
-		)
+		if strings.TrimSpace(tlsCfg.Domain) == "" {
+			return errors.New("netts: tls.domain is required when tls.mode is acme_dns01")
+		}
+		if hasCustomACMEOpts {
+			return nil
+		}
+		switch strings.ToLower(strings.TrimSpace(tlsCfg.DNSProvider)) {
+		case config.DNSProviderCloudflare:
+			if strings.TrimSpace(tlsCfg.DNSAPIToken) == "" {
+				return errors.New("netts: tls.dns_api_token is required when tls.dns_provider is cloudflare")
+			}
+			return nil
+		case config.DNSProviderWebhook:
+			if strings.TrimSpace(tlsCfg.DNSWebhookURL) == "" {
+				return errors.New("netts: tls.dns_webhook_url is required when tls.dns_provider is webhook")
+			}
+			return nil
+		default:
+			return fmt.Errorf("netts: tls.dns_provider %q must be %q or %q when tls.mode is acme_dns01",
+				tlsCfg.DNSProvider, config.DNSProviderCloudflare, config.DNSProviderWebhook)
+		}
 	default:
 		return fmt.Errorf("netts: unsupported tls.mode %q", tlsCfg.Mode)
 	}
@@ -162,7 +218,7 @@ func normalizedTLSMode(mode string) string {
 }
 
 // Start brings up the embedded tsnet node (when enabled) and opens all configured listeners.
-// Call Start before Authenticator(), LocalClient(), or Serve().
+// Call Start before Authenticator(), LocalClient(), or Serve()/ServeHandlers().
 func (s *Server) Start(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closed {
@@ -179,6 +235,7 @@ func (s *Server) Start(ctx context.Context) error {
 		tsSrv       *tsnet.Server
 		localClient *local.Client
 		status      *ipnstate.Status
+		acmeMgr     *ACMEManager
 		tailnetLn   net.Listener
 		localLn     net.Listener
 	)
@@ -190,24 +247,48 @@ func (s *Server) Start(ctx context.Context) error {
 		if tailnetLn != nil {
 			_ = tailnetLn.Close()
 		}
+		if acmeMgr != nil {
+			_ = acmeMgr.Close()
+		}
 		if tsSrv != nil {
 			_ = tsSrv.Close()
 		}
 	}
 
 	if s.cfg.TSNet.Enabled {
+		tlsMode := normalizedTLSMode(s.cfg.TLS.Mode)
+
 		// Fail fast on TLS configuration/cert errors before contacting Headscale/Tailscale.
-		if err := validateTLSConfig(s.cfg.TLS); err != nil {
+		if err := validateTLSConfig(s.cfg.TLS, len(s.acmeOpts) > 0); err != nil {
 			return err
 		}
-		if normalizedTLSMode(s.cfg.TLS.Mode) == config.TLSModeStatic {
+		switch tlsMode {
+		case config.TLSModeStatic:
 			if _, err := loadStaticTLSConfig(s.cfg.TLS); err != nil {
 				return err
 			}
+		case config.TLSModeACMEDNS01:
+			opts := make([]ACMEOption, 0, len(s.acmeOpts)+1)
+			if s.userLogf != nil {
+				opts = append(opts, WithACMELogf(s.userLogf))
+			}
+			opts = append(opts, s.acmeOpts...)
+
+			var err error
+			acmeMgr, err = NewACMEManager(s.cfg.TLS, s.cfg.TSNet.StateDir, opts...)
+			if err != nil {
+				return err
+			}
+			if _, err := acmeMgr.EnsureCertificate(ctx); err != nil {
+				cleanup()
+				return err
+			}
+			acmeMgr.StartRenewalLoop()
 		}
 
 		tsDir := filepath.Join(s.cfg.TSNet.StateDir, "tsnet")
 		if err := os.MkdirAll(tsDir, 0o700); err != nil {
+			cleanup()
 			return fmt.Errorf("netts: create tsnet state dir %q: %w", tsDir, err)
 		}
 
@@ -236,7 +317,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 		port := s.cfg.TSNet.ListenPort
 		if port == 0 {
-			if normalizedTLSMode(s.cfg.TLS.Mode) == config.TLSModeNone {
+			if tlsMode == config.TLSModeNone {
 				port = 80
 			} else {
 				port = 443
@@ -251,12 +332,16 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 		tailnetLn = rawLn
 
-		wrappedLn, err := WrapTLSListener(rawLn, s.cfg.TLS)
-		if err != nil {
-			cleanup()
-			return err
+		if acmeMgr != nil {
+			tailnetLn = tls.NewListener(rawLn, acmeMgr.TLSConfig())
+		} else {
+			wrappedLn, err := WrapTLSListener(rawLn, s.cfg.TLS)
+			if err != nil {
+				cleanup()
+				return err
+			}
+			tailnetLn = wrappedLn
 		}
-		tailnetLn = wrappedLn
 	}
 
 	if addr := strings.TrimSpace(s.cfg.LocalListen); addr != "" {
@@ -278,6 +363,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.tsSrv = tsSrv
 	s.localClient = localClient
 	s.status = status
+	s.acmeMgr = acmeMgr
 	s.tailnetLn = tailnetLn
 	s.localLn = localLn
 	s.started = true
@@ -379,7 +465,7 @@ func (s *Server) ServeHandlers(tailnetHandler, localHandler http.Handler) error 
 	return errors.Join(errs...)
 }
 
-// Close gracefully shuts down all HTTP servers, closes listeners, and stops tsnet.
+// Close gracefully shuts down all HTTP servers, stops ACME renewal, closes listeners, and stops tsnet.
 // Close is safe to call multiple times and concurrently with Serve.
 func (s *Server) Close(ctx context.Context) error {
 	if ctx == nil {
@@ -397,6 +483,7 @@ func (s *Server) Close(ctx context.Context) error {
 	localHTTP := s.localHTTP
 	tailnetLn := s.tailnetLn
 	localLn := s.localLn
+	acmeMgr := s.acmeMgr
 	tsSrv := s.tsSrv
 	s.mu.Unlock()
 
@@ -419,6 +506,12 @@ func (s *Server) Close(ctx context.Context) error {
 	} else if localLn != nil {
 		if err := localLn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			errs = append(errs, fmt.Errorf("netts: close local listener: %w", err))
+		}
+	}
+
+	if acmeMgr != nil {
+		if err := acmeMgr.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("netts: close acme manager: %w", err))
 		}
 	}
 
@@ -450,6 +543,13 @@ func (s *Server) Authenticator() auth.Authenticator {
 		return nil
 	}
 	return NewTSNetAuthenticator(s.localClient)
+}
+
+// ACMEManager returns the active ACME DNS-01 certificate manager, or nil when not in acme_dns01 mode.
+func (s *Server) ACMEManager() *ACMEManager {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.acmeMgr
 }
 
 // TailnetStatus returns the ipnstate.Status captured when tsnet came up, or nil if tsnet is disabled.

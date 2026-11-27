@@ -109,6 +109,28 @@ func LoadFromBytes(data []byte) (*PricingTable, error) {
 	}, nil
 }
 
+// ExactModels returns a cloned map of exact model pricing entries (USD per 1M tokens).
+func (t *PricingTable) ExactModels() map[string]ModelPrice {
+	if t == nil {
+		return map[string]ModelPrice{}
+	}
+	out := make(map[string]ModelPrice, len(t.models))
+	for k, v := range t.models {
+		out[k] = v
+	}
+	return out
+}
+
+// Patterns returns a cloned slice of ordered wildcard pricing patterns (USD per 1M tokens).
+func (t *PricingTable) Patterns() []PatternPrice {
+	if t == nil || len(t.patterns) == 0 {
+		return []PatternPrice{}
+	}
+	out := make([]PatternPrice, len(t.patterns))
+	copy(out, t.patterns)
+	return out
+}
+
 // Lookup finds pricing for (providerType, model) using exact match first,
 // then ordered glob match via doublestar.
 func (t *PricingTable) Lookup(providerType, model string) (ModelPrice, bool) {

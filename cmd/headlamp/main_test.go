@@ -13,17 +13,23 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/zacharykka/headlamp/internal/api"
 	"github.com/zacharykka/headlamp/internal/config"
 	"github.com/zacharykka/headlamp/internal/crypto"
+	"github.com/zacharykka/headlamp/internal/guardrail"
 	"github.com/zacharykka/headlamp/internal/metering"
 	"github.com/zacharykka/headlamp/internal/netts"
 	"github.com/zacharykka/headlamp/internal/policy"
 	"github.com/zacharykka/headlamp/internal/proxy"
+	"github.com/zacharykka/headlamp/internal/quota"
 	"github.com/zacharykka/headlamp/internal/store"
+	"github.com/zacharykka/headlamp/web"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
@@ -301,8 +307,8 @@ audit:
 	}
 
 	// P0-2 listener isolation: separate tailnetHandler (TSNet ONLY) vs localHandler (tokens + dev_mock).
-	tailnetHandler := buildHandler(gw, eval, netts.NewTSNetAuthenticator(whoIs))
-	localHandler := buildHandler(gw, eval, buildLocalAuthChain(cfg.Server))
+	tailnetHandler := buildHandler(gw, nil, eval, netts.NewTSNetAuthenticator(whoIs))
+	localHandler := buildHandler(gw, nil, eval, buildLocalAuthChain(cfg.Server))
 
 	doReq := func(h http.Handler, remoteAddr, method, target, body string, headers map[string]string) *httptest.ResponseRecorder {
 		t.Helper()
@@ -605,5 +611,431 @@ func TestCLIInitAndVersion(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "headlamp ") {
 		t.Fatalf("unexpected version output: %q", stdout.String())
+	}
+}
+
+func TestM2FullStackGovernanceAndUI(t *testing.T) {
+	// 1. Mock OpenAI upstream capturing every forwarded request body.
+	var (
+		upstreamMu     sync.Mutex
+		upstreamBodies []string
+	)
+	openAIUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		upstreamMu.Lock()
+		upstreamBodies = append(upstreamBodies, string(body))
+		upstreamMu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		// On gpt-5: 1000 input ($0.00125) + 500 output ($0.005) = $0.00625 per call.
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-m2","object":"chat.completion","model":"gpt-5","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":500,"total_tokens":1500}}`)
+	}))
+	defer openAIUpstream.Close()
+
+	// 2. Mock webhook receiver verifying HMAC-SHA256 signatures on every delivery.
+	const webhookSecret = "whsec_m2_e2e_signing_secret"
+	type receivedWebhook struct {
+		Event    string
+		Body     string
+		SigValid bool
+	}
+	var (
+		whMu   sync.Mutex
+		whEvts []receivedWebhook
+	)
+	webhookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		sig := r.Header.Get("X-Headlamp-Signature")
+		whMu.Lock()
+		whEvts = append(whEvts, receivedWebhook{
+			Event:    r.Header.Get("X-Headlamp-Event"),
+			Body:     string(raw),
+			SigValid: guardrail.VerifySignature(webhookSecret, raw, sig),
+		})
+		whMu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer webhookServer.Close()
+
+	// 3. Configure and assemble the complete M2 stack identically to runServe.
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "headlamp.db")
+	cfgPath := filepath.Join(tmpDir, "headlamp.yaml")
+
+	masterKeyBytes, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	t.Setenv("HEADLAMP_MASTER_KEY", hex.EncodeToString(masterKeyBytes))
+
+	yamlCfg := fmt.Sprintf(`
+server:
+  tsnet:
+    enabled: false
+    state_dir: %q
+  local_listen: "127.0.0.1:0"
+  dev_mode: true
+  dev_user: "dev@local"
+storage:
+  driver: sqlite
+  dsn: %q
+providers:
+  - name: openai
+    type: openai
+    base_url: %q
+    api_key: "sk-openai-m2-secret"
+    models: ["gpt-5"]
+guardrails:
+  builtin_defaults: true
+audit:
+  store_payloads: false
+  retention_days: 7
+`, tmpDir, dbPath, openAIUpstream.URL)
+
+	if err := os.WriteFile(cfgPath, []byte(yamlCfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+
+	ctx := context.Background()
+	st, _, _, err := openStore(ctx, cfg)
+	if err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	if err := st.SyncConfig(ctx, cfg); err != nil {
+		t.Fatalf("SyncConfig: %v", err)
+	}
+
+	activeAuditCfg, err := loadActiveAuditConfig(ctx, st, cfg.Audit)
+	if err != nil {
+		t.Fatalf("loadActiveAuditConfig: %v", err)
+	}
+	if activeAuditCfg.StorePayloads || activeAuditCfg.RetentionDays != 7 {
+		t.Fatalf("initial activeAuditCfg = %+v, want StorePayloads=false RetentionDays=7", activeAuditCfg)
+	}
+
+	pricing, err := metering.LoadDefault()
+	if err != nil {
+		t.Fatalf("LoadDefault: %v", err)
+	}
+
+	grEngine, err := guardrail.NewEngine(guardrail.EngineConfig{Store: st})
+	if err != nil {
+		t.Fatalf("guardrail.NewEngine: %v", err)
+	}
+	quotaMgr := quota.NewManager(st, quota.WithOnAlert(func(ev quota.AlertEvent) {
+		grEngine.Emit(ev.EventType, ev)
+	}))
+	recorder := metering.NewRecorder(st, activeAuditCfg, pricing, metering.RecorderOptions{
+		DisableAutoPurge: true,
+		OnRecorded:       quotaMgr.OnUsageRecorded,
+	})
+	eval := policy.NewEvaluator()
+
+	gw, err := proxy.NewGateway(proxy.GatewayConfig{
+		Store:      st,
+		Authorizer: eval,
+		Telemetry:  &telemetryAdapter{recorder: recorder},
+		Quota:      &quotaLimiterAdapter{mgr: quotaMgr},
+		Guardrails: &guardrailInspectorAdapter{engine: grEngine},
+		Events:     grEngine,
+	})
+	if err != nil {
+		t.Fatalf("proxy.NewGateway: %v", err)
+	}
+
+	staticFS, err := web.DistFS()
+	if err != nil {
+		t.Fatalf("web.DistFS: %v", err)
+	}
+	apiHandler, err := api.NewHandler(api.Config{
+		Store:           st,
+		Policy:          eval,
+		Pricing:         pricing,
+		AuditController: recorder,
+		BudgetReporter:  &budgetReporterAdapter{mgr: quotaMgr},
+		GuardrailTester: &guardrailTesterAdapter{engine: grEngine},
+		WebhookTester:   &webhookTesterAdapter{engine: grEngine},
+		StaticFS:        staticFS,
+	})
+	if err != nil {
+		t.Fatalf("api.NewHandler: %v", err)
+	}
+
+	whoIs := &fakeWhoIsClient{
+		peers: map[string]*apitype.WhoIsResponse{
+			"100.64.0.1": {
+				Node: &tailcfg.Node{
+					ComputedName: "admin-workstation",
+					Addresses:    []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+				},
+				UserProfile: &tailcfg.UserProfile{
+					LoginName:   "admin@example.com",
+					DisplayName: "Admin",
+				},
+				CapMap: tailcfg.PeerCapMap{
+					policy.CapHeadlampGateway: []tailcfg.RawMessage{
+						`{"role":"admin","models":["**"]}`,
+					},
+				},
+			},
+			"100.64.0.10": {
+				Node: &tailcfg.Node{
+					ComputedName: "alice-laptop",
+					Addresses:    []netip.Prefix{netip.MustParsePrefix("100.64.0.10/32")},
+				},
+				UserProfile: &tailcfg.UserProfile{
+					LoginName:   "alice@example.com",
+					DisplayName: "Alice",
+				},
+				CapMap: tailcfg.PeerCapMap{
+					policy.CapHeadlampGateway: []tailcfg.RawMessage{
+						`{"role":"user","models":["openai/*"]}`,
+					},
+				},
+			},
+		},
+	}
+
+	handler := buildHandler(gw, apiHandler, eval, netts.NewTSNetAuthenticator(whoIs))
+
+	doReq := func(remoteAddr, method, target, body string, headers map[string]string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, target, strings.NewReader(body))
+		req.RemoteAddr = remoteAddr
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	sameOrigin := map[string]string{"Sec-Fetch-Site": "same-origin"}
+
+	// (a) Embedded SPA routing vs JSON API 404 vs unauthenticated protection.
+	if rec := doReq("192.0.2.1:9999", http.MethodGet, "/healthz", "", nil); rec.Code != http.StatusOK {
+		t.Fatalf("GET /healthz unauthenticated = %d, want 200", rec.Code)
+	}
+	if rec := doReq("192.0.2.1:9999", http.MethodGet, "/", "", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET / unauthenticated = %d, want 401", rec.Code)
+	}
+	recRoot := doReq("100.64.0.10:50001", http.MethodGet, "/", "", nil)
+	if recRoot.Code != http.StatusOK || !strings.Contains(recRoot.Header().Get("Content-Type"), "text/html") || !strings.Contains(strings.ToLower(recRoot.Body.String()), "<html") {
+		t.Fatalf("GET / SPA failed: code=%d ct=%q body=%q", recRoot.Code, recRoot.Header().Get("Content-Type"), recRoot.Body.String())
+	}
+	recRoute := doReq("100.64.0.1:50002", http.MethodGet, "/security", "", nil)
+	if recRoute.Code != http.StatusOK || !strings.Contains(recRoute.Header().Get("Content-Type"), "text/html") {
+		t.Fatalf("GET /security SPA fallback failed: code=%d ct=%q", recRoute.Code, recRoute.Header().Get("Content-Type"))
+	}
+	recAPINotFound := doReq("100.64.0.1:50002", http.MethodGet, "/api/v1/unknown", "", nil)
+	if recAPINotFound.Code != http.StatusNotFound || !strings.Contains(recAPINotFound.Header().Get("Content-Type"), "application/json") {
+		t.Fatalf("GET /api/v1/unknown must return 404 JSON, got code=%d ct=%q body=%q", recAPINotFound.Code, recAPINotFound.Header().Get("Content-Type"), recAPINotFound.Body.String())
+	}
+
+	// (b) User /api/v1/me, admin RBAC enforcement, and CSRF protection.
+	recMe := doReq("100.64.0.10:50001", http.MethodGet, "/api/v1/me", "", nil)
+	if recMe.Code != http.StatusOK || !strings.Contains(recMe.Body.String(), `"alice@example.com"`) || !strings.Contains(recMe.Body.String(), `"is_admin":false`) {
+		t.Fatalf("GET /api/v1/me (alice) = %d: %s", recMe.Code, recMe.Body.String())
+	}
+	if recDeny := doReq("100.64.0.10:50001", http.MethodGet, "/api/v1/admin/overview", "", nil); recDeny.Code != http.StatusForbidden {
+		t.Fatalf("non-admin GET /api/v1/admin/overview = %d, want 403", recDeny.Code)
+	}
+	if recCSRF := doReq("100.64.0.1:50002", http.MethodPut, "/api/v1/admin/settings/audit", `{"store_payloads":true,"retention_days":14}`, map[string]string{"Sec-Fetch-Site": "cross-site"}); recCSRF.Code != http.StatusForbidden {
+		t.Fatalf("cross-site PUT audit settings = %d, want 403", recCSRF.Code)
+	}
+
+	// (c) Enable audit payload storage live via Admin API and confirm runtime + DB persistence.
+	recAudit := doReq("100.64.0.1:50002", http.MethodPut, "/api/v1/admin/settings/audit", `{"store_payloads":true,"retention_days":14}`, sameOrigin)
+	if recAudit.Code != http.StatusOK {
+		t.Fatalf("PUT /api/v1/admin/settings/audit = %d: %s", recAudit.Code, recAudit.Body.String())
+	}
+	if got := recorder.AuditConfig(); !got.StorePayloads || got.RetentionDays != 14 {
+		t.Fatalf("live AuditConfig not updated: %+v", got)
+	}
+	reloadedAudit, err := loadActiveAuditConfig(ctx, st, cfg.Audit)
+	if err != nil || !reloadedAudit.StorePayloads || reloadedAudit.RetentionDays != 14 {
+		t.Fatalf("persisted audit settings reload failed: %+v err=%v", reloadedAudit, err)
+	}
+
+	// (d) Configure async webhook, custom guardrail rule, and Alice's daily USD budget via Admin API.
+	whBody := fmt.Sprintf(`{"id":"m2-alerts","name":"M2 Alerts","url":%q,"type":"async_event","secret":%q,"events":["guardrail.triggered","budget.threshold","budget.exceeded"],"timeout_ms":2000,"fail_open":true,"enabled":true}`, webhookServer.URL, webhookSecret)
+	if rec := doReq("100.64.0.1:50002", http.MethodPost, "/api/v1/admin/webhooks", whBody, sameOrigin); rec.Code != http.StatusCreated {
+		t.Fatalf("POST /api/v1/admin/webhooks = %d: %s", rec.Code, rec.Body.String())
+	}
+	recPing := doReq("100.64.0.1:50002", http.MethodPost, "/api/v1/admin/webhooks/m2-alerts/test", `{}`, sameOrigin)
+	if recPing.Code != http.StatusOK || !strings.Contains(recPing.Body.String(), `"ok":true`) {
+		t.Fatalf("POST /api/v1/admin/webhooks/m2-alerts/test = %d: %s", recPing.Code, recPing.Body.String())
+	}
+
+	if rec := doReq("100.64.0.1:50002", http.MethodPost, "/api/v1/admin/guardrails", `{"id":"custom-corp-token","name":"Corp Token","category":"secret","pattern":"CORP_[0-9]{6}","action":"redact","enabled":true}`, sameOrigin); rec.Code != http.StatusCreated {
+		t.Fatalf("POST /api/v1/admin/guardrails = %d: %s", rec.Code, rec.Body.String())
+	}
+	recGRTest := doReq("100.64.0.1:50002", http.MethodPost, "/api/v1/admin/guardrails/test", `{"text":"leak AKIAIOSFODNN7EXAMPLE and CORP_987654"}`, sameOrigin)
+	if recGRTest.Code != http.StatusOK || !strings.Contains(recGRTest.Body.String(), `"action":"redact"`) || strings.Contains(recGRTest.Body.String(), "AKIAIOSFODNN7EXAMPLE") || strings.Contains(recGRTest.Body.String(), "CORP_987654") {
+		t.Fatalf("POST /api/v1/admin/guardrails/test = %d: %s", recGRTest.Code, recGRTest.Body.String())
+	}
+
+	// Daily USD cap $0.005 (< $0.00625 cost of 1 gpt-5 request) with 50% soft alert.
+	if rec := doReq("100.64.0.1:50002", http.MethodPost, "/api/v1/admin/budgets", `{"scope":"alice@example.com","rpm":20,"tpm":100000,"max_concurrent":5,"daily_usd":0.005,"soft_alert_pct":50,"enabled":true}`, sameOrigin); rec.Code != http.StatusCreated {
+		t.Fatalf("POST /api/v1/admin/budgets = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// (e) Live LLM call with embedded AWS key + custom secret -> redacted BEFORE upstream, logged, webhook emitted.
+	recRedact := doReq("100.64.0.10:50001", http.MethodPost, "/v1/chat/completions",
+		`{"model":"gpt-5","messages":[{"role":"user","content":"use key AKIAIOSFODNN7EXAMPLE and CORP_987654"}]}`,
+		nil,
+	)
+	if recRedact.Code != http.StatusOK {
+		t.Fatalf("redacted LLM call = %d: %s", recRedact.Code, recRedact.Body.String())
+	}
+	upstreamMu.Lock()
+	if len(upstreamBodies) != 1 {
+		upstreamMu.Unlock()
+		t.Fatalf("expected 1 upstream call, got %d", len(upstreamBodies))
+	}
+	seenUpstream := upstreamBodies[0]
+	upstreamMu.Unlock()
+	if strings.Contains(seenUpstream, "AKIAIOSFODNN7EXAMPLE") || strings.Contains(seenUpstream, "CORP_987654") || !strings.Contains(seenUpstream, "[REDACTED") {
+		t.Fatalf("upstream received unredacted secret: %s", seenUpstream)
+	}
+
+	// (f) Live LLM call with PEM private key -> blocked (400), upstream NOT called, raw key NOT stored in audit_payloads.
+	const pemSecret = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA1234567890secretpemmaterial\n-----END RSA PRIVATE KEY-----"
+	pemReq, _ := json.Marshal(map[string]any{
+		"model":    "gpt-5",
+		"messages": []map[string]string{{"role": "user", "content": pemSecret}},
+	})
+	recBlock := doReq("100.64.0.10:50001", http.MethodPost, "/v1/chat/completions", string(pemReq), nil)
+	if recBlock.Code != http.StatusBadRequest {
+		t.Fatalf("PEM private key request = %d, want 400: %s", recBlock.Code, recBlock.Body.String())
+	}
+	upstreamMu.Lock()
+	if len(upstreamBodies) != 1 {
+		upstreamMu.Unlock()
+		t.Fatalf("blocked request must not reach upstream, got %d calls", len(upstreamBodies))
+	}
+	upstreamMu.Unlock()
+
+	// (g) Wait until async metering flushes request (e) into quotaMgr (Alice's daily spend >= $0.005).
+	deadline := time.Now().Add(3 * time.Second)
+	var spent float64
+	for time.Now().Before(deadline) {
+		recMeCheck := doReq("100.64.0.10:50001", http.MethodGet, "/api/v1/me", "", nil)
+		if recMeCheck.Code == http.StatusOK {
+			var meResp struct {
+				Budgets []api.BudgetStatusItem `json:"budget_status"`
+			}
+			if err := json.Unmarshal(recMeCheck.Body.Bytes(), &meResp); err == nil {
+				for _, b := range meResp.Budgets {
+					if b.Scope == "alice@example.com" && b.DailySpentUSD >= 0.005 {
+						spent = b.DailySpentUSD
+						break
+					}
+				}
+			}
+		}
+		if spent >= 0.005 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if spent < 0.005 {
+		t.Fatalf("timed out waiting for Alice daily spend to reach >= $0.005 (got $%.6f)", spent)
+	}
+
+	// (h) Next request by Alice is rejected with HTTP 429 + Retry-After due to daily_usd budget exceeded.
+	recQuota := doReq("100.64.0.10:50001", http.MethodPost, "/v1/chat/completions",
+		`{"model":"gpt-5","messages":[{"role":"user","content":"over budget"}]}`,
+		nil,
+	)
+	if recQuota.Code != http.StatusTooManyRequests {
+		t.Fatalf("over-budget request = %d, want 429: %s", recQuota.Code, recQuota.Body.String())
+	}
+	if recQuota.Header().Get("Retry-After") == "" {
+		t.Fatalf("429 response missing Retry-After header")
+	}
+
+	// (i) Admin budgets endpoint reflects live spend.
+	recAdminBudgets := doReq("100.64.0.1:50002", http.MethodGet, "/api/v1/admin/budgets", "", nil)
+	if recAdminBudgets.Code != http.StatusOK || !strings.Contains(recAdminBudgets.Body.String(), `"alice@example.com"`) {
+		t.Fatalf("GET /api/v1/admin/budgets = %d: %s", recAdminBudgets.Code, recAdminBudgets.Body.String())
+	}
+
+	// (j) Graceful shutdown order: flush recorder FIRST, then drain guardrail webhooks.
+	if err := recorder.Close(ctx); err != nil {
+		t.Fatalf("recorder.Close: %v", err)
+	}
+	if err := grEngine.Close(ctx); err != nil {
+		t.Fatalf("grEngine.Close: %v", err)
+	}
+	if dropped := grEngine.DroppedEvents(); dropped != 0 {
+		t.Fatalf("expected 0 dropped webhook events, got %d", dropped)
+	}
+
+	// (k) Verify usage_logs guardrail + quota metadata and audit_payloads safety.
+	logs, err := st.QueryUsageLogs(ctx, store.UsageFilter{Subject: "alice@example.com"})
+	if err != nil {
+		t.Fatalf("QueryUsageLogs: %v", err)
+	}
+	if len(logs) != 3 {
+		t.Fatalf("expected 3 usage_logs for alice (1 redact 200 + 1 block 400 + 1 quota 429), got %d", len(logs))
+	}
+	var sawRedact, sawBlock, sawQuota429 bool
+	for _, l := range logs {
+		if l.StatusCode == http.StatusTooManyRequests {
+			sawQuota429 = true
+		}
+		switch l.GuardrailAction {
+		case config.GuardrailActionRedact:
+			sawRedact = true
+			if !slices.Contains(l.GuardrailHits, "builtin-aws-access-key") || !slices.Contains(l.GuardrailHits, "custom-corp-token") {
+				t.Fatalf("redact log missing expected hits: %+v", l.GuardrailHits)
+			}
+		case config.GuardrailActionBlock:
+			sawBlock = true
+			if !slices.Contains(l.GuardrailHits, "builtin-pem-private-key") {
+				t.Fatalf("block log missing builtin-pem-private-key hit: %+v", l.GuardrailHits)
+			}
+			payload, err := st.GetAuditPayloadByUsageLogID(ctx, l.ID)
+			if err != nil {
+				t.Fatalf("GetAuditPayloadByUsageLogID(blocked): %v", err)
+			}
+			if payload.RequestBody != "[BLOCKED BY GUARDRAIL]" || strings.Contains(payload.RequestBody, "PRIVATE KEY") {
+				t.Fatalf("blocked audit payload leaked raw secret or wrong sentinel: %q", payload.RequestBody)
+			}
+		}
+	}
+	if !sawRedact || !sawBlock || !sawQuota429 {
+		t.Fatalf("expected redact, block, and 429 usage logs, sawRedact=%v sawBlock=%v sawQuota429=%v", sawRedact, sawBlock, sawQuota429)
+	}
+
+	// (l) Verify async webhooks delivered with valid HMAC-SHA256 signatures for guardrail.triggered, budget.threshold, and budget.exceeded.
+	whMu.Lock()
+	defer whMu.Unlock()
+	var gotEvents []string
+	for _, ev := range whEvts {
+		if !ev.SigValid {
+			t.Fatalf("webhook event %q failed HMAC-SHA256 signature verification (body=%s)", ev.Event, ev.Body)
+		}
+		gotEvents = append(gotEvents, ev.Event)
+	}
+	for _, want := range []string{
+		config.WebhookEventGuardrailTriggered,
+		config.WebhookEventBudgetThreshold,
+		config.WebhookEventBudgetExceeded,
+	} {
+		if !slices.Contains(gotEvents, want) {
+			t.Fatalf("expected async webhook event %q, got events: %v", want, gotEvents)
+		}
 	}
 }

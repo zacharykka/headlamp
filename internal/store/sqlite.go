@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -27,16 +28,24 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
+const runtimeSettingAuditKey = "audit"
+
 type configSnapshot struct {
 	providers       []Provider
 	providersByName map[string]Provider
 	routes          []ModelRoute
 	routesByAlias   map[string]ModelRoute
+	budgets         []Budget
+	budgetsByScope  map[string]Budget
+	guardrails      []GuardrailRule
+	guardrailsByID  map[string]GuardrailRule
+	webhooks        []Webhook
+	webhooksByID    map[string]Webhook
 }
 
 // SQLiteStore implements Store backed by pure-Go modernc.org/sqlite.
-// Decrypted providers and model routes are served from an in-memory snapshot cache
-// that is atomically invalidated on mutations.
+// Decrypted providers, model routes, budgets, guardrail rules, and webhooks are
+// served from an immutable in-memory snapshot cache that is atomically invalidated on mutations.
 type SQLiteStore struct {
 	db     *sql.DB
 	cipher *crypto.Cipher
@@ -227,10 +236,10 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 	return nil
 }
 
-// SyncConfig idempotently syncs YAML providers and model routes into SQLite within a single
-// transaction, deleting any stale source='config' providers/routes removed from cfg while
-// leaving source='local' records untouched.
-// If a YAML provider omits api_key while a stored provider already exists, the existing encrypted key is preserved.
+// SyncConfig idempotently syncs YAML providers, model routes, budgets, built-in + custom
+// guardrail rules, and webhooks into SQLite within a single transaction, pruning any stale
+// source='config' rows removed from cfg while leaving source='local' UI rows untouched.
+// Existing encrypted provider API keys and webhook secrets are preserved when YAML omits them.
 func (s *SQLiteStore) SyncConfig(ctx context.Context, cfg *config.Config) error {
 	if cfg == nil {
 		return nil
@@ -246,7 +255,9 @@ func (s *SQLiteStore) SyncConfig(ctx context.Context, cfg *config.Config) error 
 	defer func() { _ = tx.Rollback() }()
 
 	now := time.Now().UTC()
+	nowStr := formatTime(now)
 
+	// 1. Providers
 	providerNames := make([]string, 0, len(cfg.Providers))
 	for _, p := range cfg.Providers {
 		providerNames = append(providerNames, p.Name)
@@ -258,7 +269,6 @@ func (s *SQLiteStore) SyncConfig(ctx context.Context, cfg *config.Config) error 
 				return fmt.Errorf("store: encrypt api_key for provider %q: %w", p.Name, err)
 			}
 		} else {
-			// Preserve an existing stored key when YAML omits api_key.
 			var existingEnc string
 			err := tx.QueryRowContext(ctx, `SELECT api_key_enc FROM providers WHERE name = ?`, p.Name).Scan(&existingEnc)
 			if err == nil {
@@ -286,13 +296,14 @@ ON CONFLICT(name) DO UPDATE SET
 	source = excluded.source,
 	updated_at = excluded.updated_at`,
 			p.Name, p.Type, p.BaseURL, apiKeyEnc, boolToInt(p.Passthrough), modelsJSON,
-			boolToInt(p.IsEnabled()), SourceConfig, formatTime(now), formatTime(now),
+			boolToInt(p.IsEnabled()), SourceConfig, nowStr, nowStr,
 		)
 		if err != nil {
 			return fmt.Errorf("store: sync provider %q: %w", p.Name, err)
 		}
 	}
 
+	// 2. Model routes
 	routeAliases := make([]string, 0, len(cfg.Routes))
 	for _, r := range cfg.Routes {
 		routeAliases = append(routeAliases, r.Alias)
@@ -328,18 +339,159 @@ ON CONFLICT(alias) DO UPDATE SET
 			r.Alias, r.Provider, r.Model, string(fallbacksJSON),
 			nullableFloat(r.InputCostPerMillion), nullableFloat(r.OutputCostPerMillion),
 			nullableFloat(r.CacheReadCostPerMillion), nullableFloat(r.CacheWriteCostPerMillion),
-			boolToInt(r.IsEnabled()), SourceConfig, formatTime(now), formatTime(now),
+			boolToInt(r.IsEnabled()), SourceConfig, nowStr, nowStr,
 		)
 		if err != nil {
 			return fmt.Errorf("store: sync route %q: %w", r.Alias, err)
 		}
 	}
 
-	// Delete stale config-managed routes BEFORE stale providers to respect foreign keys.
+	// 3. Budgets
+	budgetScopes := make([]string, 0, len(cfg.Budgets))
+	for _, b := range cfg.Budgets {
+		budgetScopes = append(budgetScopes, b.Scope)
+		softPct := b.SoftAlertPct
+		if softPct == 0 {
+			softPct = 80
+		}
+		_, err = tx.ExecContext(ctx, `
+INSERT INTO budgets (
+	scope, rpm, tpm, max_concurrent, daily_usd, monthly_usd,
+	soft_alert_pct, enabled, source, created_at, updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(scope) DO UPDATE SET
+	rpm = excluded.rpm,
+	tpm = excluded.tpm,
+	max_concurrent = excluded.max_concurrent,
+	daily_usd = excluded.daily_usd,
+	monthly_usd = excluded.monthly_usd,
+	soft_alert_pct = excluded.soft_alert_pct,
+	enabled = excluded.enabled,
+	source = excluded.source,
+	updated_at = excluded.updated_at`,
+			b.Scope, b.RPM, b.TPM, b.MaxConcurrent,
+			nullableFloat(b.DailyUSD), nullableFloat(b.MonthlyUSD),
+			softPct, boolToInt(b.IsEnabled()), SourceConfig, nowStr, nowStr,
+		)
+		if err != nil {
+			return fmt.Errorf("store: sync budget %q: %w", b.Scope, err)
+		}
+	}
+
+	// 4. Built-in + YAML guardrail rules
+	builtins := DefaultBuiltinGuardrailRules()
+	builtinIDs := make(map[string]bool, len(builtins))
+	for _, br := range builtins {
+		builtinIDs[br.ID] = true
+	}
+
+	keepGuardrailIDs := make([]string, 0, len(builtins)+len(cfg.Guardrails.Rules))
+	if cfg.Guardrails.UseBuiltinDefaults() {
+		for _, br := range builtins {
+			keepGuardrailIDs = append(keepGuardrailIDs, br.ID)
+			// Seed built-in defaults without clobbering Admin UI customizations (source='local').
+			_, err = tx.ExecContext(ctx, `
+INSERT INTO guardrail_rules (id, name, category, pattern, action, builtin, enabled, source, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+ON CONFLICT(id) DO NOTHING`,
+				br.ID, br.Name, br.Category, br.Pattern, br.Action,
+				boolToInt(br.Enabled), SourceConfig, nowStr, nowStr,
+			)
+			if err != nil {
+				return fmt.Errorf("store: seed builtin guardrail %q: %w", br.ID, err)
+			}
+		}
+	}
+
+	for _, r := range cfg.Guardrails.Rules {
+		keepGuardrailIDs = append(keepGuardrailIDs, r.ID)
+		_, err = tx.ExecContext(ctx, `
+INSERT INTO guardrail_rules (id, name, category, pattern, action, builtin, enabled, source, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+	name = excluded.name,
+	category = excluded.category,
+	pattern = excluded.pattern,
+	action = excluded.action,
+	builtin = excluded.builtin,
+	enabled = excluded.enabled,
+	source = excluded.source,
+	updated_at = excluded.updated_at`,
+			r.ID, r.Name, r.Category, r.Pattern, r.Action,
+			boolToInt(builtinIDs[r.ID]), boolToInt(r.IsEnabled()), SourceConfig, nowStr, nowStr,
+		)
+		if err != nil {
+			return fmt.Errorf("store: sync guardrail rule %q: %w", r.ID, err)
+		}
+	}
+
+	// 5. Webhooks
+	webhookIDs := make([]string, 0, len(cfg.Webhooks))
+	for _, w := range cfg.Webhooks {
+		webhookIDs = append(webhookIDs, w.ID)
+
+		secretEnc := ""
+		if w.Secret != "" {
+			secretEnc, err = s.cipher.EncryptString(w.Secret)
+			if err != nil {
+				return fmt.Errorf("store: encrypt secret for webhook %q: %w", w.ID, err)
+			}
+		} else {
+			var existingEnc string
+			err := tx.QueryRowContext(ctx, `SELECT secret_enc FROM webhooks WHERE id = ?`, w.ID).Scan(&existingEnc)
+			if err == nil {
+				secretEnc = existingEnc
+			} else if !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("store: lookup existing webhook %q: %w", w.ID, err)
+			}
+		}
+
+		eventsJSON, err := marshalStringSlice(w.Events)
+		if err != nil {
+			return fmt.Errorf("store: encode events for webhook %q: %w", w.ID, err)
+		}
+		timeoutMS := w.TimeoutMS
+		if timeoutMS <= 0 {
+			timeoutMS = 2000
+		}
+
+		_, err = tx.ExecContext(ctx, `
+INSERT INTO webhooks (id, name, url, type, secret_enc, events_json, timeout_ms, fail_open, enabled, source, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+	name = excluded.name,
+	url = excluded.url,
+	type = excluded.type,
+	secret_enc = excluded.secret_enc,
+	events_json = excluded.events_json,
+	timeout_ms = excluded.timeout_ms,
+	fail_open = excluded.fail_open,
+	enabled = excluded.enabled,
+	source = excluded.source,
+	updated_at = excluded.updated_at`,
+			w.ID, w.Name, w.URL, w.Type, secretEnc, eventsJSON, timeoutMS,
+			boolToInt(w.IsFailOpen()), boolToInt(w.IsEnabled()), SourceConfig, nowStr, nowStr,
+		)
+		if err != nil {
+			return fmt.Errorf("store: sync webhook %q: %w", w.ID, err)
+		}
+	}
+
+	// Prune stale config-managed rows (delete model_routes BEFORE providers for FK safety).
 	if err := deleteStaleConfigRowsTx(ctx, tx, "model_routes", "alias", routeAliases); err != nil {
 		return err
 	}
 	if err := deleteStaleConfigRowsTx(ctx, tx, "providers", "name", providerNames); err != nil {
+		return err
+	}
+	if err := deleteStaleConfigRowsTx(ctx, tx, "budgets", "scope", budgetScopes); err != nil {
+		return err
+	}
+	if err := deleteStaleConfigRowsTx(ctx, tx, "guardrail_rules", "id", keepGuardrailIDs); err != nil {
+		return err
+	}
+	if err := deleteStaleConfigRowsTx(ctx, tx, "webhooks", "id", webhookIDs); err != nil {
 		return err
 	}
 
@@ -402,6 +554,7 @@ func (s *SQLiteStore) snapshot(ctx context.Context) (*configSnapshot, error) {
 }
 
 func (s *SQLiteStore) loadSnapshotLocked(ctx context.Context) (*configSnapshot, error) {
+	// Providers
 	provRows, err := s.db.QueryContext(ctx, `
 SELECT name, type, base_url, api_key_enc, passthrough, models_json, enabled, source, created_at, updated_at
 FROM providers ORDER BY name ASC`)
@@ -424,6 +577,7 @@ FROM providers ORDER BY name ASC`)
 		return nil, fmt.Errorf("store: iterate provider snapshot rows: %w", err)
 	}
 
+	// Model routes
 	routeRows, err := s.db.QueryContext(ctx, `
 SELECT alias, provider_name, upstream_model, fallbacks_json,
        input_cost_per_million, output_cost_per_million,
@@ -449,6 +603,76 @@ FROM model_routes ORDER BY alias ASC`)
 		return nil, fmt.Errorf("store: iterate model routes snapshot rows: %w", err)
 	}
 
+	// Budgets
+	budgetRows, err := s.db.QueryContext(ctx, `
+SELECT scope, rpm, tpm, max_concurrent, daily_usd, monthly_usd,
+       soft_alert_pct, enabled, source, created_at, updated_at
+FROM budgets ORDER BY scope ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("store: load budgets snapshot: %w", err)
+	}
+	var budgets []Budget
+	for budgetRows.Next() {
+		b, err := scanBudget(budgetRows)
+		if err != nil {
+			_ = budgetRows.Close()
+			return nil, err
+		}
+		budgets = append(budgets, b)
+	}
+	if err := budgetRows.Close(); err != nil {
+		return nil, fmt.Errorf("store: close budgets snapshot rows: %w", err)
+	}
+	if err := budgetRows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate budgets snapshot rows: %w", err)
+	}
+
+	// Guardrail rules
+	ruleRows, err := s.db.QueryContext(ctx, `
+SELECT id, name, category, pattern, action, builtin, enabled, source, created_at, updated_at
+FROM guardrail_rules ORDER BY builtin DESC, id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("store: load guardrail rules snapshot: %w", err)
+	}
+	var guardrails []GuardrailRule
+	for ruleRows.Next() {
+		r, err := scanGuardrailRule(ruleRows)
+		if err != nil {
+			_ = ruleRows.Close()
+			return nil, err
+		}
+		guardrails = append(guardrails, r)
+	}
+	if err := ruleRows.Close(); err != nil {
+		return nil, fmt.Errorf("store: close guardrail rules snapshot rows: %w", err)
+	}
+	if err := ruleRows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate guardrail rules snapshot rows: %w", err)
+	}
+
+	// Webhooks
+	whRows, err := s.db.QueryContext(ctx, `
+SELECT id, name, url, type, secret_enc, events_json, timeout_ms, fail_open, enabled, source, created_at, updated_at
+FROM webhooks ORDER BY id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("store: load webhooks snapshot: %w", err)
+	}
+	var webhooks []Webhook
+	for whRows.Next() {
+		w, err := s.scanWebhook(whRows)
+		if err != nil {
+			_ = whRows.Close()
+			return nil, err
+		}
+		webhooks = append(webhooks, w)
+	}
+	if err := whRows.Close(); err != nil {
+		return nil, fmt.Errorf("store: close webhooks snapshot rows: %w", err)
+	}
+	if err := whRows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate webhooks snapshot rows: %w", err)
+	}
+
 	byName := make(map[string]Provider, len(providers))
 	for _, p := range providers {
 		byName[p.Name] = p
@@ -457,12 +681,30 @@ FROM model_routes ORDER BY alias ASC`)
 	for _, r := range routes {
 		byAlias[r.Alias] = r
 	}
+	byScope := make(map[string]Budget, len(budgets))
+	for _, b := range budgets {
+		byScope[b.Scope] = b
+	}
+	byRuleID := make(map[string]GuardrailRule, len(guardrails))
+	for _, r := range guardrails {
+		byRuleID[r.ID] = r
+	}
+	byWebhookID := make(map[string]Webhook, len(webhooks))
+	for _, w := range webhooks {
+		byWebhookID[w.ID] = w
+	}
 
 	return &configSnapshot{
 		providers:       providers,
 		providersByName: byName,
 		routes:          routes,
 		routesByAlias:   byAlias,
+		budgets:         budgets,
+		budgetsByScope:  byScope,
+		guardrails:      guardrails,
+		guardrailsByID:  byRuleID,
+		webhooks:        webhooks,
+		webhooksByID:    byWebhookID,
 	}, nil
 }
 
@@ -478,6 +720,17 @@ func cloneModelRoute(r ModelRoute) ModelRoute {
 	r.CacheReadCostPerMillion = cloneFloatPtr(r.CacheReadCostPerMillion)
 	r.CacheWriteCostPerMillion = cloneFloatPtr(r.CacheWriteCostPerMillion)
 	return r
+}
+
+func cloneBudget(b Budget) Budget {
+	b.DailyUSD = cloneFloatPtr(b.DailyUSD)
+	b.MonthlyUSD = cloneFloatPtr(b.MonthlyUSD)
+	return b
+}
+
+func cloneWebhook(w Webhook) Webhook {
+	w.Events = slices.Clone(w.Events)
+	return w
 }
 
 func cloneFloatPtr(v *float64) *float64 {
@@ -743,7 +996,424 @@ func scanModelRoute(sc scanner) (ModelRoute, error) {
 	return r, nil
 }
 
-// --- Usage Logs ---
+// --- Budgets ---
+
+func (s *SQLiteStore) UpsertBudget(ctx context.Context, b Budget) error {
+	scope := strings.TrimSpace(b.Scope)
+	if scope == "" {
+		return errors.New("store: budget scope is required")
+	}
+	softPct := b.SoftAlertPct
+	if softPct <= 0 {
+		softPct = 80
+	}
+	now := time.Now().UTC()
+	source := defaultSource(b.Source)
+
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO budgets (
+	scope, rpm, tpm, max_concurrent, daily_usd, monthly_usd,
+	soft_alert_pct, enabled, source, created_at, updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(scope) DO UPDATE SET
+	rpm = excluded.rpm,
+	tpm = excluded.tpm,
+	max_concurrent = excluded.max_concurrent,
+	daily_usd = excluded.daily_usd,
+	monthly_usd = excluded.monthly_usd,
+	soft_alert_pct = excluded.soft_alert_pct,
+	enabled = excluded.enabled,
+	source = excluded.source,
+	updated_at = excluded.updated_at`,
+		scope, b.RPM, b.TPM, b.MaxConcurrent,
+		nullableFloat(b.DailyUSD), nullableFloat(b.MonthlyUSD),
+		softPct, boolToInt(b.Enabled), source, formatTime(now), formatTime(now),
+	)
+	if err != nil {
+		return fmt.Errorf("store: upsert budget %q: %w", scope, err)
+	}
+	s.cache = nil
+	return nil
+}
+
+func (s *SQLiteStore) GetBudget(ctx context.Context, scope string) (*Budget, error) {
+	snap, err := s.snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	b, ok := snap.budgetsByScope[scope]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := cloneBudget(b)
+	return &cp, nil
+}
+
+func (s *SQLiteStore) ListBudgets(ctx context.Context) ([]Budget, error) {
+	snap, err := s.snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(snap.budgets) == 0 {
+		return nil, nil
+	}
+	out := make([]Budget, len(snap.budgets))
+	for i, b := range snap.budgets {
+		out[i] = cloneBudget(b)
+	}
+	return out, nil
+}
+
+func (s *SQLiteStore) DeleteBudget(ctx context.Context, scope string) error {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+
+	res, err := s.db.ExecContext(ctx, `DELETE FROM budgets WHERE scope = ?`, scope)
+	if err != nil {
+		return fmt.Errorf("store: delete budget %q: %w", scope, err)
+	}
+	if err := checkAffected(res); err != nil {
+		return err
+	}
+	s.cache = nil
+	return nil
+}
+
+func scanBudget(sc scanner) (Budget, error) {
+	var (
+		b            Budget
+		dailyUSD     sql.NullFloat64
+		monthlyUSD   sql.NullFloat64
+		enabled      int
+		createdAtStr string
+		updatedAtStr string
+	)
+	if err := sc.Scan(
+		&b.Scope, &b.RPM, &b.TPM, &b.MaxConcurrent,
+		&dailyUSD, &monthlyUSD, &b.SoftAlertPct,
+		&enabled, &b.Source, &createdAtStr, &updatedAtStr,
+	); err != nil {
+		return Budget{}, err
+	}
+	b.DailyUSD = fromNullFloat(dailyUSD)
+	b.MonthlyUSD = fromNullFloat(monthlyUSD)
+	b.Enabled = enabled != 0
+	b.CreatedAt = parseTime(createdAtStr)
+	b.UpdatedAt = parseTime(updatedAtStr)
+	return b, nil
+}
+
+// --- Guardrail Rules ---
+
+func (s *SQLiteStore) UpsertGuardrailRule(ctx context.Context, r GuardrailRule) error {
+	id := strings.TrimSpace(r.ID)
+	if id == "" {
+		id = uuid.NewString()
+	}
+	if strings.TrimSpace(r.Name) == "" {
+		return errors.New("store: guardrail rule name is required")
+	}
+	if strings.TrimSpace(r.Pattern) == "" {
+		return errors.New("store: guardrail rule pattern is required")
+	}
+	category := strings.ToLower(strings.TrimSpace(r.Category))
+	if category == "" {
+		category = config.GuardrailCategoryCustom
+	}
+	action := strings.ToLower(strings.TrimSpace(r.Action))
+	if action == "" {
+		action = config.GuardrailActionRedact
+	}
+
+	now := time.Now().UTC()
+	source := defaultSource(r.Source)
+
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO guardrail_rules (id, name, category, pattern, action, builtin, enabled, source, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+	name = excluded.name,
+	category = excluded.category,
+	pattern = excluded.pattern,
+	action = excluded.action,
+	builtin = excluded.builtin,
+	enabled = excluded.enabled,
+	source = excluded.source,
+	updated_at = excluded.updated_at`,
+		id, r.Name, category, r.Pattern, action, boolToInt(r.Builtin),
+		boolToInt(r.Enabled), source, formatTime(now), formatTime(now),
+	)
+	if err != nil {
+		return fmt.Errorf("store: upsert guardrail rule %q: %w", id, err)
+	}
+	s.cache = nil
+	return nil
+}
+
+func (s *SQLiteStore) GetGuardrailRule(ctx context.Context, id string) (*GuardrailRule, error) {
+	snap, err := s.snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r, ok := snap.guardrailsByID[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := r
+	return &cp, nil
+}
+
+func (s *SQLiteStore) ListGuardrailRules(ctx context.Context) ([]GuardrailRule, error) {
+	snap, err := s.snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(snap.guardrails) == 0 {
+		return nil, nil
+	}
+	out := make([]GuardrailRule, len(snap.guardrails))
+	copy(out, snap.guardrails)
+	return out, nil
+}
+
+func (s *SQLiteStore) DeleteGuardrailRule(ctx context.Context, id string) error {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+
+	res, err := s.db.ExecContext(ctx, `DELETE FROM guardrail_rules WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("store: delete guardrail rule %q: %w", id, err)
+	}
+	if err := checkAffected(res); err != nil {
+		return err
+	}
+	s.cache = nil
+	return nil
+}
+
+func scanGuardrailRule(sc scanner) (GuardrailRule, error) {
+	var (
+		r            GuardrailRule
+		builtin      int
+		enabled      int
+		createdAtStr string
+		updatedAtStr string
+	)
+	if err := sc.Scan(
+		&r.ID, &r.Name, &r.Category, &r.Pattern, &r.Action,
+		&builtin, &enabled, &r.Source, &createdAtStr, &updatedAtStr,
+	); err != nil {
+		return GuardrailRule{}, err
+	}
+	r.Builtin = builtin != 0
+	r.Enabled = enabled != 0
+	r.CreatedAt = parseTime(createdAtStr)
+	r.UpdatedAt = parseTime(updatedAtStr)
+	return r, nil
+}
+
+// --- Webhooks ---
+
+func (s *SQLiteStore) UpsertWebhook(ctx context.Context, w Webhook) error {
+	id := strings.TrimSpace(w.ID)
+	if id == "" {
+		id = uuid.NewString()
+	}
+	if strings.TrimSpace(w.Name) == "" {
+		return errors.New("store: webhook name is required")
+	}
+	if strings.TrimSpace(w.URL) == "" {
+		return errors.New("store: webhook url is required")
+	}
+
+	secretEnc := ""
+	if w.Secret != "" {
+		var err error
+		secretEnc, err = s.cipher.EncryptString(w.Secret)
+		if err != nil {
+			return fmt.Errorf("store: encrypt webhook secret: %w", err)
+		}
+	}
+	eventsJSON, err := marshalStringSlice(w.Events)
+	if err != nil {
+		return fmt.Errorf("store: encode webhook events: %w", err)
+	}
+	timeoutMS := w.TimeoutMS
+	if timeoutMS <= 0 {
+		timeoutMS = 2000
+	}
+
+	now := time.Now().UTC()
+	source := defaultSource(w.Source)
+
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO webhooks (id, name, url, type, secret_enc, events_json, timeout_ms, fail_open, enabled, source, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+	name = excluded.name,
+	url = excluded.url,
+	type = excluded.type,
+	secret_enc = excluded.secret_enc,
+	events_json = excluded.events_json,
+	timeout_ms = excluded.timeout_ms,
+	fail_open = excluded.fail_open,
+	enabled = excluded.enabled,
+	source = excluded.source,
+	updated_at = excluded.updated_at`,
+		id, w.Name, w.URL, w.Type, secretEnc, eventsJSON, timeoutMS,
+		boolToInt(w.FailOpen), boolToInt(w.Enabled), source, formatTime(now), formatTime(now),
+	)
+	if err != nil {
+		return fmt.Errorf("store: upsert webhook %q: %w", id, err)
+	}
+	s.cache = nil
+	return nil
+}
+
+func (s *SQLiteStore) GetWebhook(ctx context.Context, id string) (*Webhook, error) {
+	snap, err := s.snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	w, ok := snap.webhooksByID[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := cloneWebhook(w)
+	return &cp, nil
+}
+
+func (s *SQLiteStore) ListWebhooks(ctx context.Context) ([]Webhook, error) {
+	snap, err := s.snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(snap.webhooks) == 0 {
+		return nil, nil
+	}
+	out := make([]Webhook, len(snap.webhooks))
+	for i, w := range snap.webhooks {
+		out[i] = cloneWebhook(w)
+	}
+	return out, nil
+}
+
+func (s *SQLiteStore) DeleteWebhook(ctx context.Context, id string) error {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+
+	res, err := s.db.ExecContext(ctx, `DELETE FROM webhooks WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("store: delete webhook %q: %w", id, err)
+	}
+	if err := checkAffected(res); err != nil {
+		return err
+	}
+	s.cache = nil
+	return nil
+}
+
+func (s *SQLiteStore) scanWebhook(sc scanner) (Webhook, error) {
+	var (
+		w            Webhook
+		secretEnc    string
+		eventsJSON   string
+		failOpen     int
+		enabled      int
+		createdAtStr string
+		updatedAtStr string
+	)
+	if err := sc.Scan(
+		&w.ID, &w.Name, &w.URL, &w.Type, &secretEnc, &eventsJSON,
+		&w.TimeoutMS, &failOpen, &enabled, &w.Source, &createdAtStr, &updatedAtStr,
+	); err != nil {
+		return Webhook{}, err
+	}
+	if secretEnc != "" {
+		dec, err := s.cipher.DecryptString(secretEnc)
+		if err != nil {
+			return Webhook{}, fmt.Errorf("store: decrypt secret for webhook %q: %w", w.ID, err)
+		}
+		w.Secret = dec
+	}
+	events, err := unmarshalStringSlice(eventsJSON)
+	if err != nil {
+		return Webhook{}, fmt.Errorf("store: decode events for webhook %q: %w", w.ID, err)
+	}
+	w.Events = events
+	w.FailOpen = failOpen != 0
+	w.Enabled = enabled != 0
+	w.CreatedAt = parseTime(createdAtStr)
+	w.UpdatedAt = parseTime(updatedAtStr)
+	return w, nil
+}
+
+// --- Runtime Settings ---
+
+func (s *SQLiteStore) GetAuditSettings(ctx context.Context) (*AuditSettings, error) {
+	var (
+		valueJSON    string
+		updatedAtStr string
+	)
+	err := s.db.QueryRowContext(ctx, `
+SELECT value_json, updated_at FROM runtime_settings WHERE key = ?`, runtimeSettingAuditKey).
+		Scan(&valueJSON, &updatedAtStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("store: get audit settings: %w", err)
+	}
+
+	var out AuditSettings
+	if err := json.Unmarshal([]byte(valueJSON), &out); err != nil {
+		return nil, fmt.Errorf("store: decode audit settings: %w", err)
+	}
+	out.UpdatedAt = parseTime(updatedAtStr)
+	return &out, nil
+}
+
+func (s *SQLiteStore) SetAuditSettings(ctx context.Context, settings AuditSettings) error {
+	if settings.RetentionDays < 0 {
+		return fmt.Errorf("store: retention_days must be >= 0, got %d", settings.RetentionDays)
+	}
+	payload, err := json.Marshal(struct {
+		StorePayloads bool `json:"store_payloads"`
+		RetentionDays int  `json:"retention_days"`
+	}{
+		StorePayloads: settings.StorePayloads,
+		RetentionDays: settings.RetentionDays,
+	})
+	if err != nil {
+		return fmt.Errorf("store: encode audit settings: %w", err)
+	}
+
+	nowStr := formatTime(time.Now().UTC())
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO runtime_settings (key, value_json, updated_at)
+VALUES (?, ?, ?)
+ON CONFLICT(key) DO UPDATE SET
+	value_json = excluded.value_json,
+	updated_at = excluded.updated_at`,
+		runtimeSettingAuditKey, string(payload), nowStr,
+	)
+	if err != nil {
+		return fmt.Errorf("store: set audit settings: %w", err)
+	}
+	return nil
+}
+
+// --- Usage Logs & Dashboard Analytics ---
 
 func (s *SQLiteStore) InsertUsageLog(ctx context.Context, log UsageLog) error {
 	if strings.TrimSpace(log.ID) == "" {
@@ -757,6 +1427,10 @@ func (s *SQLiteStore) InsertUsageLog(ctx context.Context, log UsageLog) error {
 	if err != nil {
 		return fmt.Errorf("store: encode usage tags: %w", err)
 	}
+	hitsJSON, err := marshalStringSlice(log.GuardrailHits)
+	if err != nil {
+		return fmt.Errorf("store: encode guardrail hits: %w", err)
+	}
 
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO usage_logs (
@@ -765,16 +1439,16 @@ INSERT INTO usage_logs (
 	upstream_model, protocol, endpoint, stream, translated,
 	input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
 	reasoning_tokens, total_tokens, cost_usd, latency_ms, ttft_ms,
-	status_code, error_message
+	status_code, error_message, guardrail_action, guardrail_hits_json
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		log.ID, formatTime(createdAt), log.RequestID, log.Subject, log.DisplayName,
 		log.NodeName, log.NodeIP, tagsJSON, log.AuthSource, log.ProviderName,
 		log.ProviderType, log.RequestedModel, log.UpstreamModel, log.Protocol,
 		log.Endpoint, boolToInt(log.Stream), boolToInt(log.Translated),
 		log.InputTokens, log.OutputTokens, log.CacheReadTokens, log.CacheWriteTokens,
 		log.ReasoningTokens, log.TotalTokens, log.CostUSD, log.LatencyMS, log.TTFTMS,
-		log.StatusCode, log.ErrorMessage,
+		log.StatusCode, log.ErrorMessage, log.GuardrailAction, hitsJSON,
 	)
 	if err != nil {
 		return fmt.Errorf("store: insert usage log %q: %w", log.ID, err)
@@ -789,7 +1463,7 @@ SELECT id, created_at, request_id, subject, display_name, node_name, node_ip,
        upstream_model, protocol, endpoint, stream, translated,
        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
        reasoning_tokens, total_tokens, cost_usd, latency_ms, ttft_ms,
-       status_code, error_message
+       status_code, error_message, guardrail_action, guardrail_hits_json
 FROM usage_logs WHERE id = ?`, id)
 
 	log, err := scanUsageLog(row)
@@ -810,7 +1484,7 @@ SELECT id, created_at, request_id, subject, display_name, node_name, node_ip,
        upstream_model, protocol, endpoint, stream, translated,
        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
        reasoning_tokens, total_tokens, cost_usd, latency_ms, ttft_ms,
-       status_code, error_message
+       status_code, error_message, guardrail_action, guardrail_hits_json
 FROM usage_logs` + where + ` ORDER BY created_at DESC`
 
 	if filter.Limit > 0 {
@@ -863,6 +1537,155 @@ FROM usage_logs` + where
 	return sum, nil
 }
 
+func (s *SQLiteStore) SummarizeUsageExtended(ctx context.Context, filter UsageFilter) (UsageExtendedSummary, error) {
+	where, args := buildUsageWhere(filter)
+	query := `
+SELECT COUNT(*),
+       COALESCE(SUM(input_tokens), 0),
+       COALESCE(SUM(output_tokens), 0),
+       COALESCE(SUM(cache_read_tokens), 0),
+       COALESCE(SUM(cache_write_tokens), 0),
+       COALESCE(SUM(reasoning_tokens), 0),
+       COALESCE(SUM(total_tokens), 0),
+       COALESCE(SUM(cost_usd), 0),
+       COALESCE(SUM(CASE WHEN status_code >= 400 OR status_code = 0 OR error_message != '' THEN 1 ELSE 0 END), 0)
+FROM usage_logs` + where
+
+	var ext UsageExtendedSummary
+	if err := s.db.QueryRowContext(ctx, query, args...).Scan(
+		&ext.RequestCount, &ext.InputTokens, &ext.OutputTokens,
+		&ext.CacheReadTokens, &ext.CacheWriteTokens, &ext.ReasoningTokens,
+		&ext.TotalTokens, &ext.CostUSD, &ext.ErrorCount,
+	); err != nil {
+		return UsageExtendedSummary{}, fmt.Errorf("store: summarize usage extended: %w", err)
+	}
+
+	if ext.RequestCount > 0 {
+		offset := int64(math.Ceil(0.95*float64(ext.RequestCount))) - 1
+		if offset < 0 {
+			offset = 0
+		}
+		if offset >= ext.RequestCount {
+			offset = ext.RequestCount - 1
+		}
+		p95Args := make([]any, 0, len(args)+1)
+		p95Args = append(p95Args, args...)
+		p95Args = append(p95Args, offset)
+		p95Query := `SELECT latency_ms FROM usage_logs` + where + ` ORDER BY latency_ms ASC LIMIT 1 OFFSET ?`
+		if err := s.db.QueryRowContext(ctx, p95Query, p95Args...).Scan(&ext.P95LatencyMS); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return UsageExtendedSummary{}, fmt.Errorf("store: compute p95 latency: %w", err)
+		}
+	}
+
+	return ext, nil
+}
+
+func (s *SQLiteStore) QueryUsageSeries(ctx context.Context, filter UsageFilter, bucket string) ([]UsageTimeBucket, error) {
+	var bucketExpr string
+	switch strings.ToLower(strings.TrimSpace(bucket)) {
+	case "hour":
+		bucketExpr = "substr(created_at, 1, 13) || ':00:00Z'"
+	case "", "day":
+		bucketExpr = "substr(created_at, 1, 10)"
+	default:
+		return nil, fmt.Errorf("store: invalid usage series bucket %q (must be hour or day)", bucket)
+	}
+
+	where, args := buildUsageWhere(filter)
+	query := fmt.Sprintf(`
+SELECT %s AS bucket,
+       COUNT(*),
+       COALESCE(SUM(total_tokens), 0),
+       COALESCE(SUM(cost_usd), 0),
+       COALESCE(SUM(CASE WHEN status_code >= 400 OR status_code = 0 OR error_message != '' THEN 1 ELSE 0 END), 0)
+FROM usage_logs%s
+GROUP BY bucket
+ORDER BY bucket ASC`, bucketExpr, where)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: query usage series: %w", err)
+	}
+	defer rows.Close()
+
+	var out []UsageTimeBucket
+	for rows.Next() {
+		var b UsageTimeBucket
+		if err := rows.Scan(&b.Bucket, &b.Requests, &b.Tokens, &b.CostUSD, &b.Errors); err != nil {
+			return nil, fmt.Errorf("store: scan usage series bucket: %w", err)
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteStore) QueryTopSubjects(ctx context.Context, filter UsageFilter, limit int) ([]SubjectUsageStat, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	where, args := buildUsageWhere(filter)
+	args = append(args, limit)
+	query := `
+SELECT subject,
+       COUNT(*) AS req_count,
+       COALESCE(SUM(total_tokens), 0) AS total_tokens,
+       COALESCE(SUM(cost_usd), 0) AS total_cost
+FROM usage_logs` + where + `
+GROUP BY subject
+ORDER BY total_cost DESC, req_count DESC, subject ASC
+LIMIT ?`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: query top subjects: %w", err)
+	}
+	defer rows.Close()
+
+	var out []SubjectUsageStat
+	for rows.Next() {
+		var st SubjectUsageStat
+		if err := rows.Scan(&st.Subject, &st.Requests, &st.Tokens, &st.CostUSD); err != nil {
+			return nil, fmt.Errorf("store: scan top subject: %w", err)
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteStore) QueryTopModels(ctx context.Context, filter UsageFilter, limit int) ([]ModelUsageStat, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	where, args := buildUsageWhere(filter)
+	args = append(args, limit)
+	query := `
+SELECT requested_model,
+       provider_name,
+       COUNT(*) AS req_count,
+       COALESCE(SUM(total_tokens), 0) AS total_tokens,
+       COALESCE(SUM(cost_usd), 0) AS total_cost
+FROM usage_logs` + where + `
+GROUP BY requested_model, provider_name
+ORDER BY total_cost DESC, req_count DESC, requested_model ASC
+LIMIT ?`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: query top models: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ModelUsageStat
+	for rows.Next() {
+		var st ModelUsageStat
+		if err := rows.Scan(&st.Model, &st.Provider, &st.Requests, &st.Tokens, &st.CostUSD); err != nil {
+			return nil, fmt.Errorf("store: scan top model: %w", err)
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
 func buildUsageWhere(filter UsageFilter) (string, []any) {
 	var clauses []string
 	var args []any
@@ -871,6 +1694,10 @@ func buildUsageWhere(filter UsageFilter) (string, []any) {
 		clauses = append(clauses, "subject = ?")
 		args = append(args, filter.Subject)
 	}
+	if filter.Tag != "" {
+		clauses = append(clauses, "(subject = ? OR EXISTS (SELECT 1 FROM json_each(usage_logs.tags_json) WHERE value = ?))")
+		args = append(args, filter.Tag, filter.Tag)
+	}
 	if filter.ProviderName != "" {
 		clauses = append(clauses, "provider_name = ?")
 		args = append(args, filter.ProviderName)
@@ -878,6 +1705,13 @@ func buildUsageWhere(filter UsageFilter) (string, []any) {
 	if filter.Model != "" {
 		clauses = append(clauses, "(requested_model = ? OR upstream_model = ?)")
 		args = append(args, filter.Model, filter.Model)
+	}
+	if filter.StatusCode > 0 {
+		clauses = append(clauses, "status_code = ?")
+		args = append(args, filter.StatusCode)
+	}
+	if filter.GuardrailOnly {
+		clauses = append(clauses, "guardrail_action != ''")
 	}
 	if !filter.Since.IsZero() {
 		clauses = append(clauses, "created_at >= ?")
@@ -898,6 +1732,7 @@ func scanUsageLog(sc scanner) (UsageLog, error) {
 		log          UsageLog
 		createdAtStr string
 		tagsJSON     string
+		hitsJSON     string
 		stream       int
 		translated   int
 	)
@@ -908,7 +1743,7 @@ func scanUsageLog(sc scanner) (UsageLog, error) {
 		&log.Endpoint, &stream, &translated,
 		&log.InputTokens, &log.OutputTokens, &log.CacheReadTokens, &log.CacheWriteTokens,
 		&log.ReasoningTokens, &log.TotalTokens, &log.CostUSD, &log.LatencyMS, &log.TTFTMS,
-		&log.StatusCode, &log.ErrorMessage,
+		&log.StatusCode, &log.ErrorMessage, &log.GuardrailAction, &hitsJSON,
 	); err != nil {
 		return UsageLog{}, err
 	}
@@ -916,7 +1751,12 @@ func scanUsageLog(sc scanner) (UsageLog, error) {
 	if err != nil {
 		return UsageLog{}, err
 	}
+	hits, err := unmarshalStringSlice(hitsJSON)
+	if err != nil {
+		return UsageLog{}, err
+	}
 	log.Tags = tags
+	log.GuardrailHits = hits
 	log.CreatedAt = parseTime(createdAtStr)
 	log.Stream = stream != 0
 	log.Translated = translated != 0

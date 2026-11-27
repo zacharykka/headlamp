@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,6 +35,9 @@ type GatewayConfig struct {
 	Store                store.Store
 	Authorizer           Authorizer
 	Telemetry            TelemetryFactory
+	Quota                QuotaLimiter
+	Guardrails           GuardrailInspector
+	Events               EventDispatcher
 	HTTPClient           *http.Client
 	MaxRequestBodyBytes  int64
 	MaxResponseBodyBytes int64
@@ -43,11 +47,14 @@ type GatewayConfig struct {
 // Gateway is an http.Handler implementing Headlamp's multi-protocol LLM proxy:
 // OpenAI Chat Completions, OpenAI Responses, OpenAI Embeddings, Anthropic Messages,
 // Google Gemini, and Ollama, with native passthrough first, on-demand cross-protocol
-// translation, fallback retries, and streaming SSE telemetry hooks.
+// translation, fallback retries, guardrails, quota enforcement, and streaming SSE telemetry hooks.
 type Gateway struct {
 	store                store.Store
 	authorizer           Authorizer
 	telemetry            TelemetryFactory
+	quota                QuotaLimiter
+	guardrails           GuardrailInspector
+	events               EventDispatcher
 	httpClient           *http.Client
 	maxRequestBodyBytes  int64
 	maxResponseBodyBytes int64
@@ -83,6 +90,9 @@ func NewGateway(cfg GatewayConfig) (*Gateway, error) {
 		store:                cfg.Store,
 		authorizer:           cfg.Authorizer,
 		telemetry:            cfg.Telemetry,
+		quota:                cfg.Quota,
+		guardrails:           cfg.Guardrails,
+		events:               cfg.Events,
 		httpClient:           client,
 		maxRequestBodyBytes:  maxReq,
 		maxResponseBodyBytes: maxResp,
@@ -428,6 +438,40 @@ func (g *Gateway) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Requ
 		anthropicCands = filtered
 	}
 
+	// Run guardrails before forwarding prompt messages to Anthropic's count_tokens endpoint.
+	if g.guardrails != nil {
+		requestID := uuid.NewString()
+		decision, gErr := g.guardrails.Inspect(r.Context(), GuardrailRequest{
+			RequestID: requestID,
+			Principal: principal,
+			Protocol:  ProtocolAnthropicMessages,
+			Model:     resolved.canonicalModel,
+			Body:      reqBody,
+		})
+		if gErr != nil {
+			g.logf("headlamp proxy: count_tokens request_id=%s guardrail error: %v", requestID, gErr)
+			WriteError(w, ProtocolAnthropicMessages, http.StatusInternalServerError, "api_error", "guardrail inspection failed")
+			return
+		}
+		if decision != nil {
+			if decision.Action == "block" {
+				statusCode := decision.StatusCode
+				if statusCode < 400 {
+					statusCode = http.StatusBadRequest
+				}
+				reason := decision.Reason
+				if reason == "" {
+					reason = "request blocked by guardrail policy"
+				}
+				WriteError(w, ProtocolAnthropicMessages, statusCode, "guardrail_blocked", reason)
+				return
+			}
+			if (decision.Action == "redact" || decision.Action == "modify") && len(decision.ModifiedBody) > 0 {
+				reqBody = decision.ModifiedBody
+			}
+		}
+	}
+
 	var lastResp *http.Response
 	for i, cand := range anthropicCands {
 		bodyToSend := reqBody
@@ -523,6 +567,12 @@ func (g *Gateway) handleGeminiGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	trimmedBody := bytes.TrimSpace(reqBody)
+	if len(trimmedBody) == 0 || trimmedBody[0] != '{' || !json.Valid(trimmedBody) {
+		WriteError(w, ProtocolGemini, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid JSON request body")
+		return
+	}
+
 	g.executeLLMRequest(w, r, llmInvocation{
 		principal:       principal,
 		ingressProtocol: ProtocolGemini,
@@ -546,6 +596,8 @@ type llmInvocation struct {
 	rawQuery           string
 	reqHeaders         http.Header
 	reqBody            []byte
+	guardrailAction    string
+	guardrailHits      []string
 }
 
 func (g *Gateway) authorizeModel(w http.ResponseWriter, r *http.Request, principal *auth.Principal, protocol, canonicalModel string) bool {
@@ -644,6 +696,92 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 		compatible = allowedCands
 	}
 
+	// Pre-request Guardrail inspection (local regex + sync_review webhooks).
+	if g.guardrails != nil {
+		decision, gErr := g.guardrails.Inspect(r.Context(), GuardrailRequest{
+			RequestID: requestID,
+			Principal: inv.principal,
+			Protocol:  inv.ingressProtocol,
+			Model:     resolved.canonicalModel,
+			Body:      inv.reqBody,
+		})
+		if gErr != nil {
+			g.logf("headlamp proxy: request_id=%s guardrail error: %v", requestID, gErr)
+			WriteError(w, inv.ingressProtocol, http.StatusInternalServerError, "server_error", "guardrail inspection failed")
+			return
+		}
+		if decision != nil {
+			if decision.Action != "" && decision.Action != "allow" {
+				inv.guardrailAction = decision.Action
+				inv.guardrailHits = decision.Hits
+			}
+			if decision.Action == "block" {
+				statusCode := decision.StatusCode
+				if statusCode < 400 {
+					statusCode = http.StatusBadRequest
+				}
+				reason := decision.Reason
+				if reason == "" {
+					reason = "request blocked by guardrail policy"
+				}
+				// Never persist blocked raw secrets (e.g. PEM private keys) into audit_payloads.
+				inv.reqBody = []byte("[BLOCKED BY GUARDRAIL]")
+				obs := g.startTelemetry(r.Context(), requestID, startTime, inv, compatible[0].cand, resolved.costOverride, compatible[0].isTranslated)
+				obs.Finish(TelemetryFinish{
+					StatusCode:   statusCode,
+					LatencyMS:    time.Since(startTime).Milliseconds(),
+					ErrorMessage: reason,
+				})
+				WriteError(w, inv.ingressProtocol, statusCode, "guardrail_blocked", reason)
+				return
+			}
+			if (decision.Action == "redact" || decision.Action == "modify") && len(decision.ModifiedBody) > 0 {
+				inv.reqBody = decision.ModifiedBody
+			}
+		}
+	}
+
+	// Quota & rate-limit acquisition (RPM / TPM / MaxConcurrent / Daily & Monthly USD).
+	var (
+		quotaTicket QuotaTicket
+		usedTokens  int64
+	)
+	if g.quota != nil {
+		ticket, rej, qErr := g.quota.Acquire(r.Context(), inv.principal)
+		if qErr != nil {
+			g.logf("headlamp proxy: request_id=%s quota error: %v", requestID, qErr)
+			WriteError(w, inv.ingressProtocol, http.StatusInternalServerError, "server_error", "quota check failed")
+			return
+		}
+		if rej != nil {
+			if rej.RetryAfterSec > 0 {
+				w.Header().Set("Retry-After", strconv.Itoa(rej.RetryAfterSec))
+			}
+			reason := rej.Reason
+			if reason == "" {
+				reason = "quota or rate limit exceeded"
+			}
+			code := "rate_limit_exceeded"
+			if rej.Metric == "daily_usd" || rej.Metric == "monthly_usd" {
+				code = "insufficient_quota"
+			}
+			obs := g.startTelemetry(r.Context(), requestID, startTime, inv, compatible[0].cand, resolved.costOverride, compatible[0].isTranslated)
+			obs.Finish(TelemetryFinish{
+				StatusCode:   http.StatusTooManyRequests,
+				LatencyMS:    time.Since(startTime).Milliseconds(),
+				ErrorMessage: reason,
+			})
+			WriteError(w, inv.ingressProtocol, http.StatusTooManyRequests, code, reason)
+			return
+		}
+		quotaTicket = ticket
+	}
+	if quotaTicket != nil {
+		defer func() {
+			quotaTicket.Release(usedTokens)
+		}()
+	}
+
 	var (
 		lastResp          *http.Response
 		lastCand          routeCandidate
@@ -665,6 +803,7 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 				next := compatible[i+1].cand
 				g.logf("headlamp proxy: request_id=%s model=%s candidate %s/%s payload error (%v), falling back to %s/%s",
 					requestID, inv.requestedModel, cand.provider.Name, cand.upstreamModel, err, next.provider.Name, next.upstreamModel)
+				g.emitFallbackEvent(requestID, inv, cand, next, 0, err.Error())
 				continue
 			}
 			WriteError(w, inv.ingressProtocol, http.StatusBadRequest, "invalid_request", err.Error())
@@ -693,9 +832,11 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 				next := compatible[i+1].cand
 				g.logf("headlamp proxy: request_id=%s model=%s candidate %s/%s network error (%s), falling back to %s/%s",
 					requestID, inv.requestedModel, cand.provider.Name, cand.upstreamModel, safeErr, next.provider.Name, next.upstreamModel)
+				g.emitFallbackEvent(requestID, inv, cand, next, 0, safeErr)
 				continue
 			}
 			// Network failure on last compatible candidate.
+			g.emitUpstreamErrorEvent(requestID, inv, cand, http.StatusBadGateway, safeErr)
 			obs := g.startTelemetry(r.Context(), requestID, startTime, inv, cand, resolved.costOverride, isTranslated)
 			obs.Finish(TelemetryFinish{
 				StatusCode:   http.StatusBadGateway,
@@ -712,8 +853,10 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 16*1024))
 			_ = resp.Body.Close()
 			next := compatible[i+1].cand
-			g.logf("headlamp proxy: request_id=%s model=%s candidate %s/%s returned HTTP %d, falling back to %s/%s",
-				requestID, inv.requestedModel, cand.provider.Name, cand.upstreamModel, resp.StatusCode, next.provider.Name, next.upstreamModel)
+			reason := fmt.Sprintf("HTTP %d", resp.StatusCode)
+			g.logf("headlamp proxy: request_id=%s model=%s candidate %s/%s returned %s, falling back to %s/%s",
+				requestID, inv.requestedModel, cand.provider.Name, cand.upstreamModel, reason, next.provider.Name, next.upstreamModel)
+			g.emitFallbackEvent(requestID, inv, cand, next, resp.StatusCode, reason)
 			lastErr = fmt.Errorf("upstream %s returned HTTP %d", cand.provider.Name, resp.StatusCode)
 			continue
 		}
@@ -737,6 +880,21 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 	defer lastResp.Body.Close()
 
 	observer := g.startTelemetry(r.Context(), requestID, startTime, inv, lastCand, resolved.costOverride, lastTranslated)
+	// Ensure token usage is tracked for quotaTicket.Release even when no TokenReporter is wired.
+	var tokenTracker *fallbackTokenObserver
+	if quotaTicket != nil {
+		if _, hasReporter := observer.(TokenReporter); !hasReporter {
+			tokenTracker = &fallbackTokenObserver{inner: observer}
+			observer = tokenTracker
+		}
+		defer func() {
+			if tr, ok := observer.(TokenReporter); ok {
+				usedTokens = tr.TotalTokens()
+			} else if tokenTracker != nil {
+				usedTokens = tokenTracker.TotalTokens()
+			}
+		}()
+	}
 	observer.SetResponseHeaders(flattenHeaders(lastResp.Header))
 
 	// Handle non-2xx upstream response (status + error envelope).
@@ -750,6 +908,9 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 		errMsg := extractUpstreamErrorMessage(errBody, fmt.Sprintf("upstream returned HTTP %d", lastResp.StatusCode))
 		if readErr != nil {
 			errMsg = readErr.Error()
+		}
+		if lastResp.StatusCode >= 500 {
+			g.emitUpstreamErrorEvent(requestID, inv, lastCand, lastResp.StatusCode, errMsg)
 		}
 		observer.Finish(TelemetryFinish{
 			StatusCode:   lastResp.StatusCode,
@@ -782,6 +943,174 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 	g.handleJSONResponse(w, lastResp, observer, startTime, lastAttemptStart, inv, lastCand, lastTranslated)
 }
 
+func (g *Gateway) emitFallbackEvent(requestID string, inv llmInvocation, failed, next routeCandidate, statusCode int, reason string) {
+	if g.events == nil {
+		return
+	}
+	subject := ""
+	if inv.principal != nil {
+		subject = inv.principal.Subject
+	}
+	g.events.Emit(config.WebhookEventUpstreamFallback, map[string]any{
+		"request_id":      requestID,
+		"subject":         subject,
+		"model":           inv.requestedModel,
+		"failed_provider": failed.provider.Name,
+		"failed_model":    failed.upstreamModel,
+		"next_provider":   next.provider.Name,
+		"next_model":      next.upstreamModel,
+		"status_code":     statusCode,
+		"reason":          reason,
+	})
+}
+
+func (g *Gateway) emitUpstreamErrorEvent(requestID string, inv llmInvocation, cand routeCandidate, statusCode int, errMsg string) {
+	if g.events == nil {
+		return
+	}
+	subject := ""
+	if inv.principal != nil {
+		subject = inv.principal.Subject
+	}
+	g.events.Emit(config.WebhookEventUpstreamError, map[string]any{
+		"request_id":     requestID,
+		"subject":        subject,
+		"model":          inv.requestedModel,
+		"provider":       cand.provider.Name,
+		"upstream_model": cand.upstreamModel,
+		"status_code":    statusCode,
+		"error":          errMsg,
+	})
+}
+
+// fallbackTokenObserver wraps a StreamObserver that does not implement TokenReporter
+// so QuotaTicket.Release still receives accurate total token counts.
+type fallbackTokenObserver struct {
+	inner     StreamObserver
+	input     int64
+	output    int64
+	cacheRead int64
+	cacheWr   int64
+	thoughts  int64
+	total     int64
+}
+
+func (f *fallbackTokenObserver) SetResponseHeaders(h map[string]string) { f.inner.SetResponseHeaders(h) }
+func (f *fallbackTokenObserver) Finish(fin TelemetryFinish)             { f.inner.Finish(fin) }
+
+func (f *fallbackTokenObserver) OnSSEEvent(eventName string, data []byte) {
+	f.inner.OnSSEEvent(eventName, data)
+	f.extractTokens(data)
+}
+
+func (f *fallbackTokenObserver) OnJSONResponse(body []byte) {
+	f.inner.OnJSONResponse(body)
+	f.extractTokens(body)
+}
+
+func (f *fallbackTokenObserver) TotalTokens() int64 {
+	if f.total > 0 {
+		return f.total
+	}
+	return f.input + f.output + f.cacheRead + f.cacheWr + f.thoughts
+}
+
+func (f *fallbackTokenObserver) extractTokens(data []byte) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return
+	}
+	var probe struct {
+		Usage *struct {
+			PromptTokens             int64 `json:"prompt_tokens"`
+			CompletionTokens         int64 `json:"completion_tokens"`
+			TotalTokens              int64 `json:"total_tokens"`
+			InputTokens              int64 `json:"input_tokens"`
+			OutputTokens             int64 `json:"output_tokens"`
+			CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+		} `json:"usage"`
+		Message *struct {
+			Usage *struct {
+				InputTokens              int64 `json:"input_tokens"`
+				OutputTokens             int64 `json:"output_tokens"`
+				CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+				CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+			} `json:"usage"`
+		} `json:"message"`
+		Response *struct {
+			Usage *struct {
+				TotalTokens  int64 `json:"total_tokens"`
+				InputTokens  int64 `json:"input_tokens"`
+				OutputTokens int64 `json:"output_tokens"`
+			} `json:"usage"`
+		} `json:"response"`
+		UsageMetadata *struct {
+			TotalTokenCount      int64 `json:"totalTokenCount"`
+			PromptTokenCount     int64 `json:"promptTokenCount"`
+			CandidatesTokenCount int64 `json:"candidatesTokenCount"`
+			ThoughtsTokenCount   int64 `json:"thoughtsTokenCount"`
+		} `json:"usageMetadata"`
+	}
+	if err := json.Unmarshal(trimmed, &probe); err != nil {
+		return
+	}
+	if probe.Usage != nil {
+		if probe.Usage.TotalTokens > 0 {
+			f.total = probe.Usage.TotalTokens
+		}
+		if probe.Usage.PromptTokens > 0 {
+			f.input = probe.Usage.PromptTokens
+		}
+		if probe.Usage.CompletionTokens > 0 {
+			f.output = probe.Usage.CompletionTokens
+		}
+		if probe.Usage.InputTokens > 0 {
+			f.input = probe.Usage.InputTokens
+		}
+		if probe.Usage.OutputTokens > 0 {
+			f.output = probe.Usage.OutputTokens
+		}
+		if probe.Usage.CacheReadInputTokens > 0 {
+			f.cacheRead = probe.Usage.CacheReadInputTokens
+		}
+		if probe.Usage.CacheCreationInputTokens > 0 {
+			f.cacheWr = probe.Usage.CacheCreationInputTokens
+		}
+	}
+	if probe.Message != nil && probe.Message.Usage != nil {
+		u := probe.Message.Usage
+		if u.InputTokens > 0 {
+			f.input = u.InputTokens
+		}
+		if u.OutputTokens > 0 {
+			f.output = u.OutputTokens
+		}
+		if u.CacheReadInputTokens > 0 {
+			f.cacheRead = u.CacheReadInputTokens
+		}
+		if u.CacheCreationInputTokens > 0 {
+			f.cacheWr = u.CacheCreationInputTokens
+		}
+	}
+	if probe.Response != nil && probe.Response.Usage != nil {
+		u := probe.Response.Usage
+		if u.TotalTokens > 0 {
+			f.total = u.TotalTokens
+		} else if u.InputTokens+u.OutputTokens > 0 {
+			f.total = u.InputTokens + u.OutputTokens
+		}
+	}
+	if probe.UsageMetadata != nil {
+		u := probe.UsageMetadata
+		if u.TotalTokenCount > 0 {
+			f.total = u.TotalTokenCount
+		} else if u.PromptTokenCount+u.CandidatesTokenCount+u.ThoughtsTokenCount > 0 {
+			f.total = u.PromptTokenCount + u.CandidatesTokenCount + u.ThoughtsTokenCount
+		}
+	}
+}
+
 func (g *Gateway) startTelemetry(
 	ctx context.Context,
 	requestID string,
@@ -810,6 +1139,8 @@ func (g *Gateway) startTelemetry(
 		RequestHeaders:  inv.reqHeaders,
 		RequestBody:     inv.reqBody,
 		CostOverride:    costOverride,
+		GuardrailAction: inv.guardrailAction,
+		GuardrailHits:   inv.guardrailHits,
 	})
 	if obs == nil {
 		return noopObserver{}

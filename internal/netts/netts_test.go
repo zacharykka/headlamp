@@ -286,7 +286,7 @@ func TestWrapTLSListener_Modes(t *testing.T) {
 		}
 	})
 
-	t.Run("acme_dns01 returns clear M2 error", func(t *testing.T) {
+	t.Run("acme_dns01 via WrapTLSListener points callers to WrapTLSListenerWithACME", func(t *testing.T) {
 		rawLn, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -296,13 +296,14 @@ func TestWrapTLSListener_Modes(t *testing.T) {
 		_, err = WrapTLSListener(rawLn, config.TLSConfig{
 			Mode:        config.TLSModeACMEDNS01,
 			Domain:      "ai.internal.example.com",
-			DNSProvider: "cloudflare",
+			DNSProvider: config.DNSProviderCloudflare,
+			DNSAPIToken: "token",
 		})
 		if err == nil {
-			t.Fatal("expected error for acme_dns01 in M1")
+			t.Fatal("expected error for acme_dns01 via WrapTLSListener without stateDir")
 		}
-		if !strings.Contains(err.Error(), "M2") {
-			t.Errorf("expected error to mention M2, got: %v", err)
+		if !strings.Contains(err.Error(), "WrapTLSListenerWithACME") {
+			t.Errorf("expected error to mention WrapTLSListenerWithACME, got: %v", err)
 		}
 	})
 
@@ -464,6 +465,7 @@ func TestNewServer_Validation(t *testing.T) {
 		t.Fatal("expected error when neither tsnet nor local_listen is enabled")
 	}
 
+	// Missing Cloudflare token fails validation cleanly.
 	_, err = NewServer(config.ServerConfig{
 		TSNet: config.TSNetConfig{
 			Enabled:  true,
@@ -473,11 +475,29 @@ func TestNewServer_Validation(t *testing.T) {
 		TLS: config.TLSConfig{
 			Mode:        config.TLSModeACMEDNS01,
 			Domain:      "ai.example.com",
-			DNSProvider: "cloudflare",
+			DNSProvider: config.DNSProviderCloudflare,
 		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "M2") {
-		t.Fatalf("expected M2 error for acme_dns01, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "dns_api_token") {
+		t.Fatalf("expected dns_api_token error for cloudflare acme_dns01, got %v", err)
+	}
+
+	// Valid acme_dns01 config constructs Server cleanly.
+	_, err = NewServer(config.ServerConfig{
+		TSNet: config.TSNetConfig{
+			Enabled:  true,
+			Hostname: "headlamp",
+			StateDir: t.TempDir(),
+		},
+		TLS: config.TLSConfig{
+			Mode:        config.TLSModeACMEDNS01,
+			Domain:      "ai.example.com",
+			DNSProvider: config.DNSProviderCloudflare,
+			DNSAPIToken: "cf-token",
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected valid acme_dns01 NewServer to succeed, got %v", err)
 	}
 }
 

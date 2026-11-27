@@ -590,6 +590,58 @@ func TestRecorderAsyncFlushWithoutAndWithAuditPayloads(t *testing.T) {
 			t.Fatalf("expected Redacted=true and redacted Set-Cookie, got %+v", pResp)
 		}
 	})
+
+	// Case E: GuardrailAction/GuardrailHits persisted, UpdateAuditConfig takes effect live,
+	// and WithOnRecorded fires on each persisted UsageLog.
+	t.Run("guardrail_fields_live_audit_config_and_on_recorded_callback", func(t *testing.T) {
+		st := newTestSQLiteStore(t)
+		var recordedLogs []store.UsageLog
+		rec := NewRecorder(st, config.AuditConfig{StorePayloads: false, RetentionDays: 7}, pt, RecorderOptions{
+			DisableAutoPurge: true,
+		}).WithOnRecorded(func(log store.UsageLog) {
+			recordedLogs = append(recordedLogs, log)
+		})
+
+		// Initially StorePayloads=false
+		if rec.AuditConfig().StorePayloads {
+			t.Fatal("expected StorePayloads=false initially")
+		}
+		// Toggle live via UpdateAuditConfig
+		rec.UpdateAuditConfig(config.AuditConfig{StorePayloads: true, RetentionDays: 14})
+		if got := rec.AuditConfig(); !got.StorePayloads || got.RetentionDays != 14 {
+			t.Fatalf("AuditConfig after update = %+v", got)
+		}
+
+		obs := rec.Start(ctx, RequestInfo{
+			RequestID:       "req-guard-1",
+			Principal:       &auth.Principal{Subject: "alice@example.com", AuthSource: auth.AuthSourceTSNet},
+			Protocol:        ProtocolOpenAIChat,
+			Provider:        "openai",
+			ProviderType:    config.ProviderTypeOpenAI,
+			RequestedModel:  "gpt-5",
+			UpstreamModel:   "gpt-5",
+			RequestBody:     []byte(`{"messages":[{"role":"user","content":"[REDACTED:AWS_KEY]"}]}`),
+			GuardrailAction: config.GuardrailActionRedact,
+			GuardrailHits:   []string{"builtin-aws-access-key"},
+		})
+		obs.OnJSONResponse([]byte(`{"usage":{"prompt_tokens":1000,"completion_tokens":100,"total_tokens":1100}}`))
+		obs.Finish(200, 120, 0, "")
+
+		if err := rec.Close(ctx); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		if len(recordedLogs) != 1 || recordedLogs[0].GuardrailAction != config.GuardrailActionRedact ||
+			len(recordedLogs[0].GuardrailHits) != 1 || recordedLogs[0].GuardrailHits[0] != "builtin-aws-access-key" {
+			t.Fatalf("WithOnRecorded callback received unexpected logs: %+v", recordedLogs)
+		}
+
+		// Audit payload must exist because UpdateAuditConfig enabled StorePayloads before Start.
+		payload, err := st.GetAuditPayloadByUsageLogID(ctx, recordedLogs[0].ID)
+		if err != nil || !strings.Contains(payload.RequestBody, "REDACTED:AWS_KEY") {
+			t.Fatalf("expected audit payload persisted after runtime UpdateAuditConfig, got (%+v, %v)", payload, err)
+		}
+	})
 }
 
 func TestDefaultPricingSyncedWithSpec(t *testing.T) {

@@ -35,6 +35,7 @@ type RecorderOptions struct {
 	PurgeInterval     time.Duration
 	DisableAutoPurge  bool
 	OnError           func(error)
+	OnRecorded        func(store.UsageLog)
 }
 
 // RequestInfo captures request metadata available before proxying to an upstream provider.
@@ -54,6 +55,8 @@ type RequestInfo struct {
 	RequestBody     []byte
 	ResponseHeaders map[string]string
 	PriceOverride   *PriceOverride
+	GuardrailAction string
+	GuardrailHits   []string
 }
 
 type recordJob struct {
@@ -64,15 +67,16 @@ type recordJob struct {
 // Recorder asynchronously persists usage logs and optional audit payloads into store.Store.
 type Recorder struct {
 	store             store.Store
-	audit             config.AuditConfig
 	pricing           *PricingTable
 	maxAuditBodyBytes int
 	onError           func(error)
 
-	mu      sync.RWMutex
-	closed  bool
-	jobs    chan recordJob
-	dropped atomic.Int64
+	mu         sync.RWMutex
+	audit      config.AuditConfig
+	onRecorded func(store.UsageLog)
+	closed     bool
+	jobs       chan recordJob
+	dropped    atomic.Int64
 
 	workerDone chan struct{}
 	stopPurge  chan struct{}
@@ -81,7 +85,7 @@ type Recorder struct {
 }
 
 // NewRecorder creates a Recorder and starts its background persistence worker
-// (plus an optional audit payload retention purge loop when retention_days > 0).
+// (plus an optional audit payload retention purge loop).
 func NewRecorder(st store.Store, audit config.AuditConfig, pricing *PricingTable, opts ...RecorderOptions) *Recorder {
 	var opt RecorderOptions
 	if len(opts) > 0 {
@@ -108,19 +112,47 @@ func NewRecorder(st store.Store, audit config.AuditConfig, pricing *PricingTable
 		pricing:           pricing,
 		maxAuditBodyBytes: opt.MaxAuditBodyBytes,
 		onError:           opt.OnError,
+		onRecorded:        opt.OnRecorded,
 		jobs:              make(chan recordJob, opt.QueueSize),
 		workerDone:        make(chan struct{}),
 	}
 
 	go r.runWorker()
 
-	if !opt.DisableAutoPurge && audit.RetentionDays > 0 && st != nil {
+	if !opt.DisableAutoPurge && st != nil {
 		r.stopPurge = make(chan struct{})
 		r.purgeDone = make(chan struct{})
 		go r.runPurgeLoop(opt.PurgeInterval)
 	}
 
 	return r
+}
+
+// WithOnRecorded registers a callback invoked after each UsageLog is persisted to storage.
+// Safe to call before or during serving (for example, to feed live spend into the quota tracker).
+func (r *Recorder) WithOnRecorded(fn func(store.UsageLog)) *Recorder {
+	r.mu.Lock()
+	r.onRecorded = fn
+	r.mu.Unlock()
+	return r
+}
+
+// AuditConfig returns the active runtime audit configuration.
+func (r *Recorder) AuditConfig() config.AuditConfig {
+	r.mu.RLock()
+	cfg := r.audit
+	r.mu.RUnlock()
+	return cfg
+}
+
+// UpdateAuditConfig updates store_payloads and retention_days at runtime without restart.
+func (r *Recorder) UpdateAuditConfig(cfg config.AuditConfig) {
+	if cfg.RetentionDays < 0 {
+		cfg.RetentionDays = 0
+	}
+	r.mu.Lock()
+	r.audit = cfg
+	r.mu.Unlock()
 }
 
 // Start begins observing a single LLM request. Call OnSSEEvent or OnJSONResponse as
@@ -132,12 +164,16 @@ func (r *Recorder) Start(_ context.Context, info RequestInfo) *RequestObserver {
 	if info.Principal != nil {
 		info.Principal = info.Principal.Clone()
 	}
-	if r.audit.StorePayloads && len(info.RequestBody) > 0 {
+	info.GuardrailHits = slices.Clone(info.GuardrailHits)
+
+	storePayloads := r.AuditConfig().StorePayloads
+	if storePayloads && len(info.RequestBody) > 0 {
 		info.RequestBody = capBytes(info.RequestBody, r.maxAuditBodyBytes)
 	} else {
 		// Release reference to potentially large request payload when payload auditing is off.
 		info.RequestBody = nil
 	}
+
 	var reqRedacted, respRedacted bool
 	if len(info.RequestHeaders) > 0 {
 		info.RequestHeaders, reqRedacted = sanitizeHeaders(info.RequestHeaders)
@@ -147,11 +183,12 @@ func (r *Recorder) Start(_ context.Context, info RequestInfo) *RequestObserver {
 	}
 
 	return &RequestObserver{
-		recorder:     r,
-		info:         info,
-		parser:       NewSSEUsageParser(info.Protocol),
-		reqRedacted:  reqRedacted,
-		respRedacted: respRedacted,
+		recorder:      r,
+		info:          info,
+		parser:        NewSSEUsageParser(info.Protocol),
+		storePayloads: storePayloads,
+		reqRedacted:   reqRedacted,
+		respRedacted:  respRedacted,
 	}
 }
 
@@ -160,9 +197,11 @@ func (r *Recorder) Record(info RequestInfo, usage Usage, statusCode int, latency
 	if info.Timestamp.IsZero() {
 		info.Timestamp = time.Now().UTC()
 	}
+	info.GuardrailHits = slices.Clone(info.GuardrailHits)
+	storePayloads := r.AuditConfig().StorePayloads
 	var reqBody []byte
 	var respBody string
-	if r.audit.StorePayloads {
+	if storePayloads {
 		reqBody = capBytes(info.RequestBody, r.maxAuditBodyBytes)
 		respBody = string(capBytes(responseBody, r.maxAuditBodyBytes))
 	}
@@ -170,15 +209,16 @@ func (r *Recorder) Record(info RequestInfo, usage Usage, statusCode int, latency
 	var reqRedacted, respRedacted bool
 	info.RequestHeaders, reqRedacted = sanitizeHeaders(info.RequestHeaders)
 	info.ResponseHeaders, respRedacted = sanitizeHeaders(info.ResponseHeaders)
-	r.enqueue(info, usage, statusCode, latencyMS, ttftMS, errMsg, respBody, reqRedacted || respRedacted)
+	r.enqueue(info, usage, statusCode, latencyMS, ttftMS, errMsg, respBody, reqRedacted || respRedacted, storePayloads)
 }
 
-// PurgeNow immediately deletes audit_payloads older than audit.RetentionDays.
+// PurgeNow immediately deletes audit_payloads older than the active audit.RetentionDays.
 func (r *Recorder) PurgeNow(ctx context.Context) (int64, error) {
-	if r.store == nil || r.audit.RetentionDays <= 0 {
+	auditCfg := r.AuditConfig()
+	if r.store == nil || auditCfg.RetentionDays <= 0 {
 		return 0, nil
 	}
-	cutoff := time.Now().UTC().Add(-time.Duration(r.audit.RetentionDays) * 24 * time.Hour)
+	cutoff := time.Now().UTC().Add(-time.Duration(auditCfg.RetentionDays) * 24 * time.Hour)
 	return r.store.PurgeAuditPayloads(ctx, cutoff)
 }
 
@@ -216,7 +256,7 @@ func (r *Recorder) Close(ctx context.Context) error {
 	}
 }
 
-func (r *Recorder) enqueue(info RequestInfo, usage Usage, statusCode int, latencyMS, ttftMS int64, errMsg string, responseBody string, redacted bool) {
+func (r *Recorder) enqueue(info RequestInfo, usage Usage, statusCode int, latencyMS, ttftMS int64, errMsg string, responseBody string, redacted bool, storePayloads bool) {
 	if r == nil || r.store == nil {
 		return
 	}
@@ -260,6 +300,8 @@ func (r *Recorder) enqueue(info RequestInfo, usage Usage, statusCode int, latenc
 		TTFTMS:           ttftMS,
 		StatusCode:       statusCode,
 		ErrorMessage:     errMsg,
+		GuardrailAction:  info.GuardrailAction,
+		GuardrailHits:    slices.Clone(info.GuardrailHits),
 	}
 	if info.Principal != nil {
 		usageLog.Subject = info.Principal.Subject
@@ -271,7 +313,7 @@ func (r *Recorder) enqueue(info RequestInfo, usage Usage, statusCode int, latenc
 	}
 
 	var auditPayload *store.AuditPayload
-	if r.audit.StorePayloads {
+	if storePayloads {
 		auditPayload = &store.AuditPayload{
 			ID:              uuid.NewString(),
 			UsageLogID:      logID,
@@ -313,6 +355,13 @@ func (r *Recorder) runWorker() {
 			}
 		}
 		cancel()
+
+		r.mu.RLock()
+		cb := r.onRecorded
+		r.mu.RUnlock()
+		if cb != nil {
+			cb(job.usageLog)
+		}
 	}
 }
 
@@ -344,9 +393,10 @@ func (r *Recorder) reportError(err error) {
 // RequestObserver tracks streaming or non-streaming usage for a single in-flight request.
 // It is safe for concurrent use.
 type RequestObserver struct {
-	recorder *Recorder
-	info     RequestInfo
-	parser   *SSEUsageParser
+	recorder      *Recorder
+	info          RequestInfo
+	parser        *SSEUsageParser
+	storePayloads bool
 
 	mu            sync.Mutex
 	jsonUsage     Usage
@@ -365,7 +415,7 @@ func (o *RequestObserver) OnSSEEvent(eventName string, data []byte) {
 	}
 	o.parser.Feed(eventName, data)
 
-	if o.recorder == nil || !o.recorder.audit.StorePayloads {
+	if o.recorder == nil || !o.storePayloads {
 		return
 	}
 	o.mu.Lock()
@@ -393,7 +443,7 @@ func (o *RequestObserver) OnJSONResponse(body []byte) {
 	o.jsonUsage = parsed
 	o.hasJSONUsage = true
 
-	if o.recorder != nil && o.recorder.audit.StorePayloads {
+	if o.recorder != nil && o.storePayloads {
 		o.respBuf.Reset()
 		o.respTruncated = false
 		o.respBuf.Write(capBytes(body, o.recorder.maxAuditBodyBytes))
@@ -446,12 +496,13 @@ func (o *RequestObserver) Finish(statusCode int, latencyMS, ttftMS int64, errMsg
 	usage := o.jsonUsage
 	respBody := o.respBuf.String()
 	redacted := o.reqRedacted || o.respRedacted
+	storePayloads := o.storePayloads
 	o.mu.Unlock()
 
 	if !hasJSON {
 		usage = o.parser.Usage()
 	}
-	o.recorder.enqueue(info, usage, statusCode, latencyMS, ttftMS, errMsg, respBody, redacted)
+	o.recorder.enqueue(info, usage, statusCode, latencyMS, ttftMS, errMsg, respBody, redacted, storePayloads)
 }
 
 func (o *RequestObserver) appendAuditLocked(s string) {

@@ -5,9 +5,14 @@ COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(BUILD_DATE)
 
-.PHONY: build test test-race vet run-dev clean
+.PHONY: build web-build test test-race vet run-dev clean
 
-build:
+web-build:
+	@if [ ! -d web/node_modules ]; then npm --prefix web ci; fi
+	npm --prefix web run build
+	@touch web/dist/.gitkeep
+
+build: web-build
 	@mkdir -p $(dir $(BINARY))
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BINARY) $(PKG)
 

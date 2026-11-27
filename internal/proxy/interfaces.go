@@ -55,6 +55,8 @@ type TelemetryStart struct {
 	RequestHeaders  http.Header
 	RequestBody     []byte
 	CostOverride    *CostOverride
+	GuardrailAction string
+	GuardrailHits   []string
 }
 
 // TelemetryFinish holds final outcome and timing metrics when a request completes.
@@ -74,9 +76,62 @@ type StreamObserver interface {
 	Finish(TelemetryFinish)
 }
 
+// TokenReporter is an optional interface that a StreamObserver may implement
+// to expose exact normalized total token usage for QuotaTicket.Release.
+type TokenReporter interface {
+	TotalTokens() int64
+}
+
 // TelemetryFactory creates a StreamObserver for each proxied LLM request.
 type TelemetryFactory interface {
 	Start(ctx context.Context, info TelemetryStart) StreamObserver
+}
+
+// QuotaTicket represents an acquired rate-limit and concurrency slot.
+// Release MUST be invoked once when the request completes.
+type QuotaTicket interface {
+	Release(totalTokens int64)
+}
+
+// QuotaRejection describes why QuotaLimiter.Acquire rejected a request (HTTP 429).
+type QuotaRejection struct {
+	Scope         string
+	Metric        string
+	Reason        string
+	RetryAfterSec int
+}
+
+// QuotaLimiter enforces RPM, TPM, max concurrency, and spend budgets before forwarding.
+type QuotaLimiter interface {
+	Acquire(ctx context.Context, p *auth.Principal) (QuotaTicket, *QuotaRejection, error)
+}
+
+// GuardrailRequest carries metadata and raw JSON body for pre-request inspection.
+type GuardrailRequest struct {
+	RequestID string
+	Principal *auth.Principal
+	Protocol  string
+	Model     string
+	Body      []byte
+}
+
+// GuardrailDecision is the outcome of local regex and/or sync_review webhook inspection.
+type GuardrailDecision struct {
+	Action       string   // allow | log_only | redact | modify | block
+	ModifiedBody []byte   // Rewritten valid JSON when Action is redact or modify
+	Hits         []string // Matched rule IDs / webhook IDs
+	Reason       string   // Human-readable block reason when Action == "block"
+	StatusCode   int      // Optional HTTP status when blocked (defaults to 400)
+}
+
+// GuardrailInspector inspects and optionally redacts or blocks incoming LLM request payloads.
+type GuardrailInspector interface {
+	Inspect(ctx context.Context, req GuardrailRequest) (*GuardrailDecision, error)
+}
+
+// EventDispatcher emits asynchronous governance/operational events (e.g. upstream.fallback, upstream.error).
+type EventDispatcher interface {
+	Emit(eventType string, payload any)
 }
 
 type noopObserver struct{}

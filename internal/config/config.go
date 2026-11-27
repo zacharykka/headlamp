@@ -21,6 +21,12 @@ const (
 	TLSModeStatic    = "static"
 	TLSModeACMEDNS01 = "acme_dns01"
 
+	DNSProviderCloudflare = "cloudflare"
+	DNSProviderWebhook    = "webhook"
+
+	// DefaultACMEDirectoryURL is Let's Encrypt's production ACME v2 directory URL.
+	DefaultACMEDirectoryURL = "https://acme-v02.api.letsencrypt.org/directory"
+
 	StorageDriverSQLite   = "sqlite"
 	StorageDriverPostgres = "postgres"
 
@@ -28,16 +34,36 @@ const (
 	ProviderTypeAnthropic = "anthropic"
 	ProviderTypeGemini    = "gemini"
 	ProviderTypeOllama    = "ollama"
+
+	GuardrailCategorySecret = "secret"
+	GuardrailCategoryPII    = "pii"
+	GuardrailCategoryCustom = "custom"
+
+	GuardrailActionLogOnly = "log_only"
+	GuardrailActionRedact  = "redact"
+	GuardrailActionBlock   = "block"
+
+	WebhookTypeSyncReview = "sync_review"
+	WebhookTypeAsyncEvent = "async_event"
+
+	WebhookEventBudgetThreshold    = "budget.threshold"
+	WebhookEventBudgetExceeded     = "budget.exceeded"
+	WebhookEventGuardrailTriggered = "guardrail.triggered"
+	WebhookEventUpstreamFallback   = "upstream.fallback"
+	WebhookEventUpstreamError      = "upstream.error"
 )
 
 // Config holds the full Headlamp gateway configuration.
 // Authorization is driven purely by Tailnet/Headscale grants (or synthesized grants for static API tokens and dev mode).
 type Config struct {
-	Server    ServerConfig     `yaml:"server"`
-	Storage   StorageConfig    `yaml:"storage"`
-	Providers []ProviderConfig `yaml:"providers"`
-	Routes    []RouteConfig    `yaml:"routes"`
-	Audit     AuditConfig      `yaml:"audit"`
+	Server     ServerConfig     `yaml:"server"`
+	Storage    StorageConfig    `yaml:"storage"`
+	Providers  []ProviderConfig `yaml:"providers"`
+	Routes     []RouteConfig    `yaml:"routes"`
+	Budgets    []BudgetConfig   `yaml:"budgets"`
+	Guardrails GuardrailsConfig `yaml:"guardrails"`
+	Webhooks   []WebhookConfig  `yaml:"webhooks"`
+	Audit      AuditConfig      `yaml:"audit"`
 
 	// MasterKey is populated exclusively from HEADLAMP_MASTER_KEY (never from YAML).
 	MasterKey string `yaml:"-"`
@@ -68,12 +94,15 @@ type TSNetConfig struct {
 
 // TLSConfig configures optional HTTPS termination on the Tailnet listener.
 type TLSConfig struct {
-	Mode        string `yaml:"mode"` // none | static | acme_dns01
-	CertFile    string `yaml:"cert_file"`
-	KeyFile     string `yaml:"key_file"`
-	Domain      string `yaml:"domain"`
-	ACMEEmail   string `yaml:"acme_email"`
-	DNSProvider string `yaml:"dns_provider"`
+	Mode             string `yaml:"mode"` // none | static | acme_dns01
+	CertFile         string `yaml:"cert_file"`
+	KeyFile          string `yaml:"key_file"`
+	Domain           string `yaml:"domain"`
+	ACMEEmail        string `yaml:"acme_email"`
+	ACMEDirectoryURL string `yaml:"acme_directory_url"` // optional override; empty uses Let's Encrypt production
+	DNSProvider      string `yaml:"dns_provider"`       // cloudflare | webhook
+	DNSAPIToken      string `yaml:"dns_api_token"`      // env HEADLAMP_TLS_DNS_API_TOKEN
+	DNSWebhookURL    string `yaml:"dns_webhook_url"`    // required when dns_provider == "webhook"
 }
 
 // APITokenConfig defines a static fallback API token for non-Tailnet callers.
@@ -143,13 +172,95 @@ func (r RouteConfig) IsEnabled() bool {
 	return *r.Enabled
 }
 
+// BudgetConfig configures rate limiting (RPM/TPM/concurrency) and USD spend caps for a scope.
+// Scope may be "*" (global), "tag:<name>", or a specific user subject.
+type BudgetConfig struct {
+	Scope         string   `yaml:"scope"`
+	RPM           int      `yaml:"rpm"`
+	TPM           int64    `yaml:"tpm"`
+	MaxConcurrent int      `yaml:"max_concurrent"`
+	DailyUSD      *float64 `yaml:"daily_usd,omitempty"`
+	MonthlyUSD    *float64 `yaml:"monthly_usd,omitempty"`
+	SoftAlertPct  int      `yaml:"soft_alert_pct"`
+	Enabled       *bool    `yaml:"enabled,omitempty"`
+}
+
+// IsEnabled reports whether the budget is enabled (defaults to true when omitted in YAML).
+func (b BudgetConfig) IsEnabled() bool {
+	if b.Enabled == nil {
+		return true
+	}
+	return *b.Enabled
+}
+
+// GuardrailsConfig configures built-in detector seeding and custom regex guardrail rules.
+type GuardrailsConfig struct {
+	BuiltinDefaults *bool                 `yaml:"builtin_defaults,omitempty"`
+	Rules           []GuardrailRuleConfig `yaml:"rules"`
+}
+
+// UseBuiltinDefaults reports whether Headlamp's built-in secret/PII detectors should be seeded (defaults to true).
+func (g GuardrailsConfig) UseBuiltinDefaults() bool {
+	if g.BuiltinDefaults == nil {
+		return true
+	}
+	return *g.BuiltinDefaults
+}
+
+// GuardrailRuleConfig defines a regex guardrail rule.
+type GuardrailRuleConfig struct {
+	ID       string `yaml:"id"`
+	Name     string `yaml:"name"`
+	Category string `yaml:"category"` // secret | pii | custom
+	Pattern  string `yaml:"pattern"`
+	Action   string `yaml:"action"` // log_only | redact | block
+	Enabled  *bool  `yaml:"enabled,omitempty"`
+}
+
+// IsEnabled reports whether the guardrail rule is enabled (defaults to true when omitted in YAML).
+func (r GuardrailRuleConfig) IsEnabled() bool {
+	if r.Enabled == nil {
+		return true
+	}
+	return *r.Enabled
+}
+
+// WebhookConfig defines a synchronous pre-request review webhook or an asynchronous event webhook.
+type WebhookConfig struct {
+	ID        string   `yaml:"id"`
+	Name      string   `yaml:"name"`
+	URL       string   `yaml:"url"`
+	Type      string   `yaml:"type"` // sync_review | async_event
+	Secret    string   `yaml:"secret"`
+	Events    []string `yaml:"events"`
+	TimeoutMS int      `yaml:"timeout_ms"`
+	FailOpen  *bool    `yaml:"fail_open,omitempty"`
+	Enabled   *bool    `yaml:"enabled,omitempty"`
+}
+
+// IsFailOpen reports whether sync_review webhook errors allow requests through (defaults to true).
+func (w WebhookConfig) IsFailOpen() bool {
+	if w.FailOpen == nil {
+		return true
+	}
+	return *w.FailOpen
+}
+
+// IsEnabled reports whether the webhook is enabled (defaults to true when omitted in YAML).
+func (w WebhookConfig) IsEnabled() bool {
+	if w.Enabled == nil {
+		return true
+	}
+	return *w.Enabled
+}
+
 // AuditConfig configures optional request/response body storage and retention.
 type AuditConfig struct {
 	StorePayloads bool `yaml:"store_payloads"`
 	RetentionDays int  `yaml:"retention_days"`
 }
 
-// DefaultConfig returns a Config populated with safe M1 defaults.
+// DefaultConfig returns a Config populated with safe defaults.
 func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
@@ -186,6 +297,21 @@ func DefaultBaseURL(providerType string) string {
 		return "http://127.0.0.1:11434"
 	default:
 		return ""
+	}
+}
+
+// IsValidWebhookEvent reports whether event is a supported async webhook event name.
+func IsValidWebhookEvent(event string) bool {
+	switch strings.ToLower(strings.TrimSpace(event)) {
+	case WebhookEventBudgetThreshold,
+		WebhookEventBudgetExceeded,
+		WebhookEventGuardrailTriggered,
+		WebhookEventUpstreamFallback,
+		WebhookEventUpstreamError,
+		"*":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -293,8 +419,17 @@ func applyEnvOverrides(cfg *Config, lookupEnv func(string) (string, bool)) error
 	if v, ok := lookupEnv("HEADLAMP_TLS_ACME_EMAIL"); ok {
 		cfg.Server.TLS.ACMEEmail = strings.TrimSpace(v)
 	}
+	if v, ok := lookupEnv("HEADLAMP_TLS_ACME_DIRECTORY_URL"); ok {
+		cfg.Server.TLS.ACMEDirectoryURL = strings.TrimSpace(v)
+	}
 	if v, ok := lookupEnv("HEADLAMP_TLS_DNS_PROVIDER"); ok {
 		cfg.Server.TLS.DNSProvider = strings.TrimSpace(v)
+	}
+	if v, ok := lookupEnv("HEADLAMP_TLS_DNS_API_TOKEN"); ok {
+		cfg.Server.TLS.DNSAPIToken = strings.TrimSpace(v)
+	}
+	if v, ok := lookupEnv("HEADLAMP_TLS_DNS_WEBHOOK_URL"); ok {
+		cfg.Server.TLS.DNSWebhookURL = strings.TrimSpace(v)
 	}
 
 	if v, ok := lookupEnv("HEADLAMP_LOCAL_LISTEN"); ok {
@@ -358,11 +493,15 @@ func expandBracedEnv(s string, lookupEnv func(string) (string, bool)) string {
 
 func expandSecrets(cfg *Config, lookupEnv func(string) (string, bool)) {
 	cfg.Server.TSNet.AuthKey = expandBracedEnv(cfg.Server.TSNet.AuthKey, lookupEnv)
+	cfg.Server.TLS.DNSAPIToken = expandBracedEnv(cfg.Server.TLS.DNSAPIToken, lookupEnv)
 	for i := range cfg.Server.APITokens {
 		cfg.Server.APITokens[i].Token = expandBracedEnv(cfg.Server.APITokens[i].Token, lookupEnv)
 	}
 	for i := range cfg.Providers {
 		cfg.Providers[i].APIKey = expandBracedEnv(cfg.Providers[i].APIKey, lookupEnv)
+	}
+	for i := range cfg.Webhooks {
+		cfg.Webhooks[i].Secret = expandBracedEnv(cfg.Webhooks[i].Secret, lookupEnv)
 	}
 }
 
@@ -371,6 +510,9 @@ func applyDerivedDefaults(cfg *Config) {
 	if cfg.Server.TLS.Mode == "" {
 		cfg.Server.TLS.Mode = TLSModeNone
 	}
+	cfg.Server.TLS.DNSProvider = strings.ToLower(strings.TrimSpace(cfg.Server.TLS.DNSProvider))
+	cfg.Server.TLS.ACMEDirectoryURL = strings.TrimSpace(cfg.Server.TLS.ACMEDirectoryURL)
+	cfg.Server.TLS.DNSWebhookURL = strings.TrimSpace(cfg.Server.TLS.DNSWebhookURL)
 
 	if cfg.Server.TSNet.ListenPort == 0 {
 		if cfg.Server.TLS.Mode == TLSModeNone {
@@ -406,6 +548,36 @@ func applyDerivedDefaults(cfg *Config) {
 		cfg.Routes[i].Alias = strings.TrimSpace(cfg.Routes[i].Alias)
 		cfg.Routes[i].Provider = strings.TrimSpace(cfg.Routes[i].Provider)
 		cfg.Routes[i].Model = strings.TrimSpace(cfg.Routes[i].Model)
+	}
+	for i := range cfg.Budgets {
+		cfg.Budgets[i].Scope = strings.TrimSpace(cfg.Budgets[i].Scope)
+		if cfg.Budgets[i].SoftAlertPct == 0 {
+			cfg.Budgets[i].SoftAlertPct = 80
+		}
+	}
+	for i := range cfg.Guardrails.Rules {
+		cfg.Guardrails.Rules[i].ID = strings.TrimSpace(cfg.Guardrails.Rules[i].ID)
+		cfg.Guardrails.Rules[i].Name = strings.TrimSpace(cfg.Guardrails.Rules[i].Name)
+		cfg.Guardrails.Rules[i].Category = strings.ToLower(strings.TrimSpace(cfg.Guardrails.Rules[i].Category))
+		if cfg.Guardrails.Rules[i].Category == "" {
+			cfg.Guardrails.Rules[i].Category = GuardrailCategoryCustom
+		}
+		cfg.Guardrails.Rules[i].Action = strings.ToLower(strings.TrimSpace(cfg.Guardrails.Rules[i].Action))
+		if cfg.Guardrails.Rules[i].Action == "" {
+			cfg.Guardrails.Rules[i].Action = GuardrailActionRedact
+		}
+	}
+	for i := range cfg.Webhooks {
+		cfg.Webhooks[i].ID = strings.TrimSpace(cfg.Webhooks[i].ID)
+		cfg.Webhooks[i].Name = strings.TrimSpace(cfg.Webhooks[i].Name)
+		cfg.Webhooks[i].URL = strings.TrimSpace(cfg.Webhooks[i].URL)
+		cfg.Webhooks[i].Type = strings.ToLower(strings.TrimSpace(cfg.Webhooks[i].Type))
+		if cfg.Webhooks[i].TimeoutMS == 0 {
+			cfg.Webhooks[i].TimeoutMS = 2000
+		}
+		for j := range cfg.Webhooks[i].Events {
+			cfg.Webhooks[i].Events[j] = strings.ToLower(strings.TrimSpace(cfg.Webhooks[i].Events[j]))
+		}
 	}
 }
 
@@ -447,8 +619,24 @@ func (c *Config) Validate() error {
 			errs = append(errs, "server.tls.cert_file and server.tls.key_file are required when tls.mode is static")
 		}
 	case TLSModeACMEDNS01:
-		if strings.TrimSpace(c.Server.TLS.Domain) == "" || strings.TrimSpace(c.Server.TLS.DNSProvider) == "" {
-			errs = append(errs, "server.tls.domain and server.tls.dns_provider are required when tls.mode is acme_dns01")
+		if strings.TrimSpace(c.Server.TLS.Domain) == "" {
+			errs = append(errs, "server.tls.domain is required when tls.mode is acme_dns01")
+		}
+		switch c.Server.TLS.DNSProvider {
+		case DNSProviderCloudflare:
+		case DNSProviderWebhook:
+			if c.Server.TLS.DNSWebhookURL == "" {
+				errs = append(errs, "server.tls.dns_webhook_url is required when tls.dns_provider is webhook")
+			} else if err := validateHTTPURL(c.Server.TLS.DNSWebhookURL); err != nil {
+				errs = append(errs, fmt.Sprintf("server.tls.dns_webhook_url: %v", err))
+			}
+		default:
+			errs = append(errs, fmt.Sprintf("server.tls.dns_provider %q must be cloudflare or webhook when tls.mode is acme_dns01", c.Server.TLS.DNSProvider))
+		}
+		if c.Server.TLS.ACMEDirectoryURL != "" {
+			if err := validateHTTPURL(c.Server.TLS.ACMEDirectoryURL); err != nil {
+				errs = append(errs, fmt.Sprintf("server.tls.acme_directory_url: %v", err))
+			}
 		}
 	default:
 		errs = append(errs, fmt.Sprintf("server.tls.mode %q must be one of none, static, acme_dns01", c.Server.TLS.Mode))
@@ -561,6 +749,97 @@ func (c *Config) Validate() error {
 		} {
 			if cost != nil && *cost < 0 {
 				errs = append(errs, fmt.Sprintf("routes[%d].%s must be non-negative", i, name))
+			}
+		}
+	}
+
+	seenScopes := make(map[string]struct{}, len(c.Budgets))
+	for i, b := range c.Budgets {
+		if b.Scope == "" {
+			errs = append(errs, fmt.Sprintf("budgets[%d].scope is required", i))
+		} else {
+			if _, dup := seenScopes[b.Scope]; dup {
+				errs = append(errs, fmt.Sprintf("budgets[%d].scope %q is duplicated", i, b.Scope))
+			}
+			seenScopes[b.Scope] = struct{}{}
+		}
+		if b.RPM < 0 {
+			errs = append(errs, fmt.Sprintf("budgets[%d].rpm must be >= 0, got %d", i, b.RPM))
+		}
+		if b.TPM < 0 {
+			errs = append(errs, fmt.Sprintf("budgets[%d].tpm must be >= 0, got %d", i, b.TPM))
+		}
+		if b.MaxConcurrent < 0 {
+			errs = append(errs, fmt.Sprintf("budgets[%d].max_concurrent must be >= 0, got %d", i, b.MaxConcurrent))
+		}
+		if b.DailyUSD != nil && *b.DailyUSD < 0 {
+			errs = append(errs, fmt.Sprintf("budgets[%d].daily_usd must be non-negative", i))
+		}
+		if b.MonthlyUSD != nil && *b.MonthlyUSD < 0 {
+			errs = append(errs, fmt.Sprintf("budgets[%d].monthly_usd must be non-negative", i))
+		}
+		if b.SoftAlertPct < 1 || b.SoftAlertPct > 100 {
+			errs = append(errs, fmt.Sprintf("budgets[%d].soft_alert_pct must be between 1 and 100, got %d", i, b.SoftAlertPct))
+		}
+	}
+
+	seenGuardrailIDs := make(map[string]struct{}, len(c.Guardrails.Rules))
+	for i, r := range c.Guardrails.Rules {
+		if r.ID == "" {
+			errs = append(errs, fmt.Sprintf("guardrails.rules[%d].id is required", i))
+		} else {
+			if _, dup := seenGuardrailIDs[r.ID]; dup {
+				errs = append(errs, fmt.Sprintf("guardrails.rules[%d].id %q is duplicated", i, r.ID))
+			}
+			seenGuardrailIDs[r.ID] = struct{}{}
+		}
+		if r.Name == "" {
+			errs = append(errs, fmt.Sprintf("guardrails.rules[%d].name is required", i))
+		}
+		switch r.Category {
+		case GuardrailCategorySecret, GuardrailCategoryPII, GuardrailCategoryCustom:
+		default:
+			errs = append(errs, fmt.Sprintf("guardrails.rules[%d].category %q must be secret, pii, or custom", i, r.Category))
+		}
+		switch r.Action {
+		case GuardrailActionLogOnly, GuardrailActionRedact, GuardrailActionBlock:
+		default:
+			errs = append(errs, fmt.Sprintf("guardrails.rules[%d].action %q must be log_only, redact, or block", i, r.Action))
+		}
+		if r.Pattern == "" {
+			errs = append(errs, fmt.Sprintf("guardrails.rules[%d].pattern is required", i))
+		} else if _, err := regexp.Compile(r.Pattern); err != nil {
+			errs = append(errs, fmt.Sprintf("guardrails.rules[%d].pattern invalid regex: %v", i, err))
+		}
+	}
+
+	seenWebhookIDs := make(map[string]struct{}, len(c.Webhooks))
+	for i, w := range c.Webhooks {
+		if w.ID == "" {
+			errs = append(errs, fmt.Sprintf("webhooks[%d].id is required", i))
+		} else {
+			if _, dup := seenWebhookIDs[w.ID]; dup {
+				errs = append(errs, fmt.Sprintf("webhooks[%d].id %q is duplicated", i, w.ID))
+			}
+			seenWebhookIDs[w.ID] = struct{}{}
+		}
+		if w.Name == "" {
+			errs = append(errs, fmt.Sprintf("webhooks[%d].name is required", i))
+		}
+		if err := validateHTTPURL(w.URL); err != nil {
+			errs = append(errs, fmt.Sprintf("webhooks[%d].url: %v", i, err))
+		}
+		switch w.Type {
+		case WebhookTypeSyncReview, WebhookTypeAsyncEvent:
+		default:
+			errs = append(errs, fmt.Sprintf("webhooks[%d].type %q must be sync_review or async_event", i, w.Type))
+		}
+		if w.TimeoutMS <= 0 {
+			errs = append(errs, fmt.Sprintf("webhooks[%d].timeout_ms must be > 0, got %d", i, w.TimeoutMS))
+		}
+		for _, ev := range w.Events {
+			if !IsValidWebhookEvent(ev) {
+				errs = append(errs, fmt.Sprintf("webhooks[%d].events contains unknown event %q", i, ev))
 			}
 		}
 	}

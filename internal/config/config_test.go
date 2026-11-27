@@ -36,6 +36,12 @@ func TestLoadExampleYAML(t *testing.T) {
 	if len(cfg.Routes) != 2 {
 		t.Fatalf("len(routes) = %d, want 2", len(cfg.Routes))
 	}
+	if len(cfg.Budgets) == 0 {
+		t.Fatal("expected example budgets in headlamp.example.yaml")
+	}
+	if !cfg.Guardrails.UseBuiltinDefaults() {
+		t.Fatal("expected guardrails.builtin_defaults default true")
+	}
 	if cfg.Audit.StorePayloads {
 		t.Fatal("expected audit.store_payloads default false")
 	}
@@ -52,7 +58,11 @@ server:
     hostname: from-yaml
     control_url: https://yaml.headscale.local
   tls:
-    mode: none
+    mode: acme_dns01
+    domain: ai.internal.example.com
+    acme_email: ops@example.com
+    dns_provider: cloudflare
+    dns_api_token: "${CF_DNS_TOKEN}"
   api_tokens:
     - name: ci-runner
       token: "${MY_CI_TOKEN}"
@@ -68,6 +78,28 @@ providers:
     type: openai
     api_key: "${MY_OPENAI_KEY}"
     models: ["gpt-4.1"]
+budgets:
+  - scope: "*"
+    rpm: 60
+    tpm: 100000
+    max_concurrent: 10
+    daily_usd: 25.0
+    monthly_usd: 500.0
+guardrails:
+  builtin_defaults: true
+  rules:
+    - id: custom-internal-id
+      name: Internal Project Code
+      category: custom
+      pattern: 'PROJ-[0-9]{6}'
+      action: redact
+webhooks:
+  - id: slack-alerts
+    name: Slack Alerts
+    url: https://hooks.example.com/events
+    type: async_event
+    secret: "${WEBHOOK_SIGNING_SECRET}"
+    events: ["budget.threshold", "guardrail.triggered"]
 `
 	tmp := filepath.Join(t.TempDir(), "headlamp.yaml")
 	if err := os.WriteFile(tmp, []byte(yamlContent), 0o600); err != nil {
@@ -78,6 +110,7 @@ providers:
 	t.Setenv("HEADLAMP_MASTER_KEY", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
 	t.Setenv("HEADLAMP_CONTROL_URL", "https://env.headscale.local")
 	t.Setenv("HEADLAMP_AUTH_KEY", "tskey-from-env")
+	t.Setenv("HEADLAMP_TLS_DNS_API_TOKEN", "cf-token-override")
 	t.Setenv("HEADLAMP_LOCAL_LISTEN", "127.0.0.1:9090")
 	t.Setenv("HEADLAMP_DEV_MODE", "true")
 	t.Setenv("HEADLAMP_DEV_ALLOW_HEADER_OVERRIDE", "true")
@@ -86,6 +119,7 @@ providers:
 	t.Setenv("HEADLAMP_AUDIT_RETENTION_DAYS", "14")
 	t.Setenv("MY_OPENAI_KEY", "sk-live-$literal")
 	t.Setenv("MY_CI_TOKEN", "hl_ci_secret")
+	t.Setenv("WEBHOOK_SIGNING_SECRET", "whsec_secret_123")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -100,6 +134,12 @@ providers:
 	}
 	if cfg.Server.TSNet.AuthKey != "tskey-from-env" {
 		t.Fatalf("auth_key = %q", cfg.Server.TSNet.AuthKey)
+	}
+	if cfg.Server.TLS.DNSAPIToken != "cf-token-override" {
+		t.Fatalf("dns_api_token = %q, want cf-token-override", cfg.Server.TLS.DNSAPIToken)
+	}
+	if cfg.Server.TSNet.ListenPort != 443 {
+		t.Fatalf("listen_port = %d, want 443 for acme_dns01", cfg.Server.TSNet.ListenPort)
 	}
 	if cfg.Server.LocalListen != "127.0.0.1:9090" {
 		t.Fatalf("local_listen = %q", cfg.Server.LocalListen)
@@ -126,6 +166,15 @@ providers:
 	}
 	if !cfg.Providers[0].IsEnabled() {
 		t.Fatal("expected provider to default to enabled")
+	}
+	if len(cfg.Budgets) != 1 || cfg.Budgets[0].SoftAlertPct != 80 || !cfg.Budgets[0].IsEnabled() {
+		t.Fatalf("budgets = %+v", cfg.Budgets)
+	}
+	if len(cfg.Guardrails.Rules) != 1 || !cfg.Guardrails.Rules[0].IsEnabled() {
+		t.Fatalf("guardrails.rules = %+v", cfg.Guardrails.Rules)
+	}
+	if len(cfg.Webhooks) != 1 || cfg.Webhooks[0].Secret != "whsec_secret_123" || cfg.Webhooks[0].TimeoutMS != 2000 || !cfg.Webhooks[0].IsFailOpen() || !cfg.Webhooks[0].IsEnabled() {
+		t.Fatalf("webhooks = %+v", cfg.Webhooks)
 	}
 }
 
@@ -191,13 +240,26 @@ server:
 			wantSub: "cert_file",
 		},
 		{
-			name: "acme tls missing domain",
+			name: "acme tls invalid dns provider",
 			yaml: `
 server:
   tls:
     mode: acme_dns01
+    domain: ai.internal.example.com
+    dns_provider: route53
 `,
-			wantSub: "dns_provider",
+			wantSub: "cloudflare or webhook",
+		},
+		{
+			name: "acme tls webhook missing url",
+			yaml: `
+server:
+  tls:
+    mode: acme_dns01
+    domain: ai.internal.example.com
+    dns_provider: webhook
+`,
+			wantSub: "dns_webhook_url",
 		},
 		{
 			name: "removed policy block rejected",
@@ -240,6 +302,73 @@ server:
       allow_models: ["[unclosed"]
 `,
 			wantSub: "invalid glob",
+		},
+		{
+			name: "budget invalid soft_alert_pct",
+			yaml: `
+budgets:
+  - scope: "*"
+    soft_alert_pct: 120
+`,
+			wantSub: "soft_alert_pct",
+		},
+		{
+			name: "budget negative daily_usd",
+			yaml: `
+budgets:
+  - scope: "alice@example.com"
+    daily_usd: -1.5
+`,
+			wantSub: "daily_usd",
+		},
+		{
+			name: "guardrail invalid regex",
+			yaml: `
+guardrails:
+  rules:
+    - id: bad-rx
+      name: Bad Regex
+      category: custom
+      pattern: "[unclosed"
+      action: block
+`,
+			wantSub: "invalid regex",
+		},
+		{
+			name: "guardrail invalid action",
+			yaml: `
+guardrails:
+  rules:
+    - id: bad-act
+      name: Bad Action
+      category: secret
+      pattern: "secret"
+      action: drop
+`,
+			wantSub: "guardrails.rules[0].action",
+		},
+		{
+			name: "webhook unknown event",
+			yaml: `
+webhooks:
+  - id: wh1
+    name: Alerts
+    url: https://hooks.example.com/x
+    type: async_event
+    events: ["unknown.event"]
+`,
+			wantSub: "unknown event",
+		},
+		{
+			name: "webhook invalid type",
+			yaml: `
+webhooks:
+  - id: wh1
+    name: Alerts
+    url: https://hooks.example.com/x
+    type: bidirectional
+`,
+			wantSub: "webhooks[0].type",
 		},
 		{
 			name: "negative audit retention",

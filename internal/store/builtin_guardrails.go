@@ -1,0 +1,111 @@
+package store
+
+import "github.com/zacharykka/headlamp/internal/config"
+
+// DefaultBuiltinGuardrailRules returns Headlamp's built-in secret and PII regex detectors.
+// High-confidence secret patterns are enabled by default; PII and JWT patterns are seeded
+// disabled so teams can opt in via YAML or the Admin UI.
+func DefaultBuiltinGuardrailRules() []GuardrailRule {
+	return []GuardrailRule{
+		{
+			ID:       "builtin-openai-key",
+			Name:     "OpenAI API Key",
+			Category: config.GuardrailCategorySecret,
+			Pattern:  `\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b`,
+			Action:   config.GuardrailActionRedact,
+			Builtin:  true,
+			Enabled:  true,
+			Source:   SourceConfig,
+		},
+		{
+			ID:       "builtin-anthropic-key",
+			Name:     "Anthropic API Key",
+			Category: config.GuardrailCategorySecret,
+			Pattern:  `\bsk-ant-(?:api|admin)\d{2}-[A-Za-z0-9_-]{20,}\b`,
+			Action:   config.GuardrailActionRedact,
+			Builtin:  true,
+			Enabled:  true,
+			Source:   SourceConfig,
+		},
+		{
+			ID:       "builtin-aws-access-key",
+			Name:     "AWS Access Key ID",
+			Category: config.GuardrailCategorySecret,
+			Pattern:  `\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`,
+			Action:   config.GuardrailActionRedact,
+			Builtin:  true,
+			Enabled:  true,
+			Source:   SourceConfig,
+		},
+		{
+			ID:       "builtin-github-token",
+			Name:     "GitHub Token",
+			Category: config.GuardrailCategorySecret,
+			Pattern:  `\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b|\bgithub_pat_[A-Za-z0-9_]{22,}\b`,
+			Action:   config.GuardrailActionRedact,
+			Builtin:  true,
+			Enabled:  true,
+			Source:   SourceConfig,
+		},
+		{
+			ID:       "builtin-gcp-api-key",
+			Name:     "GCP / Gemini API Key",
+			Category: config.GuardrailCategorySecret,
+			Pattern:  `\bAIza[0-9A-Za-z_-]{35}\b`,
+			Action:   config.GuardrailActionRedact,
+			Builtin:  true,
+			Enabled:  true,
+			Source:   SourceConfig,
+		},
+		{
+			ID:       "builtin-pem-private-key",
+			Name:     "PEM Private Key Block",
+			Category: config.GuardrailCategorySecret,
+			Pattern:  `-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----`,
+			Action:   config.GuardrailActionBlock,
+			Builtin:  true,
+			Enabled:  true,
+			Source:   SourceConfig,
+		},
+		{
+			ID:       "builtin-jwt",
+			Name:     "JSON Web Token (JWT)",
+			Category: config.GuardrailCategorySecret,
+			Pattern:  `\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`,
+			Action:   config.GuardrailActionLogOnly,
+			Builtin:  true,
+			Enabled:  false,
+			Source:   SourceConfig,
+		},
+		{
+			ID:       "builtin-credit-card",
+			Name:     "Payment Card Number",
+			Category: config.GuardrailCategoryPII,
+			Pattern:  `\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b`,
+			Action:   config.GuardrailActionRedact,
+			Builtin:  true,
+			Enabled:  false,
+			Source:   SourceConfig,
+		},
+		{
+			ID:       "builtin-email",
+			Name:     "Email Address",
+			Category: config.GuardrailCategoryPII,
+			Pattern:  `\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b`,
+			Action:   config.GuardrailActionLogOnly,
+			Builtin:  true,
+			Enabled:  false,
+			Source:   SourceConfig,
+		},
+		{
+			ID:       "builtin-phone",
+			Name:     "Phone Number",
+			Category: config.GuardrailCategoryPII,
+			Pattern:  `\b(?:\+?1[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}|(?:\+?86[-.\s]?)?1[3-9]\d{9})\b`,
+			Action:   config.GuardrailActionLogOnly,
+			Builtin:  true,
+			Enabled:  false,
+			Source:   SourceConfig,
+		},
+	}
+}

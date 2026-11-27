@@ -2,13 +2,16 @@
 
 Headlamp is a self-hosted, single-binary private AI gateway built in Go that joins your Headscale (or Tailscale) tailnet as a first-class node via `tsnet`. Devices on your tailnet authenticate automatically with their tailnet identity—no vendor API keys distributed to developer machines.
 
-## Key Capabilities (M1 Core Gateway)
+## Key Capabilities
 
 - **Zero-Key Tailnet Identity & Grants Authorization**: Joins Headscale v0.29+ (or Tailscale) directly via `tsnet`, identifies callers via `WhoIs`, and enforces pure **grants-only** authorization (`headlamp.dev/cap/gateway`, plus `tailscale.com/cap/aperture` on official Tailscale SaaS) with **Explicit Deny Wins**.
+- **Embedded Admin Dashboard & Personal Usage UI**: Ships a single-binary React + TypeScript + Vite SPA (Geist typography & Reicon icons) embedded directly via `go:embed` (`web/dist`), authenticated automatically via Tailnet WhoIs SSO. Admins manage providers, virtual routes, budgets, guardrails, webhooks, usage analytics, audit logs, and grants snippets at `/`; standard users see their personal usage, budgets, and SDK setup snippets.
+- **Multi-Protocol Routing & Accounting**: Supports OpenAI (`/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`), Anthropic (`/anthropic/v1/messages`), Google Gemini (`/gemini/v1beta/...`), and Ollama providers, virtual model alias routing with automatic fallbacks, bidirectional OpenAI <-> Anthropic translation, streaming SSE token/cost usage logs, and opt-in audit payloads with TTL retention purge.
+- **Budgets, Rate Limits & Quotas**: Enforces per-scope (`*`, `tag:<name>`, user subject) RPM, TPM, max concurrency, and UTC daily/monthly USD spend caps (`429` with `Retry-After`) plus configurable soft-alert threshold notifications.
+- **Guardrails & Signed Webhooks**: Built-in zero-latency regex detectors (OpenAI, Anthropic, AWS, GitHub, and GCP secrets, PEM private keys, JWTs, credit cards, emails, and phone numbers) with `log_only`, `redact`, or `block` actions, custom regex rules, synchronous pre-request review webhooks (`sync_review`), and HMAC-SHA256 signed asynchronous event alerts (`guardrail.triggered`, `budget.threshold`, `budget.exceeded`, `upstream.fallback`, `upstream.error`).
+- **Automated ACME DNS-01 HTTPS**: Supports automated TLS certificate issuance and renewal on private Headscale domains via Cloudflare API or custom DNS-01 webhook solvers (`server.tls.mode: acme_dns01`), alongside `static` cert/key and plaintext Tailnet HTTP (`none`).
+- **Encrypted Credential Store & Zero-CGO Storage**: Upstream provider API keys and webhook secrets are encrypted at rest with AES-256-GCM (`HEADLAMP_MASTER_KEY`, or an auto-generated `0600` key file in `state_dir`), stored in pure-Go SQLite (`modernc.org/sqlite`) in WAL mode with embedded SQL migrations.
 - **Local Dev & Static Fallback Tokens**: Supports an optional local HTTP listener with loopback-restricted `dev_mode` and static fallback API tokens (with inline `allow_models` / `deny_models` grant scopes) for non-Tailnet callers such as CI runners.
-- **Encrypted Credential Store**: Upstream provider API keys are encrypted at rest with AES-256-GCM (`HEADLAMP_MASTER_KEY`, or an auto-generated `0600` key file in `state_dir`).
-- **Zero-CGO Storage**: Ships with pure-Go SQLite (`modernc.org/sqlite`) in WAL mode with `0700`/`0600` permissions, embedded SQL migrations, and an in-memory snapshot cache for providers and routes.
-- **Multi-Protocol Routing & Accounting**: Supports OpenAI (`/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`), Anthropic (`/anthropic/v1/messages`), Google Gemini (`/gemini/v1beta/...`), and Ollama providers, virtual model alias routing with fallbacks, bidirectional OpenAI <-> Anthropic translation, token/cost usage logs, and opt-in audit payloads with TTL retention purge.
 
 ## Configuration
 
@@ -36,6 +39,12 @@ Common environment overrides:
 | `HEADLAMP_DEV_ALLOW_HEADER_OVERRIDE` | Allow `X-Headlamp-Dev-*` identity headers from loopback peers in `dev_mode` (default `false`) |
 | `HEADLAMP_STORAGE_DRIVER` | Storage backend: `sqlite` (default) or `postgres` |
 | `HEADLAMP_STORAGE_DSN` | Database path or connection string |
+| `HEADLAMP_TLS_MODE` | Tailnet TLS mode: `none`, `static`, or `acme_dns01` |
+| `HEADLAMP_TLS_DOMAIN` | Certificate domain for `acme_dns01` |
+| `HEADLAMP_TLS_ACME_EMAIL` | ACME account contact email for `acme_dns01` |
+| `HEADLAMP_TLS_DNS_PROVIDER` | DNS-01 solver: `cloudflare` or `webhook` |
+| `HEADLAMP_TLS_DNS_API_TOKEN` | Cloudflare API token or webhook bearer token for DNS-01 |
+| `HEADLAMP_TLS_DNS_WEBHOOK_URL` | Custom DNS-01 webhook endpoint URL |
 
 ## Client Quickstart
 
@@ -85,26 +94,39 @@ See [`docs/headscale-setup.md`](docs/headscale-setup.md) and [`headlamp.example.
 
 ## Development
 
+Building the single binary compiles the embedded React dashboard (`web/dist`) and packages it into `./bin/headlamp`:
+
 ```bash
 make test-race
 make build
+```
+
+For frontend UI development with hot reload against a local Headlamp backend:
+
+```bash
+make run-dev
+npm --prefix web run dev
 ```
 
 ## Repository Structure
 
 ```text
 headlamp/
-├── cmd/headlamp/       # CLI entrypoint (serve, init, usage, version)
+├── cmd/headlamp/       # CLI entrypoint (serve, init, usage, version) and runtime wiring
 ├── internal/
+│   ├── api/            # Admin & User REST API (/api/v1/*), RBAC, CSRF, embedded SPA serving
+│   ├── auth/           # Principal model, context helpers, dev & static token auth
 │   ├── config/         # YAML loader, env overrides, validation
 │   ├── crypto/         # AES-256-GCM encryption and master key management
-│   ├── auth/           # Principal model, context helpers, dev & static token auth
-│   ├── store/          # Store interface, pure-Go SQLite implementation, SQL migrations
-│   ├── netts/          # tsnet node lifecycle, Headscale connection, TLS listeners
+│   ├── guardrail/      # Local regex detectors, sync review & signed async webhooks
+│   ├── metering/       # Streaming SSE usage parser, pricing table, async persistence
+│   ├── netts/          # tsnet node lifecycle, Headscale connection, ACME DNS-01 & TLS
 │   ├── policy/         # Pure grants-only policy evaluator (Explicit Deny Wins)
 │   ├── proxy/          # Native-first multi-protocol LLM reverse proxy
-│   ├── translate/      # On-demand cross-protocol request & SSE translation
-│   └── metering/       # Streaming SSE usage parser, pricing table, async persistence
-├── deploy/             # Multi-stage static Dockerfile
+│   ├── quota/          # Per-scope RPM/TPM/concurrency & USD spend budget enforcement
+│   ├── store/          # Store interface, pure-Go SQLite implementation, SQL migrations
+│   └── translate/      # On-demand cross-protocol request & SSE translation
+├── web/                # Embedded React + TypeScript + Vite Admin & User dashboard
+├── deploy/             # Multi-stage static Dockerfile (Node web build + Go binary)
 └── docs/               # Headscale v0.29.7 setup guide and protocol specs
 ```

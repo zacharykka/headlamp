@@ -20,6 +20,7 @@ import (
 	"github.com/zacharykka/headlamp/internal/auth"
 	"github.com/zacharykka/headlamp/internal/config"
 	"github.com/zacharykka/headlamp/internal/crypto"
+	"github.com/zacharykka/headlamp/internal/guardrail"
 	"github.com/zacharykka/headlamp/internal/store"
 	"github.com/zacharykka/headlamp/internal/translate"
 )
@@ -1483,5 +1484,327 @@ func TestAnthropicToOpenAICrossProtocolUsesMaxCompletionTokens(t *testing.T) {
 	}
 	if !strings.Contains(string(seenBody), `"max_completion_tokens":2048`) || strings.Contains(string(seenBody), `"max_tokens"`) {
 		t.Fatalf("expected max_completion_tokens=2048 (without max_tokens) for OpenAI upstream, got: %s", string(seenBody))
+	}
+}
+
+// --- M2 Quota, Guardrail & Event Dispatcher Tests ---
+
+type mockQuotaTicket struct {
+	mu       sync.Mutex
+	released bool
+	tokens   int64
+}
+
+func (t *mockQuotaTicket) Release(totalTokens int64) {
+	t.mu.Lock()
+	t.released = true
+	t.tokens = totalTokens
+	t.mu.Unlock()
+}
+
+type mockQuotaLimiter struct {
+	acquireFn func(p *auth.Principal) (QuotaTicket, *QuotaRejection, error)
+}
+
+func (m *mockQuotaLimiter) Acquire(_ context.Context, p *auth.Principal) (QuotaTicket, *QuotaRejection, error) {
+	return m.acquireFn(p)
+}
+
+type recordedEventEmit struct {
+	eventType string
+	payload   any
+}
+
+type mockEventDispatcher struct {
+	mu     sync.Mutex
+	events []recordedEventEmit
+}
+
+func (m *mockEventDispatcher) Emit(eventType string, payload any) {
+	m.mu.Lock()
+	m.events = append(m.events, recordedEventEmit{eventType: eventType, payload: payload})
+	m.mu.Unlock()
+}
+
+func TestQuotaRejection429RetryAfterAndTokenRelease(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		if req["stream"] == true {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-q1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-q1\",\"choices\":[],\"usage\":{\"prompt_tokens\":45,\"completion_tokens\":15,\"total_tokens\":60}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-q2","object":"chat.completion","model":"gpt-4.1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":6,"total_tokens":16}}`))
+	}))
+	defer upstream.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "openai", Type: config.ProviderTypeOpenAI, BaseURL: upstream.URL, APIKey: "sk-1", Models: []string{"gpt-4.1"}, Enabled: true,
+	})
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "anthropic", Type: config.ProviderTypeAnthropic, BaseURL: upstream.URL, APIKey: "sk-ant", Models: []string{"claude-sonnet-4-6"}, Enabled: true,
+	})
+
+	tel := &mockTelemetryFactory{}
+	var rej *QuotaRejection
+	var lastTicket *mockQuotaTicket
+	ql := &mockQuotaLimiter{
+		acquireFn: func(_ *auth.Principal) (QuotaTicket, *QuotaRejection, error) {
+			if rej != nil {
+				return nil, rej, nil
+			}
+			lastTicket = &mockQuotaTicket{}
+			return lastTicket, nil, nil
+		},
+	}
+
+	gw, _ := NewGateway(GatewayConfig{Store: st, Telemetry: tel, Quota: ql})
+
+	// 1. RPM rejection -> HTTP 429 + Retry-After header + OpenAI rate_limit_exceeded + telemetry 429.
+	rej = &QuotaRejection{Scope: "*", Metric: "rpm", Reason: "RPM limit 10 exceeded", RetryAfterSec: 45}
+	rec429 := httptest.NewRecorder()
+	gw.ServeHTTP(rec429, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}]}`))
+	if rec429.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d: %s", rec429.Code, rec429.Body.String())
+	}
+	if rec429.Header().Get("Retry-After") != "45" {
+		t.Fatalf("expected Retry-After: 45, got %q", rec429.Header().Get("Retry-After"))
+	}
+	if !strings.Contains(rec429.Body.String(), `"rate_limit_exceeded"`) || !strings.Contains(rec429.Body.String(), "RPM limit 10 exceeded") {
+		t.Fatalf("unexpected 429 OpenAI envelope: %s", rec429.Body.String())
+	}
+	if last := tel.last(); last == nil || last.finish == nil || last.finish.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 telemetry recorded, got %+v", last)
+	}
+
+	// 2. Monthly USD budget breach on Anthropic -> Anthropic 429 rate_limit_error.
+	rej = &QuotaRejection{Scope: "alice@example.com", Metric: "monthly_usd", Reason: "monthly budget $5.00 exceeded", RetryAfterSec: 3600}
+	recAnth := httptest.NewRecorder()
+	gw.ServeHTTP(recAnth, authedReq(http.MethodPost, "/anthropic/v1/messages", `{"model":"claude-sonnet-4-6","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`))
+	if recAnth.Code != http.StatusTooManyRequests || !strings.Contains(recAnth.Body.String(), `"rate_limit_error"`) || recAnth.Header().Get("Retry-After") != "3600" {
+		t.Fatalf("unexpected Anthropic 429: code=%d retry=%q body=%s", recAnth.Code, recAnth.Header().Get("Retry-After"), recAnth.Body.String())
+	}
+
+	// 3. Allowed streaming request -> ticket.Release receives exact 60 tokens via fallback token observer.
+	rej = nil
+	recStream := httptest.NewRecorder()
+	gw.ServeHTTP(recStream, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if recStream.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recStream.Code, recStream.Body.String())
+	}
+	if !lastTicket.released || lastTicket.tokens != 60 {
+		t.Fatalf("expected streaming ticket released with 60 tokens, got released=%v tokens=%d", lastTicket.released, lastTicket.tokens)
+	}
+
+	// 4. Allowed non-streaming request -> ticket.Release receives 16 tokens.
+	recJSON := httptest.NewRecorder()
+	gw.ServeHTTP(recJSON, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}]}`))
+	if recJSON.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", recJSON.Code)
+	}
+	if !lastTicket.released || lastTicket.tokens != 16 {
+		t.Fatalf("expected non-stream ticket released with 16 tokens, got released=%v tokens=%d", lastTicket.released, lastTicket.tokens)
+	}
+}
+
+type guardrailEngineAdapter struct {
+	engine *guardrail.Engine
+}
+
+func (a guardrailEngineAdapter) Inspect(ctx context.Context, req GuardrailRequest) (*GuardrailDecision, error) {
+	subject, nodeName := "", ""
+	if req.Principal != nil {
+		subject = req.Principal.Subject
+		nodeName = req.Principal.NodeName
+	}
+	dec, err := a.engine.InspectRequest(ctx, guardrail.InspectInput{
+		RequestID: req.RequestID,
+		Subject:   subject,
+		NodeName:  nodeName,
+		Protocol:  req.Protocol,
+		Model:     req.Model,
+		Body:      req.Body,
+	})
+	if err != nil || dec == nil {
+		return nil, err
+	}
+	return &GuardrailDecision{
+		Action:       dec.Action,
+		ModifiedBody: dec.ModifiedBody,
+		Hits:         dec.Hits,
+		Reason:       dec.Reason,
+		StatusCode:   dec.StatusCode,
+	}, nil
+}
+
+func TestGuardrailRedactAndBlockEndToEnd(t *testing.T) {
+	var (
+		upstreamHits atomic.Int32
+		seenUpBody   []byte
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		seenUpBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-g1","object":"chat.completion","model":"gpt-4.1","choices":[{"index":0,"message":{"role":"assistant","content":"safe"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`))
+	}))
+	defer upstream.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "openai", Type: config.ProviderTypeOpenAI, BaseURL: upstream.URL, APIKey: "sk-1", Models: []string{"gpt-4.1"}, Enabled: true,
+	})
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "anthropic", Type: config.ProviderTypeAnthropic, BaseURL: upstream.URL, APIKey: "sk-ant", Models: []string{"claude-sonnet-4-6"}, Enabled: true,
+	})
+	for _, r := range store.DefaultBuiltinGuardrailRules() {
+		if err := st.UpsertGuardrailRule(context.Background(), r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	eng, err := guardrail.NewEngine(guardrail.EngineConfig{Store: st, RetryBackoff: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close(context.Background()) }()
+
+	tel := &mockTelemetryFactory{}
+	gw, _ := NewGateway(GatewayConfig{
+		Store:      st,
+		Telemetry:  tel,
+		Guardrails: guardrailEngineAdapter{engine: eng},
+		Events:     eng,
+	})
+
+	// 1. AWS key in OpenAI prompt -> redacted before upstream AND before audit payload.
+	awsKey := "AKIA" + "0123456789ABCDEF"
+	recRedact := httptest.NewRecorder()
+	gw.ServeHTTP(recRedact, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-4.1","messages":[{"role":"user","content":"my key is `+awsKey+`"}]}`))
+	if recRedact.Code != http.StatusOK {
+		t.Fatalf("expected 200 after redaction, got %d: %s", recRedact.Code, recRedact.Body.String())
+	}
+	if strings.Contains(string(seenUpBody), awsKey) || !strings.Contains(string(seenUpBody), "[REDACTED:builtin-aws-access-key]") {
+		t.Fatalf("upstream did not receive redacted payload: %s", string(seenUpBody))
+	}
+	last1 := tel.last()
+	if last1.start.GuardrailAction != "redact" || !slices.Contains(last1.start.GuardrailHits, "builtin-aws-access-key") {
+		t.Fatalf("telemetry missing guardrail redact metadata: %+v", last1.start)
+	}
+	if strings.Contains(string(last1.start.RequestBody), awsKey) {
+		t.Fatalf("audit RequestBody must store redacted payload, not raw secret: %s", string(last1.start.RequestBody))
+	}
+
+	// 2. PEM private key in Anthropic prompt -> blocked BEFORE hitting upstream,
+	//    and audit RequestBody is stubbed so raw secret is never persisted!
+	beforeHits := upstreamHits.Load()
+	pem := "-----BEGIN " + "PRIVATE KEY-----\\nSECRET\\n-----END " + "PRIVATE KEY-----"
+	recBlock := httptest.NewRecorder()
+	gw.ServeHTTP(recBlock, authedReq(http.MethodPost, "/anthropic/v1/messages", `{"model":"claude-sonnet-4-6","max_tokens":64,"messages":[{"role":"user","content":"`+pem+`"}]}`))
+	if recBlock.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on PEM block, got %d: %s", recBlock.Code, recBlock.Body.String())
+	}
+	if upstreamHits.Load() != beforeHits {
+		t.Fatalf("blocked request must NEVER hit upstream")
+	}
+	if !strings.Contains(recBlock.Body.String(), `"invalid_request_error"`) || !strings.Contains(recBlock.Body.String(), "builtin-pem-private-key") {
+		t.Fatalf("unexpected Anthropic block envelope: %s", recBlock.Body.String())
+	}
+	last2 := tel.last()
+	if last2.start.GuardrailAction != "block" || !slices.Contains(last2.start.GuardrailHits, "builtin-pem-private-key") || last2.finish.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unexpected block telemetry: start=%+v finish=%+v", last2.start, last2.finish)
+	}
+	if string(last2.start.RequestBody) != "[BLOCKED BY GUARDRAIL]" || strings.Contains(string(last2.start.RequestBody), "PRIVATE KEY") {
+		t.Fatalf("blocked audit RequestBody must be stubbed without raw secret, got %q", string(last2.start.RequestBody))
+	}
+
+	// 3. Anthropic /v1/messages/count_tokens must ALSO run guardrails (redact AWS key, block PEM key).
+	recCountRedact := httptest.NewRecorder()
+	gw.ServeHTTP(recCountRedact, authedReq(http.MethodPost, "/anthropic/v1/messages/count_tokens", `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"token `+awsKey+`"}]}`))
+	if recCountRedact.Code != http.StatusOK {
+		t.Fatalf("expected 200 on count_tokens after redaction, got %d: %s", recCountRedact.Code, recCountRedact.Body.String())
+	}
+	if strings.Contains(string(seenUpBody), awsKey) || !strings.Contains(string(seenUpBody), "[REDACTED:builtin-aws-access-key]") {
+		t.Fatalf("count_tokens upstream did not receive redacted body: %s", string(seenUpBody))
+	}
+
+	beforeCountBlockHits := upstreamHits.Load()
+	recCountBlock := httptest.NewRecorder()
+	gw.ServeHTTP(recCountBlock, authedReq(http.MethodPost, "/anthropic/v1/messages/count_tokens", `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"`+pem+`"}]}`))
+	if recCountBlock.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on count_tokens PEM block, got %d: %s", recCountBlock.Code, recCountBlock.Body.String())
+	}
+	if upstreamHits.Load() != beforeCountBlockHits {
+		t.Fatalf("blocked count_tokens request must NEVER hit upstream")
+	}
+
+	// 4. Malformed JSON on Gemini generateContent must return 400 (INVALID_ARGUMENT), never 500 from sync_review marshal.
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "gemini", Type: config.ProviderTypeGemini, BaseURL: upstream.URL, APIKey: "gk", Models: []string{"gemini-2.5-flash"}, Enabled: true,
+	})
+	_ = st.UpsertWebhook(context.Background(), store.Webhook{
+		ID: "sync-ok", Name: "Sync Review", URL: upstream.URL, Type: config.WebhookTypeSyncReview, TimeoutMS: 500, FailOpen: true, Enabled: true,
+	})
+	recGemBad := httptest.NewRecorder()
+	gw.ServeHTTP(recGemBad, authedReq(http.MethodPost, "/gemini/v1beta/models/gemini-2.5-flash:generateContent", `{not valid json`))
+	if recGemBad.Code != http.StatusBadRequest || !strings.Contains(recGemBad.Body.String(), `"INVALID_ARGUMENT"`) {
+		t.Fatalf("expected 400 INVALID_ARGUMENT on malformed Gemini JSON, got %d: %s", recGemBad.Code, recGemBad.Body.String())
+	}
+}
+
+func TestEventDispatcherUpstreamFallbackAndError(t *testing.T) {
+	fail503 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"message":"down"}}`))
+	}))
+	defer fail503.Close()
+
+	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"ok","object":"chat.completion","model":"gpt-4.1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer okSrv.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "p1", Type: config.ProviderTypeOpenAI, BaseURL: fail503.URL, APIKey: "k", Enabled: true,
+	})
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "p2", Type: config.ProviderTypeOpenAI, BaseURL: okSrv.URL, APIKey: "k", Enabled: true,
+	})
+	_ = st.UpsertModelRoute(context.Background(), store.ModelRoute{
+		Alias: "team/ev", ProviderName: "p1", UpstreamModel: "gpt-5",
+		Fallbacks: []store.RouteTarget{{Provider: "p2", Model: "gpt-4.1"}}, Enabled: true,
+	})
+	_ = st.UpsertModelRoute(context.Background(), store.ModelRoute{
+		Alias: "team/down", ProviderName: "p1", UpstreamModel: "gpt-5", Enabled: true,
+	})
+
+	ev := &mockEventDispatcher{}
+	gw, _ := NewGateway(GatewayConfig{Store: st, Events: ev})
+
+	// 1. Fallback emits upstream.fallback.
+	rec1 := httptest.NewRecorder()
+	gw.ServeHTTP(rec1, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"team/ev","messages":[{"role":"user","content":"hi"}]}`))
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec1.Code)
+	}
+	// 2. Final 503 emits upstream.error.
+	rec2 := httptest.NewRecorder()
+	gw.ServeHTTP(rec2, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"team/down","messages":[{"role":"user","content":"hi"}]}`))
+	if rec2.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", rec2.Code)
+	}
+
+	ev.mu.Lock()
+	defer ev.mu.Unlock()
+	if len(ev.events) != 2 || ev.events[0].eventType != config.WebhookEventUpstreamFallback || ev.events[1].eventType != config.WebhookEventUpstreamError {
+		t.Fatalf("expected [upstream.fallback, upstream.error], got %+v", ev.events)
 	}
 }
