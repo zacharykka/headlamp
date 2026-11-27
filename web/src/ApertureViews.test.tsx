@@ -1,17 +1,51 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { App } from './App';
 import { ApiError, api } from './api/client';
+import { ConfirmDeleteButton } from './components/Primitives';
 import { AuditLogsView } from './views/AuditLogsView';
+import { PersonalView } from './views/PersonalView';
 import { RoutingView } from './views/RoutingView';
 import { SecurityView } from './views/SecurityView';
 
-describe('Aperture views: GitOps locks, inline modal errors, and audit inspector', () => {
+describe('Aperture views, collapsed sidebar accordion, confirmations, and API alignment', () => {
+  beforeEach(() => {
+    window.scrollTo = vi.fn();
+  });
   afterEach(() => {
     cleanup();
+    document.body.style.overflow = '';
     vi.restoreAllMocks();
   });
 
-  it('locks YAML-managed providers and renders inline validation errors inside Route modal', async () => {
+  it('serializes errors_only=true in api.listAdminLogs', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          logs: [],
+          summary: {
+            request_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            total_tokens: 0,
+            cost_usd: 0,
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    await api.listAdminLogs({ errors_only: true, limit: 25, offset: 0 });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const calledUrl = String(fetchSpy.mock.calls[0][0]);
+    expect(calledUrl).toContain('errors_only=true');
+    expect(calledUrl).toContain('limit=25');
+  });
+
+  it('locks YAML-managed providers, locks modal body scroll, and renders inline validation errors', async () => {
     vi.spyOn(api, 'listProviders').mockResolvedValue([
       {
         name: 'anthropic-yaml',
@@ -54,26 +88,24 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
       },
     ]);
 
-    vi.spyOn(api, 'getPricing').mockResolvedValue({ exact: {}, patterns: [] });
-
     render(<RoutingView />);
 
     await waitFor(() => {
       expect(screen.getByText('anthropic-yaml')).toBeTruthy();
     });
 
-    // YAML-managed badge is visible and Edit/Delete are disabled on anthropic-yaml row
     expect(screen.getByText('Managed by YAML')).toBeTruthy();
     const editYamlBtn = screen.getByRole('button', { name: 'Edit anthropic-yaml' });
     expect((editYamlBtn as HTMLButtonElement).disabled).toBe(true);
 
-    // Input-only override displays Default across all 3 remaining null tiers (output + both cache tiers)
+    // Partial cost override shows Default across remaining null tiers
     expect(screen.getByText('team/cache-tuned')).toBeTruthy();
     expect(screen.getByText(/\$0\.45/)).toBeTruthy();
     expect(screen.getByText(/Default \/ Default/)).toBeTruthy();
 
-    // Open Add Route modal and enter malformed fallback line missing "/"
+    // Open Add Route modal -> locks body scroll and shows inline error on bad fallback
     fireEvent.click(screen.getByRole('button', { name: /Add Route/i }));
+    expect(document.body.style.overflow).toBe('hidden');
     const dialog = screen.getByRole('dialog', { name: /Add Model Route/i });
 
     fireEvent.change(within(dialog).getByLabelText(/Virtual Alias/i), {
@@ -90,6 +122,27 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
 
     const alert = await within(dialog).findByRole('alert');
     expect(alert.textContent).toContain('must use "provider/model" format');
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Cancel/i }));
+    expect(document.body.style.overflow).toBe('');
+  });
+
+  it('requires two-step inline confirmation on ConfirmDeleteButton', async () => {
+    const onConfirm = vi.fn();
+    render(<ConfirmDeleteButton itemName="openai-local" onConfirm={onConfirm} />);
+
+    const btn = screen.getByRole('button', { name: 'Delete openai-local' });
+    fireEvent.click(btn);
+    expect(onConfirm).not.toHaveBeenCalled();
+
+    const confirmBtn = screen.getByRole('button', {
+      name: 'Confirm delete openai-local',
+    });
+    expect(confirmBtn.textContent).toContain('Confirm?');
+    fireEvent.click(confirmBtn);
+    await waitFor(() => {
+      expect(onConfirm).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('enforces built-in vs YAML guardrail locks and highlights playground redactions', async () => {
@@ -137,9 +190,7 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
       expect(screen.getByText('OpenAI API Key')).toBeTruthy();
     });
 
-    // Built-in rule allows opening Edit modal with Name/Category/Pattern disabled
-    const editButtons = screen.getAllByRole('button', { name: /Edit/i });
-    fireEvent.click(editButtons[0]);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit OpenAI API Key' }));
     const dialog = screen.getByRole('dialog', { name: /Edit Guardrail/i });
     expect(
       (within(dialog).getByLabelText(/Display Name/i) as HTMLInputElement).disabled,
@@ -153,7 +204,6 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
     ).toBe(false);
     fireEvent.click(within(dialog).getByRole('button', { name: /Cancel/i }));
 
-    // Live playground renders verdict and highlighted [REDACTED:...] span
     fireEvent.click(screen.getByRole('button', { name: /Evaluate Sample/i }));
     await waitFor(() => {
       expect(screen.getByText(/Verdict: REDACT/i)).toBeTruthy();
@@ -161,7 +211,7 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
     });
   });
 
-  it('distinguishes 404 unstored payloads from 500 errors and sends retention_days on purge', async () => {
+  it('distinguishes 404 vs 500 payloads, displays accurate SQLite storage copy, and resets timePreset on focus', async () => {
     vi.spyOn(api, 'getAuditSettings').mockResolvedValue({
       store_payloads: false,
       retention_days: 14,
@@ -170,7 +220,7 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
       .spyOn(api, 'purgeAuditPayloads')
       .mockResolvedValue({ purged: 3 });
 
-    vi.spyOn(api, 'listAdminLogs').mockResolvedValue({
+    const listSpy = vi.spyOn(api, 'listAdminLogs').mockResolvedValue({
       summary: {
         request_count: 2,
         input_tokens: 100,
@@ -180,7 +230,7 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
         reasoning_tokens: 0,
         total_tokens: 150,
         cost_usd: 0.002,
-        error_count: 0,
+        error_count: 1,
         p95_latency_ms: 180,
       },
       logs: [
@@ -239,8 +289,8 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
           cost_usd: 0.001,
           latency_ms: 210,
           ttft_ms: 110,
-          status_code: 200,
-          error_message: '',
+          status_code: 502,
+          error_message: 'bad gateway',
         },
       ],
     });
@@ -252,13 +302,34 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
       throw new ApiError(500, 'sqlite disk I/O failure');
     });
 
-    render(<AuditLogsView />);
+    const { rerender } = render(
+      <AuditLogsView focus={{ errorsOnly: true, timePreset: '7d', nonce: 1 }} />,
+    );
+
+    await waitFor(() => {
+      expect(listSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ errors_only: true }),
+        expect.anything(),
+      );
+    });
+
+    // External focus without timePreset resets timePreset to 'all' and clears errorsOnly
+    rerender(<AuditLogsView focus={{ subject: 'alice@tailnet', nonce: 2 }} />);
+    await waitFor(() => {
+      expect(listSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          subject: 'alice@tailnet',
+          errors_only: undefined,
+          since: undefined,
+        }),
+        expect.anything(),
+      );
+    });
 
     await waitFor(() => {
       expect(screen.getByText('alice@tailnet')).toBeTruthy();
     });
 
-    // Click log-404 -> calm "Payload logging was off for this request" message
     fireEvent.click(screen.getByText('alice@tailnet'));
     await waitFor(() => {
       expect(
@@ -266,19 +337,23 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
       ).toBeTruthy();
     });
 
-    // Click log-500 -> real error banner with actual server error text
     fireEvent.click(screen.getByText('bob@tailnet'));
     await waitFor(() => {
       expect(screen.getByText(/Failed to fetch audit payload/i)).toBeTruthy();
       expect(screen.getByText(/sqlite disk I\/O failure/i)).toBeTruthy();
     });
 
-    // Close drawer and verify Audit Storage Purge sends retention_days
     fireEvent.click(screen.getByRole('button', { name: 'Close' }));
     fireEvent.click(screen.getByRole('button', { name: /Audit Storage/i }));
     const settingsDialog = await screen.findByRole('dialog', {
       name: /Audit Storage & Payload Retention/i,
     });
+    expect(
+      within(settingsDialog).getByText(
+        /Stores sanitized headers and guardrail-redacted bodies \(capped at 256 KB\) in local SQLite\./i,
+      ),
+    ).toBeTruthy();
+
     fireEvent.change(within(settingsDialog).getByLabelText(/Retention Window/i), {
       target: { value: '7' },
     });
@@ -290,7 +365,7 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
     });
   });
 
-  it('prevents in-flight getAuditSettings from overwriting retention_days=0 edits and purges with 0', async () => {
+  it('prevents in-flight getAuditSettings from overwriting retention_days=0 and requires two-step confirm on 0-day purge', async () => {
     let savedRetention = 14;
     let resolveModalFetch!: (val: {
       store_payloads: boolean;
@@ -300,7 +375,6 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
 
     vi.spyOn(api, 'getAuditSettings').mockImplementation(() => {
       callCount += 1;
-      // First call on mount resolves immediately; second call when opening modal resolves late
       if (callCount === 2) {
         return new Promise((resolve) => {
           resolveModalFetch = resolve;
@@ -335,7 +409,6 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
 
     render(<AuditLogsView />);
 
-    // Open Audit Storage and edit Retention Window to 0 BEFORE getAuditSettings resolves
     fireEvent.click(screen.getByRole('button', { name: /Audit Storage/i }));
     const dialog = await screen.findByRole('dialog', {
       name: /Audit Storage & Payload Retention/i,
@@ -343,12 +416,10 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
     const retentionInput = within(dialog).getByLabelText(/Retention Window/i) as HTMLInputElement;
     fireEvent.change(retentionInput, { target: { value: '0' } });
 
-    // Now resolve the slow in-flight getAuditSettings() with stale 14 — must NOT clobber 0!
     resolveModalFetch({ store_payloads: false, retention_days: 14 });
     await new Promise((r) => setTimeout(r, 20));
     expect(retentionInput.value).toBe('0');
 
-    // Save Settings -> sends retention_days: 0 and closes modal
     fireEvent.click(within(dialog).getByRole('button', { name: /Save Settings/i }));
     await waitFor(() => {
       expect(updateSpy).toHaveBeenCalledWith({
@@ -357,15 +428,191 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
       });
     });
 
-    // Reopen Audit Storage -> retention is 0 -> Purge Now sends {"retention_days": 0}
     fireEvent.click(screen.getByRole('button', { name: /Audit Storage/i }));
     const reopenedDialog = await screen.findByRole('dialog', {
       name: /Audit Storage & Payload Retention/i,
     });
+
+    // First click on 0-day Purge Now arms confirmation without purging
     fireEvent.click(within(reopenedDialog).getByRole('button', { name: /Purge Now/i }));
+    expect(purgeSpy).not.toHaveBeenCalled();
+    const confirmBtn = within(reopenedDialog).getByRole('button', {
+      name: /Confirm Purge All\?/i,
+    });
+    fireEvent.click(confirmBtn);
+
     await waitFor(() => {
       expect(purgeSpy).toHaveBeenCalledWith(0);
       expect(within(reopenedDialog).getByText(/Purged all 5 stored payloads/i)).toBeTruthy();
     });
+  });
+
+  it('starts sidebar groups collapsed, syncs section toggles two-way, opens global Model Pricing, and expands group on Error Rate click', async () => {
+    vi.spyOn(api, 'getMe').mockResolvedValue({
+      principal: {
+        subject: 'shan@tailnet',
+        display_name: 'Shan',
+        node_name: 'macbook-pro',
+        node_ip: '100.64.0.12',
+        auth_source: 'tailnet',
+      },
+      is_admin: true,
+      policy: {
+        subject: 'shan@tailnet',
+        roles: ['admin'],
+        allow_models: ['*'],
+        grants_applied: true,
+      },
+    });
+    vi.spyOn(api, 'getAdminOverview').mockResolvedValue({
+      window: '7d',
+      today_cost_usd: 1.2,
+      month_cost_usd: 15.4,
+      summary: {
+        request_count: 10,
+        input_tokens: 500,
+        output_tokens: 200,
+        cache_read_tokens: 100,
+        cache_write_tokens: 0,
+        reasoning_tokens: 0,
+        total_tokens: 800,
+        cost_usd: 1.2,
+        error_count: 2,
+        p95_latency_ms: 140,
+      },
+      series: [],
+      top_subjects: [],
+      top_models: [],
+    });
+    vi.spyOn(api, 'listProviders').mockResolvedValue([]);
+    vi.spyOn(api, 'listRoutes').mockResolvedValue([]);
+    vi.spyOn(api, 'listBudgets').mockResolvedValue([]);
+    vi.spyOn(api, 'listGuardrails').mockResolvedValue([]);
+    vi.spyOn(api, 'listWebhooks').mockResolvedValue([]);
+    vi.spyOn(api, 'getPricing').mockResolvedValue({ exact: {}, patterns: [] });
+    vi.spyOn(api, 'getAuditSettings').mockResolvedValue({
+      store_payloads: false,
+      retention_days: 7,
+    });
+    const logsSpy = vi.spyOn(api, 'listAdminLogs').mockResolvedValue({
+      logs: [],
+      summary: {
+        request_count: 2,
+        input_tokens: 100,
+        output_tokens: 50,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        reasoning_tokens: 0,
+        total_tokens: 150,
+        cost_usd: 0.2,
+        error_count: 2,
+      },
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: 'Usage Overview' })).toBeTruthy();
+    });
+
+    // All 4 sidebar groups start collapsed by default; Usage & Adoption shows active parent indicator
+    const usageGroupBtn = screen.getByRole('button', { name: /Usage & Adoption/i });
+    const securityGroupBtn = screen.getByRole('button', { name: /Security/i });
+    const adminGroupBtn = screen.getByRole('button', { name: /Administration/i });
+    const refGroupBtn = screen.getByRole('button', { name: /Reference/i });
+
+    expect(usageGroupBtn.getAttribute('aria-expanded')).toBe('false');
+    expect(usageGroupBtn.getAttribute('data-has-active')).toBe('true');
+    expect(securityGroupBtn.getAttribute('aria-expanded')).toBe('false');
+    expect(adminGroupBtn.getAttribute('aria-expanded')).toBe('false');
+    expect(refGroupBtn.getAttribute('aria-expanded')).toBe('false');
+
+    // Global Model Pricing drawer opens from Reference without switching activeNav away from Usage Overview
+    fireEvent.click(refGroupBtn);
+    expect(refGroupBtn.getAttribute('aria-expanded')).toBe('true');
+    fireEvent.click(screen.getByRole('button', { name: 'Model Pricing' }));
+    expect(
+      await screen.findByRole('dialog', { name: /Built-in Model Pricing Reference/i }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    expect(screen.getByRole('heading', { name: 'Usage Overview' })).toBeTruthy();
+
+    // Clicking Error Rate KPI card jumps to Activity Logs with errors_only=true and auto-expands Security group
+    fireEvent.click(
+      screen.getByRole('button', { name: /Inspect error requests in Activity Logs/i }),
+    );
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: 'Activity & Audit Logs' })).toBeTruthy();
+      expect(securityGroupBtn.getAttribute('aria-expanded')).toBe('true');
+      expect(logsSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ errors_only: true }),
+        expect.anything(),
+      );
+    });
+
+    // Two-way sync between Administration -> Providers / Model Routing and in-page segmented toggle
+    fireEvent.click(adminGroupBtn);
+    const providersNavBtn = screen.getByRole('button', { name: /^Providers/i });
+    const routesNavBtn = screen.getByRole('button', { name: /^Model Routing/i });
+    fireEvent.click(providersNavBtn);
+    expect(providersNavBtn.getAttribute('data-active')).toBe('true');
+
+    fireEvent.click(screen.getByRole('tab', { name: /^Routes/i }));
+    expect(routesNavBtn.getAttribute('data-active')).toBe('true');
+    expect(providersNavBtn.getAttribute('data-active')).toBe('false');
+
+    // Clicking Activity Logs in sidebar resets stale logsFocus (clears errors_only & since)
+    logsSpy.mockClear();
+    fireEvent.click(screen.getByRole('button', { name: 'Activity Logs' }));
+    await waitFor(() => {
+      expect(logsSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          errors_only: undefined,
+          since: undefined,
+        }),
+        expect.anything(),
+      );
+    });
+  });
+
+  it('uses <YOUR_HEADLAMP_API_TOKEN> placeholder in Quickstart snippets when auth_source is api_key', () => {
+    vi.spyOn(api, 'getMeUsage').mockResolvedValue({
+      summary: {
+        request_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        reasoning_tokens: 0,
+        total_tokens: 0,
+        cost_usd: 0,
+      },
+      series: [],
+      logs: [],
+    });
+
+    render(
+      <PersonalView
+        me={{
+          principal: {
+            subject: 'tag:ci-runner',
+            display_name: 'CI Runner',
+            node_name: '',
+            node_ip: '',
+            auth_source: 'api_key',
+          },
+          is_admin: false,
+          policy: {
+            subject: 'tag:ci-runner',
+            roles: ['user'],
+            allow_models: ['openai/gpt-4.1'],
+            grants_applied: true,
+          },
+          budget_status: [],
+        }}
+      />,
+    );
+
+    expect(screen.getByText(/<YOUR_HEADLAMP_API_TOKEN>/)).toBeTruthy();
   });
 });

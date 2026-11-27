@@ -407,10 +407,23 @@ func TestDashboardAnalyticsQueriesAndFilters(t *testing.T) {
 		t.Fatalf("unexpected extended summary: %+v", ext)
 	}
 
-	// GuardrailOnly + StatusCode + Tag filters
+	// GuardrailOnly + StatusCode + ErrorsOnly + Tag filters
 	grLogs, err := st.QueryUsageLogs(ctx, UsageFilter{GuardrailOnly: true})
 	if err != nil || len(grLogs) != 2 {
 		t.Fatalf("GuardrailOnly logs = (%d, %v), want 2", len(grLogs), err)
+	}
+	errLogs, err := st.QueryUsageLogs(ctx, UsageFilter{ErrorsOnly: true})
+	if err != nil || len(errLogs) != 2 {
+		t.Fatalf("ErrorsOnly logs = (%d, %v), want 2", len(errLogs), err)
+	}
+	for _, l := range errLogs {
+		if l.StatusCode < 400 && l.StatusCode != 0 && l.ErrorMessage == "" {
+			t.Fatalf("ErrorsOnly returned non-error row: %+v", l)
+		}
+	}
+	errSummary, err := st.SummarizeUsageExtended(ctx, UsageFilter{ErrorsOnly: true})
+	if err != nil || errSummary.RequestCount != 2 || errSummary.ErrorCount != 2 || math.Abs(errSummary.CostUSD-0.04) > 1e-9 {
+		t.Fatalf("ErrorsOnly extended summary = (%+v, %v)", errSummary, err)
 	}
 	status429, err := st.QueryUsageLogs(ctx, UsageFilter{StatusCode: 429})
 	if err != nil || len(status429) != 1 || status429[0].ID != "u3" {
@@ -448,6 +461,35 @@ func TestDashboardAnalyticsQueriesAndFilters(t *testing.T) {
 	topModels, err := st.QueryTopModels(ctx, UsageFilter{}, 2)
 	if err != nil || len(topModels) != 2 || topModels[0].Model != "claude-sonnet-4-6" || topModels[0].Provider != "anthropic" || topModels[1].Model != "gpt-5" {
 		t.Fatalf("unexpected top models: %+v (err=%v)", topModels, err)
+	}
+
+	// Regression: ErrorsOnly must match SummarizeUsageExtended / QueryUsageSeries on mid-stream
+	// failures (StatusCode=200 + ErrorMessage!="") and zero-status errors (StatusCode=0).
+	if err := st.InsertUsageLog(ctx, UsageLog{
+		ID: "u6-midstream", CreatedAt: base.Add(26 * time.Hour), Subject: "alice", Tags: []string{"tag:eng"},
+		ProviderName: "anthropic", RequestedModel: "claude-sonnet-4-6", TotalTokens: 300, CostUSD: 0.02,
+		LatencyMS: 150, StatusCode: 200, ErrorMessage: "stream EOF",
+	}); err != nil {
+		t.Fatalf("InsertUsageLog(u6-midstream): %v", err)
+	}
+	if err := st.InsertUsageLog(ctx, UsageLog{
+		ID: "u7-zero-status", CreatedAt: base.Add(26*time.Hour + time.Minute), Subject: "bob", Tags: []string{"tag:ops"},
+		ProviderName: "openai", RequestedModel: "gpt-5", TotalTokens: 0, CostUSD: 0,
+		LatencyMS: 50, StatusCode: 0, ErrorMessage: "",
+	}); err != nil {
+		t.Fatalf("InsertUsageLog(u7-zero-status): %v", err)
+	}
+	errLogsAfter, err := st.QueryUsageLogs(ctx, UsageFilter{ErrorsOnly: true})
+	if err != nil || len(errLogsAfter) != 4 {
+		t.Fatalf("ErrorsOnly logs with midstream+zero status = (%d, %v), want 4", len(errLogsAfter), err)
+	}
+	allExtAfter, err := st.SummarizeUsageExtended(ctx, UsageFilter{})
+	if err != nil || allExtAfter.ErrorCount != 4 {
+		t.Fatalf("SummarizeUsageExtended ErrorCount = (%+v, %v), want 4", allExtAfter, err)
+	}
+	errExtAfter, err := st.SummarizeUsageExtended(ctx, UsageFilter{ErrorsOnly: true})
+	if err != nil || errExtAfter.RequestCount != 4 || errExtAfter.ErrorCount != 4 {
+		t.Fatalf("ErrorsOnly summary after midstream+zero status = (%+v, %v)", errExtAfter, err)
 	}
 }
 

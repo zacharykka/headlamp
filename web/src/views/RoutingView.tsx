@@ -6,11 +6,10 @@ import {
   EditIcon,
   PlayIcon,
   PlusIcon,
-  SearchIcon,
-  TrashIcon,
 } from '../components/ApertureIcons';
+import { PricingDrawer } from '../components/PricingDrawer';
 import {
-  Drawer,
+  ConfirmDeleteButton,
   Modal,
   ProviderTypeBadge,
   SegmentedControl,
@@ -21,14 +20,12 @@ import {
 import {
   formatCostTier,
   formatLatency,
-  formatUSD,
   hasRouteCostOverride,
   parseRouteFallbacks,
 } from '../lib/format';
 import type {
   ModelRouteItem,
   ModelRouteUpsertPayload,
-  PricingResponse,
   ProviderItem,
   ProviderTestResult,
   ProviderUpsertPayload,
@@ -51,6 +48,8 @@ export interface RoutingFocusState {
 
 interface RoutingViewProps {
   focus?: RoutingFocusState;
+  onSectionChange?: (section: 'all' | 'providers' | 'routes') => void;
+  onOpenPricing?: () => void;
   onCountsChange?: (counts: { providers: number; routes: number }) => void;
 }
 
@@ -67,13 +66,19 @@ function parseOptionalNonNegativeNumber(
   return { value: parsed, error: null };
 }
 
-export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
+export function RoutingView({
+  focus,
+  onSectionChange,
+  onOpenPricing,
+  onCountsChange,
+}: RoutingViewProps) {
   const [providers, setProviders] = useState<ProviderItem[]>([]);
   const [routes, setRoutes] = useState<ModelRouteItem[]>([]);
-  const [pricing, setPricing] = useState<PricingResponse | null>(null);
   const [pageError, setPageError] = useState<string | null>(null);
 
-  const [sectionMode, setSectionMode] = useState<'all' | 'providers' | 'routes'>('all');
+  const [sectionMode, setSectionMode] = useState<'all' | 'providers' | 'routes'>(
+    focus?.section ?? 'all',
+  );
   const [providerTypeFilter, setProviderTypeFilter] = useState<string>('all');
   const [routeFilter, setRouteFilter] = useState<'all' | 'fallbacks' | 'custom_pricing'>(
     'all',
@@ -81,6 +86,8 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
 
   const [testResults, setTestResults] = useState<Record<string, ProviderTestResult>>({});
   const [testingName, setTestingName] = useState<string | null>(null);
+  const [togglingProviders, setTogglingProviders] = useState<Record<string, boolean>>({});
+  const [togglingRoutes, setTogglingRoutes] = useState<Record<string, boolean>>({});
 
   // Provider Modal State
   const [providerModalOpen, setProviderModalOpen] = useState(false);
@@ -111,21 +118,18 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
   const [routeEnabled, setRouteEnabled] = useState(true);
   const [savingRoute, setSavingRoute] = useState(false);
 
-  // Searchable Pricing Drawer State
+  // Fallback local Pricing Drawer when RoutingView is rendered standalone
   const [pricingOpen, setPricingOpen] = useState(false);
-  const [pricingQuery, setPricingQuery] = useState('');
 
   const loadAll = async () => {
     setPageError(null);
     try {
-      const [provList, routeList, pricingRes] = await Promise.all([
+      const [provList, routeList] = await Promise.all([
         api.listProviders(),
         api.listRoutes(),
-        api.getPricing().catch(() => null),
       ]);
       setProviders(provList);
       setRoutes(routeList);
-      if (pricingRes) setPricing(pricingRes);
       onCountsChange?.({ providers: provList.length, routes: routeList.length });
       setRouteProvider((prev) => prev || provList[0]?.name || '');
     } catch (err: unknown) {
@@ -147,7 +151,11 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
     } else if (focus.modal === 'route') {
       openCreateRoute();
     } else if (focus.modal === 'pricing') {
-      setPricingOpen(true);
+      if (onOpenPricing) {
+        onOpenPricing();
+      } else {
+        setPricingOpen(true);
+      }
     }
   }, [focus?.nonce]);
 
@@ -231,8 +239,9 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
   };
 
   const handleToggleProvider = async (item: ProviderItem, enabled: boolean) => {
-    if (item.source === 'config') return;
+    if (item.source === 'config' || togglingProviders[item.name]) return;
     setPageError(null);
+    setTogglingProviders((prev) => ({ ...prev, [item.name]: true }));
     try {
       await api.updateProvider(item.name, {
         name: item.name,
@@ -247,6 +256,8 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
       );
     } catch (err: unknown) {
       setPageError(err instanceof Error ? err.message : 'Failed to update provider');
+    } finally {
+      setTogglingProviders((prev) => ({ ...prev, [item.name]: false }));
     }
   };
 
@@ -407,8 +418,9 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
   };
 
   const handleToggleRoute = async (item: ModelRouteItem, enabled: boolean) => {
-    if (item.source === 'config') return;
+    if (item.source === 'config' || togglingRoutes[item.alias]) return;
     setPageError(null);
+    setTogglingRoutes((prev) => ({ ...prev, [item.alias]: true }));
     try {
       await api.updateRoute(item.alias, {
         alias: item.alias,
@@ -426,6 +438,8 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
       );
     } catch (err: unknown) {
       setPageError(err instanceof Error ? err.message : 'Failed to update route');
+    } finally {
+      setTogglingRoutes((prev) => ({ ...prev, [item.alias]: false }));
     }
   };
 
@@ -455,24 +469,13 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
     return routes;
   }, [routes, routeFilter]);
 
-  const exactPricingEntries = useMemo(() => {
-    const q = pricingQuery.trim().toLowerCase();
-    const entries = Object.entries(pricing?.exact ?? {}).sort(([a], [b]) =>
-      a.localeCompare(b),
-    );
-    if (!q) return entries;
-    return entries.filter(([model]) => model.toLowerCase().includes(q));
-  }, [pricing, pricingQuery]);
-
-  const patternPricingEntries = useMemo(() => {
-    const q = pricingQuery.trim().toLowerCase();
-    const entries = pricing?.patterns ?? [];
-    if (!q) return entries;
-    return entries.filter((p) => p.pattern.toLowerCase().includes(q));
-  }, [pricing, pricingQuery]);
-
   const showProviders = sectionMode === 'all' || sectionMode === 'providers';
   const showRoutes = sectionMode === 'all' || sectionMode === 'routes';
+
+  const handleSectionSelect = (next: 'all' | 'providers' | 'routes') => {
+    setSectionMode(next);
+    onSectionChange?.(next);
+  };
 
   return (
     <div className="ap-page">
@@ -497,7 +500,7 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
             <SegmentedControl
               ariaLabel="Routing view section"
               value={sectionMode}
-              onChange={setSectionMode}
+              onChange={handleSectionSelect}
               options={[
                 { value: 'all', label: 'All' },
                 { value: 'providers', label: `Providers (${providers.length})` },
@@ -510,7 +513,13 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
             <button
               type="button"
               className="ap-btn"
-              onClick={() => setPricingOpen(true)}
+              onClick={() => {
+                if (onOpenPricing) {
+                  onOpenPricing();
+                } else {
+                  setPricingOpen(true);
+                }
+              }}
             >
               <BookIcon size={15} />
               <span>Model Pricing</span>
@@ -669,7 +678,7 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
                         <td>
                           <Toggle
                             checked={prov.enabled}
-                            disabled={isYaml}
+                            disabled={isYaml || Boolean(togglingProviders[prov.name])}
                             title={isYaml ? YAML_LOCK_TOOLTIP : undefined}
                             onChange={(next) => handleToggleProvider(prov, next)}
                             label={`Enable ${prov.name}`}
@@ -698,17 +707,12 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
                               <EditIcon />
                               <span className="ap-action-label">Edit</span>
                             </button>
-                            <button
-                              type="button"
-                              className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm ap-btn-icon-compact"
+                            <ConfirmDeleteButton
+                              itemName={prov.name}
                               disabled={isYaml}
-                              aria-label={`Delete ${prov.name}`}
                               title={isYaml ? YAML_LOCK_TOOLTIP : `Delete ${prov.name}`}
-                              onClick={() => handleDeleteProvider(prov)}
-                            >
-                              <TrashIcon />
-                              <span className="ap-action-label">Delete</span>
-                            </button>
+                              onConfirm={() => handleDeleteProvider(prov)}
+                            />
                           </div>
                         </td>
                       </tr>
@@ -839,7 +843,7 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
                         <td>
                           <Toggle
                             checked={route.enabled}
-                            disabled={isYaml}
+                            disabled={isYaml || Boolean(togglingRoutes[route.alias])}
                             title={isYaml ? YAML_LOCK_TOOLTIP : undefined}
                             onChange={(next) => handleToggleRoute(route, next)}
                             label={`Enable route ${route.alias}`}
@@ -858,17 +862,12 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
                               <EditIcon />
                               <span className="ap-action-label">Edit</span>
                             </button>
-                            <button
-                              type="button"
-                              className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm ap-btn-icon-compact"
+                            <ConfirmDeleteButton
+                              itemName={route.alias}
                               disabled={isYaml}
-                              aria-label={`Delete ${route.alias}`}
                               title={isYaml ? YAML_LOCK_TOOLTIP : `Delete ${route.alias}`}
-                              onClick={() => handleDeleteRoute(route)}
-                            >
-                              <TrashIcon />
-                              <span className="ap-action-label">Delete</span>
-                            </button>
+                              onConfirm={() => handleDeleteRoute(route)}
+                            />
                           </div>
                         </td>
                       </tr>
@@ -1168,126 +1167,12 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
         </form>
       </Modal>
 
-      {/* Searchable Built-in Model Pricing Reference Drawer */}
-      <Drawer
-        open={pricingOpen}
-        title="Built-in Model Pricing Reference"
-        subtitle="USD per 1,000,000 tokens used when route cost tiers are set to Default"
-        onClose={() => setPricingOpen(false)}
-      >
-        <div style={{ position: 'relative' }}>
-          <SearchIcon
-            style={{
-              position: 'absolute',
-              left: 11,
-              top: '50%',
-              transform: 'translateY(-50%)',
-              color: 'var(--ap-text-muted)',
-              pointerEvents: 'none',
-            }}
-          />
-          <input
-            className="ap-input"
-            style={{ paddingLeft: 34 }}
-            placeholder="Filter models or wildcard patterns (e.g. claude, gpt-4.1, gemini)..."
-            value={pricingQuery}
-            onChange={(e) => setPricingQuery(e.target.value)}
-            aria-label="Filter built-in model pricing"
-          />
-        </div>
-
-        <section className="ap-card">
-          <div className="ap-card-header">
-            <h3 className="ap-card-title">
-              Exact Models ({exactPricingEntries.length})
-            </h3>
-          </div>
-          <div className="ap-table-wrap">
-            <table className="ap-table">
-              <thead>
-                <tr>
-                  <th>Model ID</th>
-                  <th className="ap-num">Input</th>
-                  <th className="ap-num">Output</th>
-                  <th className="ap-num">Cache Read</th>
-                  <th className="ap-num">Cache Write</th>
-                </tr>
-              </thead>
-              <tbody>
-                {exactPricingEntries.length === 0 ? (
-                  <tr>
-                    <td colSpan={5} style={{ color: 'var(--ap-text-muted)', textAlign: 'center', padding: 18 }}>
-                      No matching exact models.
-                    </td>
-                  </tr>
-                ) : (
-                  exactPricingEntries.map(([model, price]) => (
-                    <tr key={model} className="ap-row">
-                      <td className="ap-mono" style={{ fontSize: 12 }}>
-                        {model}
-                      </td>
-                      <td className="ap-num">{formatUSD(price.input)}</td>
-                      <td className="ap-num">{formatUSD(price.output)}</td>
-                      <td className="ap-num" style={{ color: 'var(--ap-text-secondary)' }}>
-                        {formatUSD(price.cache_read)}
-                      </td>
-                      <td className="ap-num" style={{ color: 'var(--ap-text-secondary)' }}>
-                        {formatUSD(price.cache_write)}
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        <section className="ap-card">
-          <div className="ap-card-header">
-            <h3 className="ap-card-title">
-              Wildcard Family Fallbacks ({patternPricingEntries.length})
-            </h3>
-          </div>
-          <div className="ap-table-wrap">
-            <table className="ap-table">
-              <thead>
-                <tr>
-                  <th>Pattern</th>
-                  <th className="ap-num">Input</th>
-                  <th className="ap-num">Output</th>
-                  <th className="ap-num">Cache Read</th>
-                  <th className="ap-num">Cache Write</th>
-                </tr>
-              </thead>
-              <tbody>
-                {patternPricingEntries.length === 0 ? (
-                  <tr>
-                    <td colSpan={5} style={{ color: 'var(--ap-text-muted)', textAlign: 'center', padding: 18 }}>
-                      No matching wildcard patterns.
-                    </td>
-                  </tr>
-                ) : (
-                  patternPricingEntries.map((item) => (
-                    <tr key={item.pattern} className="ap-row">
-                      <td className="ap-mono" style={{ fontSize: 12 }}>
-                        {item.pattern}
-                      </td>
-                      <td className="ap-num">{formatUSD(item.input)}</td>
-                      <td className="ap-num">{formatUSD(item.output)}</td>
-                      <td className="ap-num" style={{ color: 'var(--ap-text-secondary)' }}>
-                        {formatUSD(item.cache_read)}
-                      </td>
-                      <td className="ap-num" style={{ color: 'var(--ap-text-secondary)' }}>
-                        {formatUSD(item.cache_write)}
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-        </section>
-      </Drawer>
+      {!onOpenPricing && (
+        <PricingDrawer
+          open={pricingOpen}
+          onClose={() => setPricingOpen(false)}
+        />
+      )}
     </div>
   );
 }

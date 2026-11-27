@@ -1162,6 +1162,14 @@ func (h *Handler) handleAdminLogs(w http.ResponseWriter, r *http.Request) {
 		}
 		filter.StatusCode = code
 	}
+	if errStr := strings.TrimSpace(q.Get("errors_only")); errStr != "" {
+		b, err := strconv.ParseBool(errStr)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "invalid errors_only query parameter")
+			return
+		}
+		filter.ErrorsOnly = b
+	}
 	if grStr := strings.TrimSpace(q.Get("guardrail_only")); grStr != "" {
 		b, err := strconv.ParseBool(grStr)
 		if err != nil {

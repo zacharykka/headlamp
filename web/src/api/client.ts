@@ -226,6 +226,7 @@ export const api = {
     if (filter.provider) params.set('provider', filter.provider);
     if (filter.model) params.set('model', filter.model);
     if (filter.status) params.set('status', filter.status);
+    if (filter.errors_only) params.set('errors_only', 'true');
     if (filter.guardrail_only) params.set('guardrail_only', 'true');
     if (filter.since) params.set('since', filter.since);
     if (filter.until) params.set('until', filter.until);

@@ -1714,6 +1714,9 @@ func buildUsageWhere(filter UsageFilter) (string, []any) {
 		clauses = append(clauses, "status_code = ?")
 		args = append(args, filter.StatusCode)
 	}
+	if filter.ErrorsOnly {
+		clauses = append(clauses, "(status_code >= 400 OR status_code = 0 OR error_message != '')")
+	}
 	if filter.GuardrailOnly {
 		clauses = append(clauses, "guardrail_action != ''")
 	}

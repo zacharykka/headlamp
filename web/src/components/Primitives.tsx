@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import {
   AlertIcon,
@@ -7,7 +7,29 @@ import {
   CopyIcon,
   LockIcon,
   ProviderGlyph,
+  TrashIcon,
 } from './ApertureIcons';
+
+let activeOverlayCount = 0;
+let savedBodyOverflow = '';
+
+function acquireBodyScrollLock(): () => void {
+  if (typeof document === 'undefined') return () => {};
+  if (activeOverlayCount === 0) {
+    savedBodyOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+  }
+  activeOverlayCount += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    activeOverlayCount = Math.max(0, activeOverlayCount - 1);
+    if (activeOverlayCount === 0 && typeof document !== 'undefined') {
+      document.body.style.overflow = savedBodyOverflow;
+    }
+  };
+}
 
 interface ModalProps {
   open: boolean;
@@ -28,13 +50,17 @@ export function Modal({
 }: ModalProps) {
   useEffect(() => {
     if (!open) return;
+    const releaseScroll = acquireBodyScrollLock();
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         onClose();
       }
     };
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      releaseScroll();
+    };
   }, [open, onClose]);
 
   if (!open) return null;
@@ -90,13 +116,17 @@ interface DrawerProps {
 export function Drawer({ open, title, subtitle, onClose, children }: DrawerProps) {
   useEffect(() => {
     if (!open) return;
+    const releaseScroll = acquireBodyScrollLock();
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         onClose();
       }
     };
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      releaseScroll();
+    };
   }, [open, onClose]);
 
   if (!open) return null;
@@ -167,6 +197,107 @@ export function Toggle({
       }}
     >
       <span className="ap-toggle-thumb" />
+    </button>
+  );
+}
+
+interface ConfirmDeleteButtonProps {
+  itemName: string;
+  onConfirm: () => void | Promise<void>;
+  disabled?: boolean;
+  title?: string;
+}
+
+/**
+ * Lightweight two-step inline confirmation button for destructive row deletions.
+ * First click arms "Confirm?" (auto-resets after 4s or Escape/blur); second click executes.
+ */
+export function ConfirmDeleteButton({
+  itemName,
+  onConfirm,
+  disabled = false,
+  title,
+}: ConfirmDeleteButtonProps) {
+  const [armed, setArmed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const timerRef = useRef<number | null>(null);
+
+  const clearArmTimer = () => {
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+  };
+
+  useEffect(() => clearArmTimer, []);
+
+  useEffect(() => {
+    if (disabled && armed) {
+      clearArmTimer();
+      setArmed(false);
+    }
+  }, [disabled, armed]);
+
+  const handleClick = async () => {
+    if (disabled || busy) return;
+    if (!armed) {
+      setArmed(true);
+      clearArmTimer();
+      timerRef.current = window.setTimeout(() => {
+        timerRef.current = null;
+        setArmed(false);
+      }, 4000);
+      return;
+    }
+
+    clearArmTimer();
+    setArmed(false);
+    setBusy(true);
+    try {
+      await onConfirm();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      className={
+        armed
+          ? 'ap-btn ap-btn-danger ap-btn-sm'
+          : 'ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm ap-btn-icon-compact'
+      }
+      disabled={disabled || busy}
+      aria-label={armed ? `Confirm delete ${itemName}` : `Delete ${itemName}`}
+      title={
+        disabled
+          ? title
+          : armed
+            ? `Click again to permanently delete ${itemName} (Esc to cancel)`
+            : title || `Delete ${itemName}`
+      }
+      onClick={() => void handleClick()}
+      onBlur={() => {
+        if (armed) {
+          clearArmTimer();
+          setArmed(false);
+        }
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Escape' && armed) {
+          e.stopPropagation();
+          clearArmTimer();
+          setArmed(false);
+        }
+      }}
+    >
+      <TrashIcon />
+      {armed ? (
+        <span>Confirm?</span>
+      ) : (
+        <span className="ap-action-label">{busy ? 'Deleting' : 'Delete'}</span>
+      )}
     </button>
   );
 }
@@ -250,12 +381,27 @@ export function CodeBlock({
   highlightRedactions = false,
 }: CodeBlockProps) {
   const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
 
   const handleCopy = async () => {
     try {
       await navigator.clipboard.writeText(code);
       setCopied(true);
-      window.setTimeout(() => setCopied(false), 1600);
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = window.setTimeout(() => {
+        copyTimerRef.current = null;
+        setCopied(false);
+      }, 1600);
     } catch {
       // Clipboard API may be unavailable in restricted contexts.
     }

@@ -5,10 +5,10 @@ import {
   EditIcon,
   PlusIcon,
   TailnetMeshGlyph,
-  TrashIcon,
 } from '../components/ApertureIcons';
 import {
   CodeBlock,
+  ConfirmDeleteButton,
   Modal,
   ProgressBar,
   SegmentedControl,
@@ -70,6 +70,7 @@ export function BudgetsAccessView({
   const [softAlertPct, setSoftAlertPct] = useState('80');
   const [enabled, setEnabled] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [togglingScopes, setTogglingScopes] = useState<Record<string, boolean>>({});
 
   const loadAll = async () => {
     setPageError(null);
@@ -180,8 +181,9 @@ export function BudgetsAccessView({
   };
 
   const handleToggle = async (item: BudgetItem, next: boolean) => {
-    if (item.source === 'config') return;
+    if (item.source === 'config' || togglingScopes[item.scope]) return;
     setPageError(null);
+    setTogglingScopes((prev) => ({ ...prev, [item.scope]: true }));
     try {
       await api.updateBudget(item.scope, {
         scope: item.scope,
@@ -198,6 +200,8 @@ export function BudgetsAccessView({
       );
     } catch (err: unknown) {
       setPageError(err instanceof Error ? err.message : 'Failed to update quota');
+    } finally {
+      setTogglingScopes((prev) => ({ ...prev, [item.scope]: false }));
     }
   };
 
@@ -284,9 +288,9 @@ export function BudgetsAccessView({
               <tr>
                 <th>Scope</th>
                 <th>Origin</th>
-                <th style={{ minWidth: 122 }}>Daily Consumption</th>
-                <th style={{ minWidth: 122 }}>Monthly Consumption</th>
-                <th>Rate & Concurrency</th>
+                <th>Daily Spend</th>
+                <th>Monthly Spend</th>
+                <th>Rate Limits</th>
                 <th>Enabled</th>
                 <th style={{ textAlign: 'right' }}>Actions</th>
               </tr>
@@ -301,14 +305,24 @@ export function BudgetsAccessView({
               ) : (
                 filteredBudgets.map((item) => {
                   const isYaml = item.source === 'config';
+                  const isToggling = Boolean(togglingScopes[item.scope]);
+                  const scopeLabel = item.scope === '*' ? '* (Global)' : item.scope;
+                  const rateLabel =
+                    [
+                      item.rpm > 0 ? `${formatNumber(item.rpm)} RPM` : null,
+                      item.tpm > 0 ? `${formatCompactTokens(item.tpm)} TPM` : null,
+                      item.max_concurrent > 0 ? `${item.max_concurrent} conc` : null,
+                    ]
+                      .filter(Boolean)
+                      .join(' · ') || 'Unlimited';
                   return (
                     <tr key={item.scope} className="ap-row">
-                      <td style={{ whiteSpace: 'nowrap' }}>
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                          <span className="ap-mono" style={{ fontWeight: 600 }}>
-                            {item.scope === '*' ? '* (Global)' : item.scope}
+                      <td style={{ maxWidth: 116 }} title={item.scope}>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
+                          <span className="ap-mono ap-truncate" style={{ fontWeight: 600 }}>
+                            {scopeLabel}
                           </span>
-                          <span style={{ fontSize: 11.5, color: 'var(--ap-text-muted)' }}>
+                          <span style={{ fontSize: 11, color: 'var(--ap-text-muted)', whiteSpace: 'nowrap' }}>
                             Alert at {item.soft_alert_pct}%
                           </span>
                         </div>
@@ -316,15 +330,15 @@ export function BudgetsAccessView({
                       <td style={{ whiteSpace: 'nowrap' }}>
                         <SourceBadge source={item.source} />
                       </td>
-                      <td style={{ maxWidth: 155 }}>
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      <td style={{ maxWidth: 138 }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
                           <div
                             className="ap-tabular"
                             style={{
                               display: 'flex',
                               justifyContent: 'space-between',
-                              gap: 6,
-                              fontSize: 12,
+                              gap: 5,
+                              fontSize: 11.5,
                               whiteSpace: 'nowrap',
                             }}
                           >
@@ -346,15 +360,15 @@ export function BudgetsAccessView({
                           )}
                         </div>
                       </td>
-                      <td style={{ maxWidth: 155 }}>
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      <td style={{ maxWidth: 138 }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
                           <div
                             className="ap-tabular"
                             style={{
                               display: 'flex',
                               justifyContent: 'space-between',
-                              gap: 6,
-                              fontSize: 12,
+                              gap: 5,
+                              fontSize: 11.5,
                               whiteSpace: 'nowrap',
                             }}
                           >
@@ -377,25 +391,20 @@ export function BudgetsAccessView({
                         </div>
                       </td>
                       <td
-                        className="ap-tabular"
+                        className="ap-tabular ap-truncate"
                         style={{
+                          maxWidth: 146,
                           color: 'var(--ap-text-secondary)',
                           fontSize: 11.5,
-                          whiteSpace: 'nowrap',
                         }}
+                        title={rateLabel}
                       >
-                        {[
-                          item.rpm > 0 ? `${formatNumber(item.rpm)} RPM` : null,
-                          item.tpm > 0 ? `${formatCompactTokens(item.tpm)} TPM` : null,
-                          item.max_concurrent > 0 ? `${item.max_concurrent} conc` : null,
-                        ]
-                          .filter(Boolean)
-                          .join(' · ') || 'Unlimited'}
+                        {rateLabel}
                       </td>
                       <td>
                         <Toggle
                           checked={item.enabled}
-                          disabled={isYaml}
+                          disabled={isYaml || isToggling}
                           title={isYaml ? YAML_LOCK_TOOLTIP : undefined}
                           onChange={(next) => handleToggle(item, next)}
                           label={`Enable budget ${item.scope}`}
@@ -414,17 +423,12 @@ export function BudgetsAccessView({
                             <EditIcon />
                             <span className="ap-action-label">Edit</span>
                           </button>
-                          <button
-                            type="button"
-                            className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm ap-btn-icon-compact"
+                          <ConfirmDeleteButton
+                            itemName={item.scope}
                             disabled={isYaml}
-                            aria-label={`Delete ${item.scope}`}
                             title={isYaml ? YAML_LOCK_TOOLTIP : `Delete ${item.scope}`}
-                            onClick={() => handleDelete(item)}
-                          >
-                            <TrashIcon />
-                            <span className="ap-action-label">Delete</span>
-                          </button>
+                            onConfirm={() => handleDelete(item)}
+                          />
                         </div>
                       </td>
                     </tr>

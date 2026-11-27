@@ -240,6 +240,7 @@ export interface AdminLogsFilter {
   provider?: string;
   model?: string;
   status?: string;
+  errors_only?: boolean;
   guardrail_only?: boolean;
   since?: string;
   until?: string;

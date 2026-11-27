@@ -75,19 +75,26 @@ export function PersonalView({ me }: PersonalViewProps) {
   const allowModels = me.policy.allow_models ?? [];
   const denyModels = me.policy.deny_models ?? [];
   const budgets = me.budget_status ?? [];
+  const isStaticToken =
+    me.principal.auth_source === 'api_key' ||
+    me.principal.auth_source === 'static_token';
+  const sampleKey = isStaticToken ? '<YOUR_HEADLAMP_API_TOKEN>' : 'tailnet';
 
   const snippets = useMemo(() => {
     const claudeModel = pickExampleModel(allowModels, 'anthropic');
     const openaiModel = pickExampleModel(allowModels, 'openai');
     const geminiModel = pickExampleModel(allowModels, 'gemini');
+    const authComment = isStaticToken
+      ? 'authenticated with your static Headlamp API token'
+      : 'no upstream API key needed over your Tailnet';
 
     return {
       claude: {
         label: 'Claude Code · ~/.zshrc or shell env',
         code: [
-          `# Connect Claude Code over your Tailnet — no upstream API key needed`,
+          `# Connect Claude Code — ${authComment}`,
           `export ANTHROPIC_BASE_URL="${origin}/anthropic"`,
-          `export ANTHROPIC_API_KEY="tailnet"`,
+          `export ANTHROPIC_API_KEY="${sampleKey}"`,
           ``,
           `claude --model ${claudeModel}`,
         ].join('\n'),
@@ -97,9 +104,10 @@ export function PersonalView({ me }: PersonalViewProps) {
         code: [
           `# Connect Codex CLI, Aider, or any OpenAI-compatible SDK`,
           `export OPENAI_BASE_URL="${origin}/v1"`,
-          `export OPENAI_API_KEY="tailnet"`,
+          `export OPENAI_API_KEY="${sampleKey}"`,
           ``,
           `curl -sS "${origin}/v1/chat/completions" \\`,
+          ...(isStaticToken ? [`  -H "Authorization: Bearer ${sampleKey}" \\`] : []),
           `  -H "Content-Type: application/json" \\`,
           `  -d '{"model":"${openaiModel}","messages":[{"role":"user","content":"ping"}]}'`,
         ].join('\n'),
@@ -110,7 +118,7 @@ export function PersonalView({ me }: PersonalViewProps) {
           `# Connect Gemini CLI & Google GenAI clients via Headlamp`,
           `export GEMINI_API_BASE="${origin}/gemini"`,
           `export GOOGLE_GEMINI_BASE_URL="${origin}/gemini"`,
-          `export GEMINI_API_KEY="tailnet"`,
+          `export GEMINI_API_KEY="${sampleKey}"`,
           ``,
           `gemini -m ${geminiModel} -p "Hello from Tailnet"`,
         ].join('\n'),
@@ -120,7 +128,7 @@ export function PersonalView({ me }: PersonalViewProps) {
         code: [
           `# Override OpenAI Base URL in Cursor / Continue / Zed:`,
           `Base URL:  ${origin}/v1`,
-          `API Key:   tailnet`,
+          `API Key:   ${sampleKey}`,
           `Model ID:  ${openaiModel}`,
           ``,
           `# ~/.continue/config.json snippet:`,
@@ -131,14 +139,14 @@ export function PersonalView({ me }: PersonalViewProps) {
           `      "provider": "openai",`,
           `      "model": "${openaiModel}",`,
           `      "apiBase": "${origin}/v1",`,
-          `      "apiKey": "tailnet"`,
+          `      "apiKey": "${sampleKey}"`,
           `    }`,
           `  ]`,
           `}`,
         ].join('\n'),
       },
     };
-  }, [origin, allowModels]);
+  }, [origin, allowModels, isStaticToken, sampleKey]);
 
   const summary = usage?.summary;
   const logs = usage?.logs ?? [];
@@ -458,7 +466,11 @@ export function PersonalView({ me }: PersonalViewProps) {
                     <td className="ap-num">
                       <span
                         className={`ap-badge ap-tabular ${
-                          log.status_code >= 400 ? 'ap-badge--red' : 'ap-badge--green'
+                          log.status_code >= 400 ||
+                          log.status_code === 0 ||
+                          Boolean(log.error_message)
+                            ? 'ap-badge--red'
+                            : 'ap-badge--green'
                         }`}
                       >
                         {log.status_code}

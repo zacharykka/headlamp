@@ -775,4 +775,40 @@ func TestBackendReviewFixRegressions(t *testing.T) {
 			t.Fatalf("PUT budget missing live spend fields: %+v", putItem)
 		}
 	})
+
+	t.Run("P2_2_admin_logs_errors_only_filter", func(t *testing.T) {
+		h, st, _, _ := setupTestAPI(t)
+		ctx := context.Background()
+		now := time.Now().UTC()
+
+		_ = st.InsertUsageLog(ctx, store.UsageLog{ID: "ok-200", CreatedAt: now, Subject: "alice@example.com", ProviderName: "openai", RequestedModel: "gpt-5", CostUSD: 0.10, StatusCode: 200})
+		_ = st.InsertUsageLog(ctx, store.UsageLog{ID: "err-400", CreatedAt: now, Subject: "alice@example.com", ProviderName: "openai", RequestedModel: "gpt-5", CostUSD: 0.02, StatusCode: 400})
+		_ = st.InsertUsageLog(ctx, store.UsageLog{ID: "err-502", CreatedAt: now, Subject: "bob@example.com", ProviderName: "anthropic", RequestedModel: "claude-sonnet-4-6", CostUSD: 0.03, StatusCode: 502})
+		_ = st.InsertUsageLog(ctx, store.UsageLog{ID: "err-stream-200", CreatedAt: now, Subject: "alice@example.com", ProviderName: "anthropic", RequestedModel: "claude-sonnet-4-6", CostUSD: 0.01, StatusCode: 200, ErrorMessage: "stream EOF"})
+		_ = st.InsertUsageLog(ctx, store.UsageLog{ID: "err-zero-status", CreatedAt: now, Subject: "bob@example.com", ProviderName: "openai", RequestedModel: "gpt-5", CostUSD: 0.00, StatusCode: 0})
+
+		if r := doAPIRequest(h, adminPrincipal(), http.MethodGet, "/api/v1/admin/logs?errors_only=notabool", "", nil); r.Code != http.StatusBadRequest {
+			t.Fatalf("invalid errors_only = %d, want 400: %s", r.Code, r.Body.String())
+		}
+
+		r := doAPIRequest(h, adminPrincipal(), http.MethodGet, "/api/v1/admin/logs?errors_only=true", "", nil)
+		if r.Code != http.StatusOK {
+			t.Fatalf("GET logs errors_only=true = %d: %s", r.Code, r.Body.String())
+		}
+		var resp struct {
+			Logs    []store.UsageLog           `json:"logs"`
+			Summary store.UsageExtendedSummary `json:"summary"`
+		}
+		if err := json.Unmarshal(r.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode logs response: %v", err)
+		}
+		if len(resp.Logs) != 4 || resp.Summary.RequestCount != 4 || resp.Summary.ErrorCount != 4 {
+			t.Fatalf("expected 4 error logs (400, 502, 200+stream EOF, status 0) and summary count=4, got logs=%d summary=%+v", len(resp.Logs), resp.Summary)
+		}
+		for _, l := range resp.Logs {
+			if l.ID == "ok-200" {
+				t.Fatalf("errors_only=true returned non-error row: %+v", l)
+			}
+		}
+	})
 }

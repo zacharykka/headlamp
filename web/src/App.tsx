@@ -15,6 +15,7 @@ import {
   TailnetMeshGlyph,
   TerminalIcon,
 } from './components/ApertureIcons';
+import { PricingDrawer } from './components/PricingDrawer';
 import type { MeResponse, TimeWindow } from './types/api';
 import { AuditLogsView, type LogsFocusState } from './views/AuditLogsView';
 import {
@@ -26,7 +27,7 @@ import { PersonalView } from './views/PersonalView';
 import { RoutingView, type RoutingFocusState } from './views/RoutingView';
 import { SecurityView, type SecurityFocusState } from './views/SecurityView';
 
-type NavKey =
+export type NavKey =
   | 'overview'
   | 'logs'
   | 'providers'
@@ -36,12 +37,21 @@ type NavKey =
   | 'webhooks'
   | 'quickstart';
 
+type GroupKey = 'telemetry' | 'security' | 'admin' | 'developer';
+
 interface SidebarCounts {
   providers: number;
   routes: number;
   budgets: number;
   rules: number;
   webhooks: number;
+}
+
+function groupForNav(nav: NavKey): GroupKey | null {
+  if (nav === 'overview') return 'telemetry';
+  if (nav === 'logs' || nav === 'guardrails' || nav === 'webhooks') return 'security';
+  if (nav === 'providers' || nav === 'routes' || nav === 'budgets') return 'admin';
+  return null;
 }
 
 function initialsFromPrincipal(name: string): string {
@@ -63,12 +73,14 @@ export function App() {
   const [overviewWindow, setOverviewWindow] = useState<TimeWindow>('7d');
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [bannerDismissed, setBannerDismissed] = useState(false);
+  const [pricingOpen, setPricingOpen] = useState(false);
 
-  const [openGroups, setOpenGroups] = useState({
-    telemetry: true,
-    security: true,
-    admin: true,
-    developer: true,
+  // All sidebar groups start collapsed by default
+  const [openGroups, setOpenGroups] = useState<Record<GroupKey, boolean>>({
+    telemetry: false,
+    security: false,
+    admin: false,
+    developer: false,
   });
 
   const [counts, setCounts] = useState<SidebarCounts>({
@@ -79,10 +91,14 @@ export function App() {
     webhooks: 0,
   });
 
-  const [routingFocus, setRoutingFocus] = useState<RoutingFocusState>({});
+  const [routingFocus, setRoutingFocus] = useState<RoutingFocusState>({
+    section: 'providers',
+  });
   const [budgetsFocus, setBudgetsFocus] = useState<BudgetsFocusState>({});
   const [logsFocus, setLogsFocus] = useState<LogsFocusState>({});
-  const [securityFocus, setSecurityFocus] = useState<SecurityFocusState>({});
+  const [securityFocus, setSecurityFocus] = useState<SecurityFocusState>({
+    section: 'guardrails',
+  });
 
   useEffect(() => {
     api
@@ -92,7 +108,6 @@ export function App() {
         if (!res.is_admin) {
           setActiveNav('quickstart');
         } else {
-          // Preload sidebar inventory counts in parallel for admin console
           void Promise.all([
             api.listProviders().catch(() => []),
             api.listRoutes().catch(() => []),
@@ -164,35 +179,41 @@ export function App() {
     );
   }
 
-  const toggleGroup = (key: keyof typeof openGroups) => {
+  const toggleGroup = (key: GroupKey) => {
     setOpenGroups((prev) => ({ ...prev, [key]: !prev[key] }));
   };
 
-  const navigate = (next: NavKey) => {
+  const navigate = (next: NavKey, opts?: { expandGroup?: boolean }) => {
     setActiveNav(next);
     setMobileSidebarOpen(false);
+    if (opts?.expandGroup) {
+      const targetGroup = groupForNav(next);
+      if (targetGroup) {
+        setOpenGroups((prev) => ({ ...prev, [targetGroup]: true }));
+      }
+    }
     if (typeof window !== 'undefined') {
       window.scrollTo(0, 0);
     }
-    if (next === 'providers') {
-      setRoutingFocus({ section: 'all', nonce: Date.now() });
+    if (next === 'logs') {
+      setLogsFocus({ nonce: Date.now() });
+    } else if (next === 'providers') {
+      setRoutingFocus({ section: 'providers', nonce: Date.now() });
     } else if (next === 'routes') {
       setRoutingFocus({ section: 'routes', nonce: Date.now() });
     } else if (next === 'guardrails') {
-      setSecurityFocus({ section: 'all', nonce: Date.now() });
+      setSecurityFocus({ section: 'guardrails', nonce: Date.now() });
     } else if (next === 'webhooks') {
       setSecurityFocus({ section: 'webhooks', nonce: Date.now() });
     }
   };
 
-  const openPricingDrawer = () => {
-    setActiveNav('providers');
-    setMobileSidebarOpen(false);
-    setRoutingFocus({ section: 'routes', modal: 'pricing', nonce: Date.now() });
-  };
-
   const jumpToLogs = (filter: Omit<LogsFocusState, 'nonce'>) => {
     setActiveNav('logs');
+    setOpenGroups((prev) => ({ ...prev, security: true }));
+    if (typeof window !== 'undefined') {
+      window.scrollTo(0, 0);
+    }
     setLogsFocus({ ...filter, nonce: Date.now() });
   };
 
@@ -202,6 +223,7 @@ export function App() {
     : me.principal.node_ip || me.principal.auth_source;
 
   const isQuickstartView = !me.is_admin || activeNav === 'quickstart';
+  const activeGroup = groupForNav(activeNav);
 
   return (
     <div className="ap-shell">
@@ -237,11 +259,12 @@ export function App() {
         <nav className="ap-sidebar-scroll">
           {me.is_admin ? (
             <>
-              {/* Telemetry / Usage & Adoption */}
+              {/* Usage & Adoption */}
               <div className="ap-nav-group">
                 <button
                   type="button"
                   className="ap-nav-group-btn"
+                  data-has-active={!openGroups.telemetry && activeGroup === 'telemetry'}
                   onClick={() => toggleGroup('telemetry')}
                   aria-expanded={openGroups.telemetry}
                 >
@@ -249,30 +272,31 @@ export function App() {
                     <ChartBarIcon size={16} />
                     <span>Usage & Adoption</span>
                   </span>
-                  <span className="ap-nav-group-chevron">
-                    {openGroups.telemetry ? <ChevronDownIcon /> : <ChevronRightIcon />}
+                  <span
+                    className="ap-nav-group-chevron"
+                    data-open={openGroups.telemetry}
+                  >
+                    <ChevronDownIcon />
                   </span>
                 </button>
-                {openGroups.telemetry && (
-                  <div className="ap-nav-items">
-                    <button
-                      type="button"
-                      className="ap-nav-item"
-                      data-active={activeNav === 'overview'}
-                      onClick={() => navigate('overview')}
-                    >
-                      <span>Usage Overview</span>
-                    </button>
-                    <button
-                      type="button"
-                      className="ap-nav-item"
-                      data-active={activeNav === 'quickstart'}
-                      onClick={() => navigate('quickstart')}
-                    >
-                      <span>My Usage & SDKs</span>
-                    </button>
+                <div
+                  className={`ap-nav-collapse ${openGroups.telemetry ? 'is-open' : ''}`}
+                  aria-hidden={!openGroups.telemetry}
+                >
+                  <div className="ap-nav-collapse-inner">
+                    <div className="ap-nav-items">
+                      <button
+                        type="button"
+                        className="ap-nav-item"
+                        tabIndex={openGroups.telemetry ? 0 : -1}
+                        data-active={activeNav === 'overview'}
+                        onClick={() => navigate('overview')}
+                      >
+                        <span>Usage Overview</span>
+                      </button>
+                    </div>
                   </div>
-                )}
+                </div>
               </div>
 
               {/* Security */}
@@ -280,6 +304,7 @@ export function App() {
                 <button
                   type="button"
                   className="ap-nav-group-btn"
+                  data-has-active={!openGroups.security && activeGroup === 'security'}
                   onClick={() => toggleGroup('security')}
                   aria-expanded={openGroups.security}
                 >
@@ -287,44 +312,55 @@ export function App() {
                     <ShieldIcon size={16} />
                     <span>Security</span>
                   </span>
-                  <span className="ap-nav-group-chevron">
-                    {openGroups.security ? <ChevronDownIcon /> : <ChevronRightIcon />}
+                  <span
+                    className="ap-nav-group-chevron"
+                    data-open={openGroups.security}
+                  >
+                    <ChevronDownIcon />
                   </span>
                 </button>
-                {openGroups.security && (
-                  <div className="ap-nav-items">
-                    <button
-                      type="button"
-                      className="ap-nav-item"
-                      data-active={activeNav === 'logs'}
-                      onClick={() => navigate('logs')}
-                    >
-                      <span>Activity Logs</span>
-                    </button>
-                    <button
-                      type="button"
-                      className="ap-nav-item"
-                      data-active={activeNav === 'guardrails'}
-                      onClick={() => navigate('guardrails')}
-                    >
-                      <span>Guardrails</span>
-                      {counts.rules > 0 && (
-                        <span className="ap-nav-count">{counts.rules}</span>
-                      )}
-                    </button>
-                    <button
-                      type="button"
-                      className="ap-nav-item"
-                      data-active={activeNav === 'webhooks'}
-                      onClick={() => navigate('webhooks')}
-                    >
-                      <span>Webhooks</span>
-                      {counts.webhooks > 0 && (
-                        <span className="ap-nav-count">{counts.webhooks}</span>
-                      )}
-                    </button>
+                <div
+                  className={`ap-nav-collapse ${openGroups.security ? 'is-open' : ''}`}
+                  aria-hidden={!openGroups.security}
+                >
+                  <div className="ap-nav-collapse-inner">
+                    <div className="ap-nav-items">
+                      <button
+                        type="button"
+                        className="ap-nav-item"
+                        tabIndex={openGroups.security ? 0 : -1}
+                        data-active={activeNav === 'logs'}
+                        onClick={() => navigate('logs')}
+                      >
+                        <span>Activity Logs</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="ap-nav-item"
+                        tabIndex={openGroups.security ? 0 : -1}
+                        data-active={activeNav === 'guardrails'}
+                        onClick={() => navigate('guardrails')}
+                      >
+                        <span>Guardrails</span>
+                        {counts.rules > 0 && (
+                          <span className="ap-nav-count">{counts.rules}</span>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        className="ap-nav-item"
+                        tabIndex={openGroups.security ? 0 : -1}
+                        data-active={activeNav === 'webhooks'}
+                        onClick={() => navigate('webhooks')}
+                      >
+                        <span>Webhooks</span>
+                        {counts.webhooks > 0 && (
+                          <span className="ap-nav-count">{counts.webhooks}</span>
+                        )}
+                      </button>
+                    </div>
                   </div>
-                )}
+                </div>
               </div>
 
               {/* Administration */}
@@ -332,6 +368,7 @@ export function App() {
                 <button
                   type="button"
                   className="ap-nav-group-btn"
+                  data-has-active={!openGroups.admin && activeGroup === 'admin'}
                   onClick={() => toggleGroup('admin')}
                   aria-expanded={openGroups.admin}
                 >
@@ -339,47 +376,58 @@ export function App() {
                     <GearIcon size={16} />
                     <span>Administration</span>
                   </span>
-                  <span className="ap-nav-group-chevron">
-                    {openGroups.admin ? <ChevronDownIcon /> : <ChevronRightIcon />}
+                  <span
+                    className="ap-nav-group-chevron"
+                    data-open={openGroups.admin}
+                  >
+                    <ChevronDownIcon />
                   </span>
                 </button>
-                {openGroups.admin && (
-                  <div className="ap-nav-items">
-                    <button
-                      type="button"
-                      className="ap-nav-item"
-                      data-active={activeNav === 'providers'}
-                      onClick={() => navigate('providers')}
-                    >
-                      <span>Providers</span>
-                      {counts.providers > 0 && (
-                        <span className="ap-nav-count">{counts.providers}</span>
-                      )}
-                    </button>
-                    <button
-                      type="button"
-                      className="ap-nav-item"
-                      data-active={activeNav === 'routes'}
-                      onClick={() => navigate('routes')}
-                    >
-                      <span>Model Routing</span>
-                      {counts.routes > 0 && (
-                        <span className="ap-nav-count">{counts.routes}</span>
-                      )}
-                    </button>
-                    <button
-                      type="button"
-                      className="ap-nav-item"
-                      data-active={activeNav === 'budgets'}
-                      onClick={() => navigate('budgets')}
-                    >
-                      <span>Quotas & Grants</span>
-                      {counts.budgets > 0 && (
-                        <span className="ap-nav-count">{counts.budgets}</span>
-                      )}
-                    </button>
+                <div
+                  className={`ap-nav-collapse ${openGroups.admin ? 'is-open' : ''}`}
+                  aria-hidden={!openGroups.admin}
+                >
+                  <div className="ap-nav-collapse-inner">
+                    <div className="ap-nav-items">
+                      <button
+                        type="button"
+                        className="ap-nav-item"
+                        tabIndex={openGroups.admin ? 0 : -1}
+                        data-active={activeNav === 'providers'}
+                        onClick={() => navigate('providers')}
+                      >
+                        <span>Providers</span>
+                        {counts.providers > 0 && (
+                          <span className="ap-nav-count">{counts.providers}</span>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        className="ap-nav-item"
+                        tabIndex={openGroups.admin ? 0 : -1}
+                        data-active={activeNav === 'routes'}
+                        onClick={() => navigate('routes')}
+                      >
+                        <span>Model Routing</span>
+                        {counts.routes > 0 && (
+                          <span className="ap-nav-count">{counts.routes}</span>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        className="ap-nav-item"
+                        tabIndex={openGroups.admin ? 0 : -1}
+                        data-active={activeNav === 'budgets'}
+                        onClick={() => navigate('budgets')}
+                      >
+                        <span>Quotas & Grants</span>
+                        {counts.budgets > 0 && (
+                          <span className="ap-nav-count">{counts.budgets}</span>
+                        )}
+                      </button>
+                    </div>
                   </div>
-                )}
+                </div>
               </div>
 
               {/* Reference */}
@@ -387,6 +435,7 @@ export function App() {
                 <button
                   type="button"
                   className="ap-nav-group-btn"
+                  data-has-active={!openGroups.developer && pricingOpen}
                   onClick={() => toggleGroup('developer')}
                   aria-expanded={openGroups.developer}
                 >
@@ -394,22 +443,34 @@ export function App() {
                     <BookIcon size={16} />
                     <span>Reference</span>
                   </span>
-                  <span className="ap-nav-group-chevron">
-                    {openGroups.developer ? <ChevronDownIcon /> : <ChevronRightIcon />}
+                  <span
+                    className="ap-nav-group-chevron"
+                    data-open={openGroups.developer}
+                  >
+                    <ChevronDownIcon />
                   </span>
                 </button>
-                {openGroups.developer && (
-                  <div className="ap-nav-items">
-                    <button
-                      type="button"
-                      className="ap-nav-item"
-                      data-active={false}
-                      onClick={openPricingDrawer}
-                    >
-                      <span>Model Pricing</span>
-                    </button>
+                <div
+                  className={`ap-nav-collapse ${openGroups.developer ? 'is-open' : ''}`}
+                  aria-hidden={!openGroups.developer}
+                >
+                  <div className="ap-nav-collapse-inner">
+                    <div className="ap-nav-items">
+                      <button
+                        type="button"
+                        className="ap-nav-item"
+                        tabIndex={openGroups.developer ? 0 : -1}
+                        data-active={pricingOpen}
+                        onClick={() => {
+                          setMobileSidebarOpen(false);
+                          setPricingOpen(true);
+                        }}
+                      >
+                        <span>Model Pricing</span>
+                      </button>
+                    </div>
                   </div>
-                )}
+                </div>
               </div>
             </>
           ) : (
@@ -500,8 +561,11 @@ export function App() {
         {me.is_admin && !bannerDismissed && (
           <div className="ap-info-banner">
             <div className="ap-info-banner-body">
-              <SparkleIcon size={15} />
-              <span>
+              <SparkleIcon
+                size={15}
+                style={{ flexShrink: 0, marginTop: 2 }}
+              />
+              <span style={{ minWidth: 0 }}>
                 <strong>Keyless Tailnet AI Gateway is active.</strong> Connect Claude Code, Codex, Gemini CLI, and Cursor using your node identity in{' '}
                 <button
                   type="button"
@@ -515,7 +579,7 @@ export function App() {
                   type="button"
                   className="ap-info-banner-link"
                   onClick={() => {
-                    setActiveNav('budgets');
+                    navigate('budgets', { expandGroup: true });
                     setBudgetsFocus({ scopeFilter: 'all', nonce: Date.now() });
                   }}
                 >
@@ -527,6 +591,7 @@ export function App() {
             <button
               type="button"
               className="ap-btn ap-btn-ghost ap-btn-sm"
+              style={{ flexShrink: 0, height: 22, padding: '0 4px' }}
               onClick={() => setBannerDismissed(true)}
               aria-label="Dismiss banner"
             >
@@ -547,6 +612,10 @@ export function App() {
           ) : activeNav === 'providers' || activeNav === 'routes' ? (
             <RoutingView
               focus={routingFocus}
+              onSectionChange={(sec) =>
+                setActiveNav(sec === 'routes' ? 'routes' : 'providers')
+              }
+              onOpenPricing={() => setPricingOpen(true)}
               onCountsChange={({ providers, routes }) =>
                 setCounts((prev) => ({ ...prev, providers, routes }))
               }
@@ -563,6 +632,9 @@ export function App() {
           ) : (
             <SecurityView
               focus={securityFocus}
+              onSectionChange={(sec) =>
+                setActiveNav(sec === 'webhooks' ? 'webhooks' : 'guardrails')
+              }
               onCountsChange={({ rules, webhooks }) =>
                 setCounts((prev) => ({ ...prev, rules, webhooks }))
               }
@@ -570,6 +642,11 @@ export function App() {
           )}
         </main>
       </div>
+
+      <PricingDrawer
+        open={pricingOpen}
+        onClose={() => setPricingOpen(false)}
+      />
     </div>
   );
 }

@@ -24,6 +24,7 @@ interface OverviewViewProps {
     subject?: string;
     model?: string;
     status?: string;
+    errorsOnly?: boolean;
     timePreset?: TimeWindow;
   }) => void;
 }
@@ -250,9 +251,24 @@ export function OverviewView({
 
           <div
             className="ap-kpi-card ap-kpi-card--sub"
+            role={errorCount > 0 ? 'button' : undefined}
+            tabIndex={errorCount > 0 ? 0 : undefined}
+            aria-label={
+              errorCount > 0
+                ? 'Inspect error requests in Activity Logs'
+                : undefined
+            }
             style={{ cursor: errorCount > 0 ? 'pointer' : undefined }}
             onClick={() => {
-              if (errorCount > 0) onJumpToLogs({ timePreset: windowRange });
+              if (errorCount > 0) {
+                onJumpToLogs({ timePreset: windowRange, errorsOnly: true });
+              }
+            }}
+            onKeyDown={(e) => {
+              if (errorCount > 0 && (e.key === 'Enter' || e.key === ' ')) {
+                e.preventDefault();
+                onJumpToLogs({ timePreset: windowRange, errorsOnly: true });
+              }
             }}
           >
             <span className="ap-kpi-label">

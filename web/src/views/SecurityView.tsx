@@ -6,10 +6,10 @@ import {
   PlayIcon,
   PlusIcon,
   ShieldIcon,
-  TrashIcon,
 } from '../components/ApertureIcons';
 import {
   CodeBlock,
+  ConfirmDeleteButton,
   Modal,
   SegmentedControl,
   SourceBadge,
@@ -60,17 +60,26 @@ export interface SecurityFocusState {
 
 interface SecurityViewProps {
   focus?: SecurityFocusState;
+  onSectionChange?: (section: 'all' | 'guardrails' | 'webhooks') => void;
   onCountsChange?: (counts: { rules: number; webhooks: number }) => void;
 }
 
-export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
+export function SecurityView({
+  focus,
+  onSectionChange,
+  onCountsChange,
+}: SecurityViewProps) {
   const [rules, setRules] = useState<GuardrailRule[]>([]);
   const [webhooks, setWebhooks] = useState<WebhookItem[]>([]);
   const [pageError, setPageError] = useState<string | null>(null);
 
-  const [sectionMode, setSectionMode] = useState<'all' | 'guardrails' | 'webhooks'>('all');
+  const [sectionMode, setSectionMode] = useState<'all' | 'guardrails' | 'webhooks'>(
+    focus?.section ?? 'all',
+  );
   const [categoryFilter, setCategoryFilter] = useState<'all' | 'secret' | 'pii' | 'custom'>('all');
   const [webhookFilter, setWebhookFilter] = useState<'all' | 'sync_review' | 'async_event'>('all');
+  const [togglingRules, setTogglingRules] = useState<Record<string, boolean>>({});
+  const [togglingWebhooks, setTogglingWebhooks] = useState<Record<string, boolean>>({});
 
   // Interactive Live Guardrail Playground
   const [sampleText, setSampleText] = useState(PLAYGROUND_PRESETS[0].text);
@@ -240,8 +249,9 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
   };
 
   const handleToggleRule = async (item: GuardrailRule, next: boolean) => {
-    if (item.source === 'config') return;
+    if (item.source === 'config' || togglingRules[item.id]) return;
     setPageError(null);
+    setTogglingRules((prev) => ({ ...prev, [item.id]: true }));
     try {
       const updated = await api.updateGuardrail(item.id, {
         id: item.id,
@@ -254,6 +264,8 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
       setRules((prev) => prev.map((r) => (r.id === item.id ? updated : r)));
     } catch (err: unknown) {
       setPageError(err instanceof Error ? err.message : 'Failed to toggle guardrail rule');
+    } finally {
+      setTogglingRules((prev) => ({ ...prev, [item.id]: false }));
     }
   };
 
@@ -377,8 +389,9 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
   };
 
   const handleToggleWebhook = async (item: WebhookItem, next: boolean) => {
-    if (item.source === 'config') return;
+    if (item.source === 'config' || togglingWebhooks[item.id]) return;
     setPageError(null);
+    setTogglingWebhooks((prev) => ({ ...prev, [item.id]: true }));
     try {
       await api.updateWebhook(item.id, {
         id: item.id,
@@ -395,6 +408,8 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
       );
     } catch (err: unknown) {
       setPageError(err instanceof Error ? err.message : 'Failed to update webhook');
+    } finally {
+      setTogglingWebhooks((prev) => ({ ...prev, [item.id]: false }));
     }
   };
 
@@ -448,6 +463,11 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
   const showGuardrails = sectionMode === 'all' || sectionMode === 'guardrails';
   const showWebhooks = sectionMode === 'all' || sectionMode === 'webhooks';
 
+  const handleSectionSelect = (next: 'all' | 'guardrails' | 'webhooks') => {
+    setSectionMode(next);
+    onSectionChange?.(next);
+  };
+
   const verdictAction = (testResult?.action || 'allow').toLowerCase();
 
   return (
@@ -473,7 +493,7 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
             <SegmentedControl
               ariaLabel="Security section"
               value={sectionMode}
-              onChange={setSectionMode}
+              onChange={handleSectionSelect}
               options={[
                 { value: 'all', label: 'All' },
                 { value: 'guardrails', label: `Guardrails (${rules.length})` },
@@ -724,7 +744,7 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
                           <td>
                             <Toggle
                               checked={rule.enabled}
-                              disabled={isYaml}
+                              disabled={isYaml || Boolean(togglingRules[rule.id])}
                               title={isYaml ? YAML_LOCK_TOOLTIP : undefined}
                               onChange={(next) => handleToggleRule(rule, next)}
                               label={`Enable ${rule.name}`}
@@ -750,27 +770,18 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
                                 <span className="ap-action-label">Edit</span>
                               </button>
                               {canDelete && (
-                                <button
-                                  type="button"
-                                  className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm ap-btn-icon-compact"
-                                  aria-label={`Delete ${rule.name}`}
-                                  onClick={() => handleDeleteRule(rule)}
-                                >
-                                  <TrashIcon />
-                                  <span className="ap-action-label">Delete</span>
-                                </button>
+                                <ConfirmDeleteButton
+                                  itemName={rule.name}
+                                  onConfirm={() => handleDeleteRule(rule)}
+                                />
                               )}
                               {isYaml && !rule.builtin && (
-                                <button
-                                  type="button"
-                                  className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm ap-btn-icon-compact"
+                                <ConfirmDeleteButton
+                                  itemName={rule.name}
                                   disabled
-                                  aria-label={`Delete ${rule.name}`}
                                   title={YAML_LOCK_TOOLTIP}
-                                >
-                                  <TrashIcon />
-                                  <span className="ap-action-label">Delete</span>
-                                </button>
+                                  onConfirm={() => handleDeleteRule(rule)}
+                                />
                               )}
                             </div>
                           </td>
@@ -914,7 +925,7 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
                         <td>
                           <Toggle
                             checked={wh.enabled}
-                            disabled={isYaml}
+                            disabled={isYaml || Boolean(togglingWebhooks[wh.id])}
                             title={isYaml ? YAML_LOCK_TOOLTIP : undefined}
                             onChange={(next) => handleToggleWebhook(wh, next)}
                             label={`Enable ${wh.name}`}
@@ -942,17 +953,12 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
                               <EditIcon />
                               <span className="ap-action-label">Edit</span>
                             </button>
-                            <button
-                              type="button"
-                              className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm ap-btn-icon-compact"
+                            <ConfirmDeleteButton
+                              itemName={wh.name}
                               disabled={isYaml}
-                              aria-label={`Delete ${wh.name}`}
                               title={isYaml ? YAML_LOCK_TOOLTIP : `Delete ${wh.name}`}
-                              onClick={() => handleDeleteWebhook(wh)}
-                            >
-                              <TrashIcon />
-                              <span className="ap-action-label">Delete</span>
-                            </button>
+                              onConfirm={() => handleDeleteWebhook(wh)}
+                            />
                           </div>
                         </td>
                       </tr>

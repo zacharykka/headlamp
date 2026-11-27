@@ -148,6 +148,7 @@ type UsageFilter struct {
 	ProviderName  string
 	Model         string
 	StatusCode    int
+	ErrorsOnly    bool
 	GuardrailOnly bool
 	Since         time.Time
 	Until         time.Time

@@ -31,6 +31,7 @@ export interface LogsFocusState {
   provider?: string;
   model?: string;
   status?: string;
+  errorsOnly?: boolean;
   guardrail_only?: boolean;
   timePreset?: LogTimePreset;
   openSettings?: boolean;
@@ -99,9 +100,20 @@ export function AuditLogsView({ focus }: AuditLogsViewProps) {
   const [retentionDaysInput, setRetentionDaysInput] = useState('7');
   const [savingSettings, setSavingSettings] = useState(false);
   const [purging, setPurging] = useState(false);
+  const [confirmZeroPurge, setConfirmZeroPurge] = useState(false);
   const [purgeNotice, setPurgeNotice] = useState<string | null>(null);
   const settingsDirtyRef = useRef(false);
   const settingsLoadSeqRef = useRef(0);
+  const zeroPurgeTimerRef = useRef<number | null>(null);
+
+  const clearZeroPurgeTimer = () => {
+    if (zeroPurgeTimerRef.current !== null) {
+      window.clearTimeout(zeroPurgeTimerRef.current);
+      zeroPurgeTimerRef.current = null;
+    }
+  };
+
+  useEffect(() => clearZeroPurgeTimer, []);
 
   useEffect(() => {
     void api
@@ -120,9 +132,9 @@ export function AuditLogsView({ focus }: AuditLogsViewProps) {
     setSubject(focus.subject ?? '');
     setProvider(focus.provider ?? '');
     setModel(focus.model ?? '');
-    setStatus(focus.status ?? '');
+    setStatus(focus.errorsOnly ? 'errors_only' : (focus.status ?? ''));
     setGuardrailOnly(Boolean(focus.guardrail_only));
-    if (focus.timePreset) setTimePreset(focus.timePreset);
+    setTimePreset(focus.timePreset ?? 'all');
     setOffset(0);
     if (focus.openSettings) {
       void openAuditSettings();
@@ -145,7 +157,8 @@ export function AuditLogsView({ focus }: AuditLogsViewProps) {
             subject: subject.trim() || undefined,
             provider: provider.trim() || undefined,
             model: model.trim() || undefined,
-            status: status || undefined,
+            status: status && status !== 'errors_only' ? status : undefined,
+            errors_only: status === 'errors_only' ? true : undefined,
             guardrail_only: guardrailOnly || undefined,
             since: sinceFromPreset(timePreset),
             limit: PAGE_LIMIT,
@@ -217,6 +230,8 @@ export function AuditLogsView({ focus }: AuditLogsViewProps) {
 
   const openAuditSettings = async () => {
     settingsDirtyRef.current = false;
+    clearZeroPurgeTimer();
+    setConfirmZeroPurge(false);
     const seq = ++settingsLoadSeqRef.current;
     setSettingsModalError(null);
     setPurgeNotice(null);
@@ -281,6 +296,17 @@ export function AuditLogsView({ focus }: AuditLogsViewProps) {
       setSettingsModalError(error);
       return;
     }
+    if (days === 0 && !confirmZeroPurge) {
+      setConfirmZeroPurge(true);
+      clearZeroPurgeTimer();
+      zeroPurgeTimerRef.current = window.setTimeout(() => {
+        zeroPurgeTimerRef.current = null;
+        setConfirmZeroPurge(false);
+      }, 4000);
+      return;
+    }
+    clearZeroPurgeTimer();
+    setConfirmZeroPurge(false);
     setPurging(true);
     try {
       const res = await api.purgeAuditPayloads(days);
@@ -380,7 +406,7 @@ export function AuditLogsView({ focus }: AuditLogsViewProps) {
             />
             <select
               className="ap-select ap-select--sm"
-              style={{ width: 134 }}
+              style={{ width: 146 }}
               value={status}
               onChange={(e) => {
                 setStatus(e.target.value);
@@ -389,6 +415,7 @@ export function AuditLogsView({ focus }: AuditLogsViewProps) {
               aria-label="HTTP status filter"
             >
               <option value="">All Statuses</option>
+              <option value="errors_only">Errors (4xx/5xx)</option>
               <option value="200">200 OK</option>
               <option value="400">400 Bad Request</option>
               <option value="403">403 Forbidden</option>
@@ -520,7 +547,10 @@ export function AuditLogsView({ focus }: AuditLogsViewProps) {
                 </tr>
               ) : (
                 logs.map((log) => {
-                  const isError = log.status_code >= 400;
+                  const isError =
+                    log.status_code >= 400 ||
+                    log.status_code === 0 ||
+                    Boolean(log.error_message);
                   const grAction = log.guardrail_action || '';
                   return (
                     <tr
@@ -894,7 +924,7 @@ export function AuditLogsView({ focus }: AuditLogsViewProps) {
             <div>
               <div className="ap-label">Store Request & Response Payloads</div>
               <div className="ap-hint">
-                Encrypts captured bodies at rest using HEADLAMP_MASTER_KEY after applying guardrail redactions.
+                Stores sanitized headers and guardrail-redacted bodies (capped at 256 KB) in local SQLite.
               </div>
             </div>
             <Toggle
@@ -917,6 +947,8 @@ export function AuditLogsView({ focus }: AuditLogsViewProps) {
               value={retentionDaysInput}
               onChange={(e) => {
                 settingsDirtyRef.current = true;
+                clearZeroPurgeTimer();
+                setConfirmZeroPurge(false);
                 setRetentionDaysInput(e.target.value);
               }}
             />
@@ -943,15 +975,35 @@ export function AuditLogsView({ focus }: AuditLogsViewProps) {
                 Purges stored bodies older than the retention days entered above (0 purges all).
               </div>
             </div>
-            <button
-              type="button"
-              className="ap-btn ap-btn-danger ap-btn-sm"
-              disabled={purging}
-              onClick={() => void handlePurge()}
-            >
-              <TrashIcon />
-              <span>{purging ? 'Purging...' : 'Purge Now'}</span>
-            </button>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              {confirmZeroPurge && (
+                <button
+                  type="button"
+                  className="ap-btn ap-btn-ghost ap-btn-sm"
+                  onClick={() => {
+                    clearZeroPurgeTimer();
+                    setConfirmZeroPurge(false);
+                  }}
+                >
+                  Cancel
+                </button>
+              )}
+              <button
+                type="button"
+                className="ap-btn ap-btn-danger ap-btn-sm"
+                disabled={purging}
+                onClick={() => void handlePurge()}
+              >
+                <TrashIcon />
+                <span>
+                  {purging
+                    ? 'Purging...'
+                    : confirmZeroPurge
+                      ? 'Confirm Purge All?'
+                      : 'Purge Now'}
+                </span>
+              </button>
+            </div>
           </div>
 
           {purgeNotice && (
