@@ -32,6 +32,7 @@ headlamp.local.yaml
 # Frontend dependencies and build artifacts
 web/node_modules/
 web/dist/
+references
 
 # Editor and OS files
 .DS_Store
