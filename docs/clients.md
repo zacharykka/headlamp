@@ -1,5 +1,7 @@
 # Headlamp Client & Deployment Recipes
 
+**English** | [简体中文](./clients.zh-CN.md)
+
 Headlamp authenticates tailnet devices automatically via `tsnet` `WhoIs`. Replace `http://headlamp` with your HTTPS MagicDNS or ACME DNS-01 URL (for example `https://headlamp.internal.example.com`) when TLS is enabled.
 
 When connecting over the tailnet, the API key environment variable is only a non-empty placeholder required by client SDKs—Headlamp ignores it and injects the encrypted upstream vendor key from its store. For non-tailnet callers (such as CI runners hitting `local_listen`), replace `"headlamp"` with your configured `server.api_tokens` value.

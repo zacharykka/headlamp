@@ -1,5 +1,7 @@
 # Headlamp + Headscale v0.29.7 Setup Guide
 
+**English** | [简体中文](./headscale-setup.zh-CN.md)
+
 This guide walks through joining **Headlamp** to a self-hosted **Headscale v0.29.7** tailnet via `tsnet`, configuring Headscale `grants`, and pointing AI coding agents at Headlamp with zero client API keys.
 
 ---

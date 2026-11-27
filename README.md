@@ -1,5 +1,7 @@
 # Headlamp
 
+**English** | [简体中文](./README.zh-CN.md)
+
 Headlamp is a self-hosted, single-binary private AI gateway built in Go that joins your Headscale (or Tailscale) tailnet as a first-class node via `tsnet`. Devices on your tailnet authenticate automatically with their tailnet identity—no vendor API keys distributed to developer machines.
 
 ## Key Capabilities

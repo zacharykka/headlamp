@@ -1,5 +1,7 @@
 # Headscale v0.29.7 & Tailscale `tsnet` Integration Spec
 
+**English** | [简体中文](./headscale_tsnet.zh-CN.md)
+
 Implementation reference for Headlamp `internal/netts`, `internal/auth`, and `internal/policy`.
 All Go types and signatures below are verified directly against **`tailscale.com v1.106.1`** (resolved in `go.mod`) and **Headscale v0.29.7**.
 

@@ -1,5 +1,7 @@
 # LLM Providers Wire Format, Streaming SSE & Cross-Protocol Translation Spec
 
+**English** | [简体中文](./providers_sse.zh-CN.md)
+
 Implementation reference for Headlamp `internal/proxy`, `internal/translate`, and `internal/metering`.
 
 ---
