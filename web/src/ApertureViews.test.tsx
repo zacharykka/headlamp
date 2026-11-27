@@ -44,9 +44,9 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
         provider_name: 'anthropic-yaml',
         upstream_model: 'claude-sonnet-4-20250514',
         fallbacks: [],
-        input_cost_per_million: null,
+        input_cost_per_million: 0.45,
         output_cost_per_million: null,
-        cache_read_cost_per_million: 0.25,
+        cache_read_cost_per_million: null,
         cache_write_cost_per_million: null,
         enabled: true,
         source: 'local',
@@ -64,13 +64,13 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
 
     // YAML-managed badge is visible and Edit/Delete are disabled on anthropic-yaml row
     expect(screen.getByText('Managed by YAML')).toBeTruthy();
-    const editYamlBtn = screen.getAllByRole('button', { name: /Edit/i })[0];
+    const editYamlBtn = screen.getByRole('button', { name: 'Edit anthropic-yaml' });
     expect((editYamlBtn as HTMLButtonElement).disabled).toBe(true);
 
-    // Cache-tier override detected & null input/output tiers display "Default", never "$0.00"
+    // Input-only override displays Default across all 3 remaining null tiers (output + both cache tiers)
     expect(screen.getByText('team/cache-tuned')).toBeTruthy();
-    expect(screen.getAllByText('Default').length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText(/\$0\.25/)).toBeTruthy();
+    expect(screen.getByText(/\$0\.45/)).toBeTruthy();
+    expect(screen.getByText(/Default \/ Default/)).toBeTruthy();
 
     // Open Add Route modal and enter malformed fallback line missing "/"
     fireEvent.click(screen.getByRole('button', { name: /Add Route/i }));
@@ -287,6 +287,85 @@ describe('Aperture views: GitOps locks, inline modal errors, and audit inspector
     await waitFor(() => {
       expect(purgeSpy).toHaveBeenCalledWith(7);
       expect(within(settingsDialog).getByText(/Purged 3 payloads older than 7d/i)).toBeTruthy();
+    });
+  });
+
+  it('prevents in-flight getAuditSettings from overwriting retention_days=0 edits and purges with 0', async () => {
+    let savedRetention = 14;
+    let resolveModalFetch!: (val: {
+      store_payloads: boolean;
+      retention_days: number;
+    }) => void;
+    let callCount = 0;
+
+    vi.spyOn(api, 'getAuditSettings').mockImplementation(() => {
+      callCount += 1;
+      // First call on mount resolves immediately; second call when opening modal resolves late
+      if (callCount === 2) {
+        return new Promise((resolve) => {
+          resolveModalFetch = resolve;
+        });
+      }
+      return Promise.resolve({ store_payloads: false, retention_days: savedRetention });
+    });
+
+    const updateSpy = vi
+      .spyOn(api, 'updateAuditSettings')
+      .mockImplementation(async (next) => {
+        savedRetention = next.retention_days;
+        return next;
+      });
+    const purgeSpy = vi
+      .spyOn(api, 'purgeAuditPayloads')
+      .mockResolvedValue({ purged: 5 });
+
+    vi.spyOn(api, 'listAdminLogs').mockResolvedValue({
+      summary: {
+        request_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        reasoning_tokens: 0,
+        total_tokens: 0,
+        cost_usd: 0,
+      },
+      logs: [],
+    });
+
+    render(<AuditLogsView />);
+
+    // Open Audit Storage and edit Retention Window to 0 BEFORE getAuditSettings resolves
+    fireEvent.click(screen.getByRole('button', { name: /Audit Storage/i }));
+    const dialog = await screen.findByRole('dialog', {
+      name: /Audit Storage & Payload Retention/i,
+    });
+    const retentionInput = within(dialog).getByLabelText(/Retention Window/i) as HTMLInputElement;
+    fireEvent.change(retentionInput, { target: { value: '0' } });
+
+    // Now resolve the slow in-flight getAuditSettings() with stale 14 — must NOT clobber 0!
+    resolveModalFetch({ store_payloads: false, retention_days: 14 });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(retentionInput.value).toBe('0');
+
+    // Save Settings -> sends retention_days: 0 and closes modal
+    fireEvent.click(within(dialog).getByRole('button', { name: /Save Settings/i }));
+    await waitFor(() => {
+      expect(updateSpy).toHaveBeenCalledWith({
+        store_payloads: false,
+        retention_days: 0,
+      });
+    });
+
+    // Reopen Audit Storage -> retention is 0 -> Purge Now sends {"retention_days": 0}
+    fireEvent.click(screen.getByRole('button', { name: /Audit Storage/i }));
+    const reopenedDialog = await screen.findByRole('dialog', {
+      name: /Audit Storage & Payload Retention/i,
+    });
+    fireEvent.click(within(reopenedDialog).getByRole('button', { name: /Purge Now/i }));
+    await waitFor(() => {
+      expect(purgeSpy).toHaveBeenCalledWith(0);
+      expect(within(reopenedDialog).getByText(/Purged all 5 stored payloads/i)).toBeTruthy();
     });
   });
 });

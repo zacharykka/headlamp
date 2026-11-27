@@ -681,19 +681,25 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
 
                       return (
                         <tr key={rule.id} className="ap-row">
-                          <td>
-                            <div style={{ fontWeight: 560 }}>{rule.name}</div>
-                            <div className="ap-mono" style={{ fontSize: 11, color: 'var(--ap-text-muted)' }}>
+                          <td style={{ maxWidth: 140 }}>
+                            <div className="ap-truncate" style={{ fontWeight: 560 }} title={rule.name}>
+                              {rule.name}
+                            </div>
+                            <div
+                              className="ap-mono ap-truncate"
+                              style={{ fontSize: 11, color: 'var(--ap-text-muted)' }}
+                              title={rule.id}
+                            >
                               {rule.id}
                             </div>
                           </td>
-                          <td>
+                          <td style={{ whiteSpace: 'nowrap' }}>
                             <SourceBadge source={rule.source} builtin={rule.builtin} />
                           </td>
-                          <td style={{ textTransform: 'uppercase', fontSize: 11.5, color: 'var(--ap-text-secondary)', fontWeight: 550 }}>
+                          <td style={{ textTransform: 'uppercase', fontSize: 11.5, color: 'var(--ap-text-secondary)', fontWeight: 550, whiteSpace: 'nowrap' }}>
                             {rule.category}
                           </td>
-                          <td style={{ maxWidth: 230 }}>
+                          <td style={{ maxWidth: 145 }}>
                             <span
                               className="ap-mono ap-truncate"
                               style={{ display: 'block', fontSize: 12, color: 'var(--ap-text-secondary)' }}
@@ -702,7 +708,7 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
                               {rule.pattern}
                             </span>
                           </td>
-                          <td>
+                          <td style={{ whiteSpace: 'nowrap' }}>
                             <span
                               className={`ap-badge ${
                                 rule.action === 'block'
@@ -728,8 +734,9 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
                             <div className="ap-row-actions">
                               <button
                                 type="button"
-                                className="ap-btn ap-btn-ghost ap-btn-sm"
+                                className="ap-btn ap-btn-ghost ap-btn-sm ap-btn-icon-compact"
                                 disabled={isYaml}
+                                aria-label={`Edit ${rule.name}`}
                                 title={
                                   isYaml
                                     ? YAML_LOCK_TOOLTIP
@@ -740,27 +747,29 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
                                 onClick={() => openEditRule(rule)}
                               >
                                 <EditIcon />
-                                <span>Edit</span>
+                                <span className="ap-action-label">Edit</span>
                               </button>
                               {canDelete && (
                                 <button
                                   type="button"
-                                  className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm"
+                                  className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm ap-btn-icon-compact"
+                                  aria-label={`Delete ${rule.name}`}
                                   onClick={() => handleDeleteRule(rule)}
                                 >
                                   <TrashIcon />
-                                  <span>Delete</span>
+                                  <span className="ap-action-label">Delete</span>
                                 </button>
                               )}
                               {isYaml && !rule.builtin && (
                                 <button
                                   type="button"
-                                  className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm"
+                                  className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm ap-btn-icon-compact"
                                   disabled
+                                  aria-label={`Delete ${rule.name}`}
                                   title={YAML_LOCK_TOOLTIP}
                                 >
                                   <TrashIcon />
-                                  <span>Delete</span>
+                                  <span className="ap-action-label">Delete</span>
                                 </button>
                               )}
                             </div>
@@ -825,16 +834,22 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
 
                     return (
                       <tr key={wh.id} className="ap-row">
-                        <td>
-                          <div style={{ fontWeight: 560 }}>{wh.name}</div>
-                          <div className="ap-mono" style={{ fontSize: 11, color: 'var(--ap-text-muted)' }}>
+                        <td style={{ maxWidth: 122 }}>
+                          <div className="ap-truncate" style={{ fontWeight: 560 }} title={wh.name}>
+                            {wh.name}
+                          </div>
+                          <div
+                            className="ap-mono ap-truncate"
+                            style={{ fontSize: 11, color: 'var(--ap-text-muted)' }}
+                            title={wh.id}
+                          >
                             {wh.id}
                           </div>
                         </td>
-                        <td>
+                        <td style={{ whiteSpace: 'nowrap' }}>
                           <SourceBadge source={wh.source} />
                         </td>
-                        <td>
+                        <td style={{ whiteSpace: 'nowrap' }}>
                           <span
                             className={`ap-badge ${
                               wh.type === 'sync_review' ? 'ap-badge--purple' : 'ap-badge--blue'
@@ -843,7 +858,7 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
                             {wh.type === 'sync_review' ? 'Sync Review' : 'Async Event'}
                           </span>
                         </td>
-                        <td style={{ maxWidth: 230 }}>
+                        <td style={{ maxWidth: 162 }}>
                           <div
                             className="ap-mono ap-truncate"
                             style={{ fontSize: 12, color: 'var(--ap-text-secondary)' }}
@@ -852,19 +867,42 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
                             {wh.url}
                           </div>
                           <div
-                            className="ap-truncate"
-                            style={{ fontSize: 11.5, color: 'var(--ap-text-muted)', marginTop: 2 }}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 6,
+                              marginTop: 2,
+                              minWidth: 0,
+                            }}
                           >
-                            {wh.type === 'sync_review'
-                              ? `${wh.timeout_ms} ms timeout · ${
-                                  wh.fail_open ? 'fail_open' : 'fail_closed'
-                                }`
-                              : (wh.events ?? []).includes('*')
-                                ? 'All events (*)'
-                                : (wh.events ?? []).join(', ') || 'No events'}
+                            <span
+                              className="ap-truncate"
+                              style={{ fontSize: 11.5, color: 'var(--ap-text-muted)' }}
+                            >
+                              {wh.type === 'sync_review'
+                                ? `${wh.timeout_ms} ms · ${
+                                    wh.fail_open ? 'fail_open' : 'fail_closed'
+                                  }`
+                                : (wh.events ?? []).includes('*')
+                                  ? 'All events (*)'
+                                  : (wh.events ?? []).join(', ') || 'No events'}
+                            </span>
+                            {ping && (
+                              <span
+                                className={`ap-badge ap-tabular ${
+                                  ping.ok ? 'ap-badge--green' : 'ap-badge--red'
+                                }`}
+                                style={{ flexShrink: 0 }}
+                                title={ping.message}
+                              >
+                                {ping.ok
+                                  ? `${ping.status_code} · ${formatLatency(ping.latency_ms)}`
+                                  : ping.message.slice(0, 18)}
+                              </span>
+                            )}
                           </div>
                         </td>
-                        <td>
+                        <td style={{ whiteSpace: 'nowrap' }}>
                           <span
                             className={`ap-badge ${
                               wh.has_secret ? 'ap-badge--green' : ''
@@ -884,18 +922,6 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
                         </td>
                         <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                           <div className="ap-row-actions">
-                            {ping && (
-                              <span
-                                className={`ap-badge ap-tabular ${
-                                  ping.ok ? 'ap-badge--green' : 'ap-badge--red'
-                                }`}
-                                title={ping.message}
-                              >
-                                {ping.ok
-                                  ? `${ping.status_code} · ${formatLatency(ping.latency_ms)}`
-                                  : ping.message.slice(0, 26)}
-                              </span>
-                            )}
                             <button
                               type="button"
                               className="ap-btn ap-btn-ghost ap-btn-sm"
@@ -907,23 +933,25 @@ export function SecurityView({ focus, onCountsChange }: SecurityViewProps) {
                             </button>
                             <button
                               type="button"
-                              className="ap-btn ap-btn-ghost ap-btn-sm"
+                              className="ap-btn ap-btn-ghost ap-btn-sm ap-btn-icon-compact"
                               disabled={isYaml}
+                              aria-label={`Edit ${wh.name}`}
                               title={isYaml ? YAML_LOCK_TOOLTIP : `Edit ${wh.name}`}
                               onClick={() => openEditWebhook(wh)}
                             >
                               <EditIcon />
-                              <span>Edit</span>
+                              <span className="ap-action-label">Edit</span>
                             </button>
                             <button
                               type="button"
-                              className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm"
+                              className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm ap-btn-icon-compact"
                               disabled={isYaml}
+                              aria-label={`Delete ${wh.name}`}
                               title={isYaml ? YAML_LOCK_TOOLTIP : `Delete ${wh.name}`}
                               onClick={() => handleDeleteWebhook(wh)}
                             >
                               <TrashIcon />
-                              <span>Delete</span>
+                              <span className="ap-action-label">Delete</span>
                             </button>
                           </div>
                         </td>

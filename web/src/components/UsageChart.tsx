@@ -12,9 +12,10 @@ export type ChartMetric = 'cost_usd' | 'requests' | 'tokens' | 'errors';
 interface UsageChartProps {
   series: UsageSeriesPoint[];
   metric: ChartMetric;
+  flush?: boolean;
 }
 
-export function UsageChart({ series, metric }: UsageChartProps) {
+export function UsageChart({ series, metric, flush = false }: UsageChartProps) {
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const gradId = useId();
 
@@ -103,7 +104,7 @@ export function UsageChart({ series, metric }: UsageChartProps) {
           : 'Requests';
 
   return (
-    <div style={{ padding: '14px 18px 16px' }}>
+    <div style={{ padding: flush ? '4px 0 0' : '14px 18px 16px' }}>
       <div
         style={{
           minHeight: 24,
@@ -190,14 +191,37 @@ export function UsageChart({ series, metric }: UsageChartProps) {
 
         {areaPath && <path d={areaPath} fill={`url(#${gradId})`} />}
 
-        <path
-          d={linePath}
-          fill="none"
-          stroke={strokeColor}
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
+        {points.length === 1 ? (
+          <g>
+            <rect
+              x={points[0].x - 22}
+              y={points[0].y}
+              width={44}
+              height={Math.max(2, padTop + plotH - points[0].y)}
+              rx={5}
+              fill={strokeColor}
+              fillOpacity="0.14"
+            />
+            <line
+              x1={points[0].x}
+              x2={points[0].x}
+              y1={points[0].y}
+              y2={padTop + plotH}
+              stroke={strokeColor}
+              strokeWidth="2"
+              strokeLinecap="round"
+            />
+          </g>
+        ) : (
+          <path
+            d={linePath}
+            fill="none"
+            stroke={strokeColor}
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        )}
 
         {activePoint && (
           <line
@@ -218,7 +242,7 @@ export function UsageChart({ series, metric }: UsageChartProps) {
               <circle
                 cx={pt.x}
                 cy={pt.y}
-                r={hoveredIndex === idx ? 4.8 : 3}
+                r={hoveredIndex === idx ? 4.8 : points.length === 1 ? 4 : 3}
                 fill={hoveredIndex === idx ? strokeColor : '#FFFFFF'}
                 stroke={strokeColor}
                 strokeWidth="2"
@@ -235,7 +259,13 @@ export function UsageChart({ series, metric }: UsageChartProps) {
           );
         })}
 
-        <text x={padLeft} y={height - 7} textAnchor="start" fill="#84827C" fontSize="11.5">
+        <text
+          x={points.length === 1 ? points[0].x : padLeft}
+          y={height - 7}
+          textAnchor={points.length === 1 ? 'middle' : 'start'}
+          fill="#84827C"
+          fontSize="11.5"
+        >
           {firstLabel}
         </text>
         {midLabel && (

@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import {
   AlertIcon,
   CheckIcon,
@@ -38,7 +39,7 @@ export function Modal({
 
   if (!open) return null;
 
-  return (
+  const node = (
     <div
       className="ap-backdrop"
       role="dialog"
@@ -74,6 +75,8 @@ export function Modal({
       </div>
     </div>
   );
+
+  return typeof document !== 'undefined' ? createPortal(node, document.body) : node;
 }
 
 interface DrawerProps {
@@ -98,7 +101,7 @@ export function Drawer({ open, title, subtitle, onClose, children }: DrawerProps
 
   if (!open) return null;
 
-  return (
+  const node = (
     <div
       className="ap-drawer-backdrop"
       role="dialog"
@@ -131,6 +134,8 @@ export function Drawer({ open, title, subtitle, onClose, children }: DrawerProps
       </div>
     </div>
   );
+
+  return typeof document !== 'undefined' ? createPortal(node, document.body) : node;
 }
 
 interface ToggleProps {
@@ -269,7 +274,11 @@ export function CodeBlock({
           <span>{copied ? 'Copied' : 'Copy'}</span>
         </button>
       </div>
-      <pre className="ap-code-pre">
+      <pre
+        className={`ap-code-pre ${
+          highlightRedactions ? 'ap-code-pre--wrap' : ''
+        }`}
+      >
         {highlightRedactions ? renderRedactedParts(code) : code}
       </pre>
     </div>

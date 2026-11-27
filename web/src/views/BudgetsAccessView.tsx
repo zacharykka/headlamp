@@ -284,8 +284,8 @@ export function BudgetsAccessView({
               <tr>
                 <th>Scope</th>
                 <th>Origin</th>
-                <th style={{ minWidth: 165 }}>Daily Consumption</th>
-                <th style={{ minWidth: 165 }}>Monthly Consumption</th>
+                <th style={{ minWidth: 122 }}>Daily Consumption</th>
+                <th style={{ minWidth: 122 }}>Monthly Consumption</th>
                 <th>Rate & Concurrency</th>
                 <th>Enabled</th>
                 <th style={{ textAlign: 'right' }}>Actions</th>
@@ -303,7 +303,7 @@ export function BudgetsAccessView({
                   const isYaml = item.source === 'config';
                   return (
                     <tr key={item.scope} className="ap-row">
-                      <td>
+                      <td style={{ whiteSpace: 'nowrap' }}>
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                           <span className="ap-mono" style={{ fontWeight: 600 }}>
                             {item.scope === '*' ? '* (Global)' : item.scope}
@@ -313,18 +313,19 @@ export function BudgetsAccessView({
                           </span>
                         </div>
                       </td>
-                      <td>
+                      <td style={{ whiteSpace: 'nowrap' }}>
                         <SourceBadge source={item.source} />
                       </td>
-                      <td>
+                      <td style={{ maxWidth: 155 }}>
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                           <div
                             className="ap-tabular"
                             style={{
                               display: 'flex',
                               justifyContent: 'space-between',
-                              gap: 8,
+                              gap: 6,
                               fontSize: 12,
+                              whiteSpace: 'nowrap',
                             }}
                           >
                             <span style={{ fontWeight: 600 }}>
@@ -345,15 +346,16 @@ export function BudgetsAccessView({
                           )}
                         </div>
                       </td>
-                      <td>
+                      <td style={{ maxWidth: 155 }}>
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                           <div
                             className="ap-tabular"
                             style={{
                               display: 'flex',
                               justifyContent: 'space-between',
-                              gap: 8,
+                              gap: 6,
                               fontSize: 12,
+                              whiteSpace: 'nowrap',
                             }}
                           >
                             <span style={{ fontWeight: 600 }}>
@@ -374,7 +376,14 @@ export function BudgetsAccessView({
                           )}
                         </div>
                       </td>
-                      <td className="ap-tabular" style={{ color: 'var(--ap-text-secondary)', fontSize: 12 }}>
+                      <td
+                        className="ap-tabular"
+                        style={{
+                          color: 'var(--ap-text-secondary)',
+                          fontSize: 11.5,
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
                         {[
                           item.rpm > 0 ? `${formatNumber(item.rpm)} RPM` : null,
                           item.tpm > 0 ? `${formatCompactTokens(item.tpm)} TPM` : null,
@@ -396,23 +405,25 @@ export function BudgetsAccessView({
                         <div className="ap-row-actions">
                           <button
                             type="button"
-                            className="ap-btn ap-btn-ghost ap-btn-sm"
+                            className="ap-btn ap-btn-ghost ap-btn-sm ap-btn-icon-compact"
                             disabled={isYaml}
+                            aria-label={`Edit ${item.scope}`}
                             title={isYaml ? YAML_LOCK_TOOLTIP : `Edit ${item.scope}`}
                             onClick={() => openEditModal(item)}
                           >
                             <EditIcon />
-                            <span>Edit</span>
+                            <span className="ap-action-label">Edit</span>
                           </button>
                           <button
                             type="button"
-                            className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm"
+                            className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm ap-btn-icon-compact"
                             disabled={isYaml}
+                            aria-label={`Delete ${item.scope}`}
                             title={isYaml ? YAML_LOCK_TOOLTIP : `Delete ${item.scope}`}
                             onClick={() => handleDelete(item)}
                           >
                             <TrashIcon />
-                            <span>Delete</span>
+                            <span className="ap-action-label">Delete</span>
                           </button>
                         </div>
                       </td>
@@ -427,10 +438,23 @@ export function BudgetsAccessView({
 
       <div className="ap-split-2">
         <section className="ap-card" aria-label="Live Headscale grants inspector">
-          <div className="ap-card-header">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <TailnetMeshGlyph size={16} />
-              <div>
+          <div
+            className="ap-card-header"
+            style={{ flexWrap: 'nowrap', alignItems: 'flex-start' }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'flex-start',
+                gap: 8,
+                flex: 1,
+                minWidth: 0,
+              }}
+            >
+              <span style={{ marginTop: 2, display: 'inline-flex', flexShrink: 0 }}>
+                <TailnetMeshGlyph size={16} />
+              </span>
+              <div style={{ minWidth: 0 }}>
                 <h2 className="ap-card-title">Live Policy Inspector</h2>
                 <p className="ap-card-subtitle">
                   Evaluated headlamp.dev/cap/gateway capabilities for your session.
@@ -441,6 +465,7 @@ export function BudgetsAccessView({
               className={`ap-badge ${
                 policy?.grants_applied ? 'ap-badge--green' : 'ap-badge--amber'
               }`}
+              style={{ flexShrink: 0 }}
             >
               {policy?.grants_applied ? 'Grants Active' : 'No Matching Grants'}
             </span>

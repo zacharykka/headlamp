@@ -200,7 +200,7 @@ export function PersonalView({ me }: PersonalViewProps) {
             />
           </div>
 
-          <div className="ap-card-body ap-split-2">
+          <div className="ap-card-body ap-quickstart-grid">
             <CodeBlock
               label={snippets[toolTab].label}
               code={snippets[toolTab].code}
@@ -408,7 +408,7 @@ export function PersonalView({ me }: PersonalViewProps) {
             </div>
           </div>
 
-          <UsageChart series={usage?.series ?? []} metric={metric} />
+          <UsageChart series={usage?.series ?? []} metric={metric} flush />
         </div>
       </section>
 

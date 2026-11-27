@@ -24,6 +24,7 @@ interface OverviewViewProps {
     subject?: string;
     model?: string;
     status?: string;
+    timePreset?: TimeWindow;
   }) => void;
 }
 
@@ -33,6 +34,7 @@ export function OverviewView({
   onJumpToLogs,
 }: OverviewViewProps) {
   const [data, setData] = useState<AdminOverviewResponse | null>(null);
+  const [providerTypes, setProviderTypes] = useState<Record<string, string>>({});
   const [metric, setMetric] = useState<ChartMetric>('cost_usd');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -43,11 +45,18 @@ export function OverviewView({
     setLoading(true);
     setError(null);
 
-    api
-      .getAdminOverview(windowRange, { signal: controller.signal })
-      .then((res) => {
+    Promise.all([
+      api.getAdminOverview(windowRange, { signal: controller.signal }),
+      api.listProviders({ signal: controller.signal }).catch(() => []),
+    ])
+      .then(([res, provList]) => {
         if (!controller.signal.aborted) {
           setData(res);
+          const map: Record<string, string> = {};
+          for (const p of provList) {
+            map[p.name] = p.type;
+          }
+          setProviderTypes(map);
           setLoading(false);
         }
       })
@@ -243,7 +252,7 @@ export function OverviewView({
             className="ap-kpi-card ap-kpi-card--sub"
             style={{ cursor: errorCount > 0 ? 'pointer' : undefined }}
             onClick={() => {
-              if (errorCount > 0) onJumpToLogs({});
+              if (errorCount > 0) onJumpToLogs({ timePreset: windowRange });
             }}
           >
             <span className="ap-kpi-label">
@@ -308,14 +317,24 @@ export function OverviewView({
                       key={item.subject}
                       className="ap-row ap-row-clickable"
                       tabIndex={0}
-                      onClick={() => onJumpToLogs({ subject: item.subject })}
+                      onClick={() =>
+                        onJumpToLogs({
+                          subject: item.subject,
+                          timePreset: windowRange,
+                        })
+                      }
                       onKeyDown={(e) => {
-                        if (e.key === 'Enter') onJumpToLogs({ subject: item.subject });
+                        if (e.key === 'Enter') {
+                          onJumpToLogs({
+                            subject: item.subject,
+                            timePreset: windowRange,
+                          });
+                        }
                       }}
                     >
                       <td
                         className="ap-mono ap-truncate"
-                        style={{ maxWidth: 210, fontWeight: 550 }}
+                        style={{ maxWidth: 170, fontWeight: 550 }}
                         title={item.subject}
                       >
                         {item.subject}
@@ -348,8 +367,7 @@ export function OverviewView({
             <table className="ap-table">
               <thead>
                 <tr>
-                  <th>Model</th>
-                  <th>Provider</th>
+                  <th>Model & Provider</th>
                   <th className="ap-num">Requests</th>
                   <th className="ap-num">Tokens</th>
                   <th className="ap-num">Spend</th>
@@ -358,50 +376,69 @@ export function OverviewView({
               <tbody>
                 {topModels.length === 0 ? (
                   <tr>
-                    <td colSpan={5} style={{ color: 'var(--ap-text-muted)', padding: '24px 14px', textAlign: 'center' }}>
+                    <td colSpan={4} style={{ color: 'var(--ap-text-muted)', padding: '24px 14px', textAlign: 'center' }}>
                       No model activity in this window.
                     </td>
                   </tr>
                 ) : (
-                  topModels.map((item) => (
-                    <tr
-                      key={`${item.provider}/${item.model}`}
-                      className="ap-row ap-row-clickable"
-                      tabIndex={0}
-                      onClick={() => onJumpToLogs({ model: item.model })}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') onJumpToLogs({ model: item.model });
-                      }}
-                    >
-                      <td
-                        className="ap-mono ap-truncate"
-                        style={{ maxWidth: 190, fontWeight: 550 }}
-                        title={item.model}
+                  topModels.map((item) => {
+                    const resolvedType =
+                      providerTypes[item.provider] || item.provider;
+                    return (
+                      <tr
+                        key={`${item.provider}/${item.model}`}
+                        className="ap-row ap-row-clickable"
+                        tabIndex={0}
+                        onClick={() =>
+                          onJumpToLogs({
+                            model: item.model,
+                            timePreset: windowRange,
+                          })
+                        }
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            onJumpToLogs({
+                              model: item.model,
+                              timePreset: windowRange,
+                            });
+                          }
+                        }}
                       >
-                        {item.model}
-                      </td>
-                      <td>
-                        <span
-                          style={{
-                            display: 'inline-flex',
-                            alignItems: 'center',
-                            gap: 6,
-                            color: 'var(--ap-text-secondary)',
-                          }}
-                        >
-                          <ProviderGlyph type={item.provider} />
-                          <span>{item.provider}</span>
-                        </span>
-                      </td>
-                      <td className="ap-num">{formatNumber(item.requests)}</td>
-                      <td className="ap-num" style={{ color: 'var(--ap-text-secondary)' }}>
-                        {formatCompactTokens(item.tokens)}
-                      </td>
-                      <td className="ap-num" style={{ fontWeight: 600 }}>
-                        {formatUSD(item.cost_usd)}
-                      </td>
-                    </tr>
-                  ))
+                        <td style={{ maxWidth: 180 }}>
+                          <div
+                            className="ap-mono ap-truncate"
+                            style={{ fontWeight: 550 }}
+                            title={item.model}
+                          >
+                            {item.model}
+                          </div>
+                          <div
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 5,
+                              marginTop: 2,
+                              color: 'var(--ap-text-secondary)',
+                              fontSize: 11.5,
+                              whiteSpace: 'nowrap',
+                              overflow: 'hidden',
+                            }}
+                            title={item.provider}
+                          >
+                            <ProviderGlyph type={resolvedType} />
+                            <span className="ap-truncate">{item.provider}</span>
+                          </div>
+                        </td>
+                        <td className="ap-num">{formatNumber(item.requests)}</td>
+                        <td className="ap-num" style={{ color: 'var(--ap-text-secondary)' }}>
+                          {formatCompactTokens(item.tokens)}
+                        </td>
+                        <td className="ap-num" style={{ fontWeight: 600 }}>
+                          {formatUSD(item.cost_usd)}
+                        </td>
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>

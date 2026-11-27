@@ -100,13 +100,17 @@ export function AuditLogsView({ focus }: AuditLogsViewProps) {
   const [savingSettings, setSavingSettings] = useState(false);
   const [purging, setPurging] = useState(false);
   const [purgeNotice, setPurgeNotice] = useState<string | null>(null);
+  const settingsDirtyRef = useRef(false);
+  const settingsLoadSeqRef = useRef(0);
 
   useEffect(() => {
     void api
       .getAuditSettings()
       .then((res) => {
-        setSettings(res);
-        setRetentionDaysInput(String(res.retention_days));
+        if (!settingsDirtyRef.current) {
+          setSettings(res);
+          setRetentionDaysInput(String(res.retention_days));
+        }
       })
       .catch(() => {});
   }, []);
@@ -212,18 +216,24 @@ export function AuditLogsView({ focus }: AuditLogsViewProps) {
   };
 
   const openAuditSettings = async () => {
+    settingsDirtyRef.current = false;
+    const seq = ++settingsLoadSeqRef.current;
     setSettingsModalError(null);
     setPurgeNotice(null);
     setRetentionDaysInput(String(settings.retention_days));
     setSettingsOpen(true);
     try {
       const current = await api.getAuditSettings();
-      setSettings(current);
-      setRetentionDaysInput(String(current.retention_days));
+      if (seq === settingsLoadSeqRef.current && !settingsDirtyRef.current) {
+        setSettings(current);
+        setRetentionDaysInput(String(current.retention_days));
+      }
     } catch (err: unknown) {
-      setSettingsModalError(
-        err instanceof Error ? err.message : 'Failed to load current audit settings',
-      );
+      if (seq === settingsLoadSeqRef.current) {
+        setSettingsModalError(
+          err instanceof Error ? err.message : 'Failed to load current audit settings',
+        );
+      }
     }
   };
 
@@ -608,14 +618,15 @@ export function AuditLogsView({ focus }: AuditLogsViewProps) {
                       <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                         <button
                           type="button"
-                          className="ap-btn ap-btn-ghost ap-btn-sm"
+                          className="ap-btn ap-btn-ghost ap-btn-sm ap-btn-icon-compact"
+                          aria-label="Inspect request"
                           onClick={(e) => {
                             e.stopPropagation();
                             void inspectLog(log);
                           }}
                         >
                           <EyeIcon />
-                          <span>Inspect</span>
+                          <span className="ap-action-label">Inspect</span>
                         </button>
                       </td>
                     </tr>
@@ -888,9 +899,10 @@ export function AuditLogsView({ focus }: AuditLogsViewProps) {
             </div>
             <Toggle
               checked={settings.store_payloads}
-              onChange={(next) =>
-                setSettings((prev) => ({ ...prev, store_payloads: next }))
-              }
+              onChange={(next) => {
+                settingsDirtyRef.current = true;
+                setSettings((prev) => ({ ...prev, store_payloads: next }));
+              }}
               label="Store Request & Response Payloads"
             />
           </div>
@@ -903,7 +915,10 @@ export function AuditLogsView({ focus }: AuditLogsViewProps) {
               step={1}
               className="ap-input ap-tabular"
               value={retentionDaysInput}
-              onChange={(e) => setRetentionDaysInput(e.target.value)}
+              onChange={(e) => {
+                settingsDirtyRef.current = true;
+                setRetentionDaysInput(e.target.value);
+              }}
             />
             <span className="ap-hint">
               Set to 0 to disable automatic background purge, or enter N days to retain payloads.

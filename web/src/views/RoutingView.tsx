@@ -593,7 +593,7 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
 
                     return (
                       <tr key={prov.name} className="ap-row">
-                        <td>
+                        <td style={{ whiteSpace: 'nowrap' }}>
                           <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
                             <span style={{ fontWeight: 600 }}>{prov.name}</span>
                             <span style={{ fontSize: 12, color: 'var(--ap-text-secondary)' }}>
@@ -601,10 +601,10 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
                             </span>
                           </div>
                         </td>
-                        <td>
+                        <td style={{ whiteSpace: 'nowrap' }}>
                           <SourceBadge source={prov.source} />
                         </td>
-                        <td style={{ maxWidth: 230 }}>
+                        <td style={{ maxWidth: 185 }}>
                           <div
                             className="ap-mono ap-truncate"
                             style={{ fontSize: 12, color: 'var(--ap-text-secondary)' }}
@@ -613,24 +613,47 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
                             {prov.base_url}
                           </div>
                           <div
-                            className="ap-truncate"
-                            style={{ fontSize: 11.5, color: 'var(--ap-text-muted)', marginTop: 2 }}
-                            title={modelList.join(', ')}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 6,
+                              marginTop: 2,
+                              minWidth: 0,
+                            }}
                           >
-                            {modelList.length > 0
-                              ? `${modelList.length} ${modelList.length === 1 ? 'model' : 'models'}: ${modelList.join(', ')}`
-                              : 'All upstream models'}
+                            <span
+                              className="ap-truncate"
+                              style={{ fontSize: 11.5, color: 'var(--ap-text-muted)' }}
+                              title={modelList.join(', ')}
+                            >
+                              {modelList.length > 0
+                                ? `${modelList.length} ${modelList.length === 1 ? 'model' : 'models'}: ${modelList.join(', ')}`
+                                : 'All upstream models'}
+                            </span>
+                            {testStatus && (
+                              <span
+                                className={`ap-badge ap-tabular ${
+                                  testStatus.ok ? 'ap-badge--green' : 'ap-badge--red'
+                                }`}
+                                style={{ flexShrink: 0 }}
+                                title={testStatus.message}
+                              >
+                                {testStatus.ok
+                                  ? formatLatency(testStatus.latency_ms)
+                                  : testStatus.message.slice(0, 18)}
+                              </span>
+                            )}
                           </div>
                         </td>
-                        <td>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                        <td style={{ whiteSpace: 'nowrap' }}>
+                          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
                             {prov.has_api_key ? (
                               <span className="ap-badge ap-mono">
                                 {prov.api_key_preview || 'Stored key'}
                               </span>
                             ) : (
                               <span style={{ color: 'var(--ap-text-muted)', fontSize: 12 }}>
-                                No stored key
+                                No key
                               </span>
                             )}
                             {prov.passthrough && (
@@ -654,18 +677,6 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
                         </td>
                         <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                           <div className="ap-row-actions">
-                            {testStatus && (
-                              <span
-                                className={`ap-badge ap-tabular ${
-                                  testStatus.ok ? 'ap-badge--green' : 'ap-badge--red'
-                                }`}
-                                title={testStatus.message}
-                              >
-                                {testStatus.ok
-                                  ? `${formatLatency(testStatus.latency_ms)}`
-                                  : testStatus.message.slice(0, 28)}
-                              </span>
-                            )}
                             <button
                               type="button"
                               className="ap-btn ap-btn-ghost ap-btn-sm"
@@ -678,23 +689,25 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
                             </button>
                             <button
                               type="button"
-                              className="ap-btn ap-btn-ghost ap-btn-sm"
+                              className="ap-btn ap-btn-ghost ap-btn-sm ap-btn-icon-compact"
                               disabled={isYaml}
+                              aria-label={`Edit ${prov.name}`}
                               title={isYaml ? YAML_LOCK_TOOLTIP : `Edit ${prov.name}`}
                               onClick={() => openEditProvider(prov)}
                             >
                               <EditIcon />
-                              <span>Edit</span>
+                              <span className="ap-action-label">Edit</span>
                             </button>
                             <button
                               type="button"
-                              className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm"
+                              className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm ap-btn-icon-compact"
                               disabled={isYaml}
+                              aria-label={`Delete ${prov.name}`}
                               title={isYaml ? YAML_LOCK_TOOLTIP : `Delete ${prov.name}`}
                               onClick={() => handleDeleteProvider(prov)}
                             >
                               <TrashIcon />
-                              <span>Delete</span>
+                              <span className="ap-action-label">Delete</span>
                             </button>
                           </div>
                         </td>
@@ -757,24 +770,28 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
 
                     return (
                       <tr key={route.alias} className="ap-row">
-                        <td>
-                          <span className="ap-mono" style={{ fontWeight: 600 }}>
+                        <td style={{ maxWidth: 118 }}>
+                          <span
+                            className="ap-mono ap-truncate"
+                            style={{ display: 'block', fontWeight: 600 }}
+                            title={route.alias}
+                          >
                             {route.alias}
                           </span>
                         </td>
-                        <td>
+                        <td style={{ whiteSpace: 'nowrap' }}>
                           <SourceBadge source={route.source} />
                         </td>
-                        <td style={{ maxWidth: 200 }}>
+                        <td style={{ maxWidth: 138 }}>
                           <span
                             className="ap-mono ap-truncate"
-                            style={{ display: 'block', fontSize: 12.5 }}
+                            style={{ display: 'block', fontSize: 12 }}
                             title={`${route.provider_name}/${route.upstream_model}`}
                           >
                             {route.provider_name}/{route.upstream_model}
                           </span>
                         </td>
-                        <td style={{ maxWidth: 200 }}>
+                        <td style={{ maxWidth: 125 }}>
                           {fallbacks.length > 0 ? (
                             <span
                               className="ap-mono ap-truncate"
@@ -795,7 +812,7 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
                             <span style={{ color: 'var(--ap-text-muted)' }}>—</span>
                           )}
                         </td>
-                        <td>
+                        <td style={{ whiteSpace: 'nowrap' }}>
                           {hasOverride ? (
                             <div
                               className="ap-tabular"
@@ -807,16 +824,13 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
                                 {' / '}
                                 <strong>{formatCostTier(route.output_cost_per_million)}</strong>
                               </div>
-                              {(route.cache_read_cost_per_million != null ||
-                                route.cache_write_cost_per_million != null) && (
-                                <div style={{ color: 'var(--ap-text-secondary)' }}>
-                                  <span style={{ color: 'var(--ap-text-muted)' }}>
-                                    Cache R/W:{' '}
-                                  </span>
-                                  {formatCostTier(route.cache_read_cost_per_million)} /{' '}
-                                  {formatCostTier(route.cache_write_cost_per_million)}
-                                </div>
-                              )}
+                              <div style={{ color: 'var(--ap-text-secondary)' }}>
+                                <span style={{ color: 'var(--ap-text-muted)' }}>
+                                  Cache R/W:{' '}
+                                </span>
+                                {formatCostTier(route.cache_read_cost_per_million)} /{' '}
+                                {formatCostTier(route.cache_write_cost_per_million)}
+                              </div>
                             </div>
                           ) : (
                             <span className="ap-badge">Default</span>
@@ -835,23 +849,25 @@ export function RoutingView({ focus, onCountsChange }: RoutingViewProps) {
                           <div className="ap-row-actions">
                             <button
                               type="button"
-                              className="ap-btn ap-btn-ghost ap-btn-sm"
+                              className="ap-btn ap-btn-ghost ap-btn-sm ap-btn-icon-compact"
                               disabled={isYaml}
+                              aria-label={`Edit ${route.alias}`}
                               title={isYaml ? YAML_LOCK_TOOLTIP : `Edit ${route.alias}`}
                               onClick={() => openEditRoute(route)}
                             >
                               <EditIcon />
-                              <span>Edit</span>
+                              <span className="ap-action-label">Edit</span>
                             </button>
                             <button
                               type="button"
-                              className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm"
+                              className="ap-btn ap-btn-ghost ap-btn-danger ap-btn-sm ap-btn-icon-compact"
                               disabled={isYaml}
+                              aria-label={`Delete ${route.alias}`}
                               title={isYaml ? YAML_LOCK_TOOLTIP : `Delete ${route.alias}`}
                               onClick={() => handleDeleteRoute(route)}
                             >
                               <TrashIcon />
-                              <span>Delete</span>
+                              <span className="ap-action-label">Delete</span>
                             </button>
                           </div>
                         </td>

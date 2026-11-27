@@ -323,30 +323,54 @@ export function SidebarToggleIcon({ size = 16, ...props }: SvgIconProps) {
   );
 }
 
+export function resolveProviderFamily(
+  typeOrName: string,
+): 'anthropic' | 'openai' | 'gemini' | 'ollama' | 'other' {
+  const norm = (typeOrName || '').toLowerCase();
+  if (norm === 'anthropic' || norm.includes('anthropic') || norm.includes('claude')) {
+    return 'anthropic';
+  }
+  if (norm === 'openai' || norm.includes('openai') || norm.includes('gpt')) {
+    return 'openai';
+  }
+  if (
+    norm === 'gemini' ||
+    norm.includes('gemini') ||
+    norm.includes('vertex') ||
+    norm.includes('google')
+  ) {
+    return 'gemini';
+  }
+  if (norm === 'ollama' || norm.includes('ollama')) {
+    return 'ollama';
+  }
+  return 'other';
+}
+
 export function ProviderGlyph({ type }: { type: string }) {
-  const norm = type.toLowerCase();
-  if (norm === 'anthropic') {
+  const family = resolveProviderFamily(type);
+  if (family === 'anthropic') {
     return (
       <span className="ap-prov-dot" data-provider="anthropic" aria-hidden="true">
         A
       </span>
     );
   }
-  if (norm === 'openai') {
+  if (family === 'openai') {
     return (
       <span className="ap-prov-dot" data-provider="openai" aria-hidden="true">
         O
       </span>
     );
   }
-  if (norm === 'gemini') {
+  if (family === 'gemini') {
     return (
       <span className="ap-prov-dot" data-provider="gemini" aria-hidden="true">
         G
       </span>
     );
   }
-  if (norm === 'ollama') {
+  if (family === 'ollama') {
     return (
       <span className="ap-prov-dot" data-provider="ollama" aria-hidden="true">
         L
