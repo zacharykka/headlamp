@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -658,5 +659,293 @@ func TestWebhookBlocksRedirectsAndNonObjectModifiedBody(t *testing.T) {
 	out, err = disp.Review(context.Background(), req)
 	if err != nil || out.Action != ActionAllow || string(out.ModifiedBody) != string(req.Body) {
 		t.Fatalf("expected fail_open to ignore scalar modified_body and allow original body, got out=%+v err=%v", out, err)
+	}
+}
+
+func TestPathAwareJSONSkippingScansToolPayloads(t *testing.T) {
+	st := newTestStore(t)
+	seedAllBuiltinRulesEnabled(t, st)
+	eval := NewEvaluator(st, nil)
+
+	awsKey := "AKIA" + "5566778899AABBCC"
+	oaiKey := "sk-proj-" + strings.Repeat("z9Y8", 7)
+	pemKey := "-----BEGIN " + "PRIVATE KEY-----\\nTOPSECRET\\n-----END " + "PRIVATE KEY-----"
+
+	// 1. Anthropic tool_use.input containing keys named "id", "name", "detail", "type", "model", "role",
+	//    and even a nested {"type":"base64","data":"..."} MUST ALL be scanned & redacted,
+	//    while the enclosing tool_use envelope ("id", "name", "type") stays intact.
+	anthropicToolPayload := `{
+		"model": "claude-sonnet-4-6",
+		"messages": [{
+			"role": "assistant",
+			"content": [{
+				"type": "tool_use",
+				"id": "` + awsKey + `",
+				"name": "http_request",
+				"input": {
+					"id": "` + oaiKey + `",
+					"name": "` + awsKey + `",
+					"detail": "` + awsKey + `",
+					"type": "` + awsKey + `",
+					"model": "` + awsKey + `",
+					"role": "` + awsKey + `",
+					"nested_blob": {"type": "base64", "data": "` + awsKey + `"}
+				}
+			}]
+		}]
+	}`
+	res, err := eval.InspectJSONPayload(context.Background(), []byte(anthropicToolPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Action != ActionRedact {
+		t.Fatalf("expected redact on Anthropic tool_use.input, got %q", res.Action)
+	}
+	var parsedAnth map[string]any
+	if err := json.Unmarshal(res.ModifiedBody, &parsedAnth); err != nil {
+		t.Fatalf("invalid redacted JSON: %v", err)
+	}
+	toolBlock := parsedAnth["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+	if toolBlock["id"] != awsKey || toolBlock["name"] != "http_request" || toolBlock["type"] != "tool_use" {
+		t.Fatalf("enclosing tool_use envelope metadata should remain intact: %+v", toolBlock)
+	}
+	inputObj := toolBlock["input"].(map[string]any)
+	if inputObj["id"] != "[REDACTED:builtin-openai-key]" {
+		t.Fatalf("tool_use.input.id was not redacted: %v", inputObj["id"])
+	}
+	for _, k := range []string{"name", "detail", "type", "model", "role"} {
+		if inputObj[k] != "[REDACTED:builtin-aws-access-key]" {
+			t.Fatalf("tool_use.input.%s was not redacted: %v", k, inputObj[k])
+		}
+	}
+	if inputObj["nested_blob"].(map[string]any)["data"] != "[REDACTED:builtin-aws-access-key]" {
+		t.Fatalf("nested base64-shaped map inside tool_use.input must still be redacted: %+v", inputObj["nested_blob"])
+	}
+
+	// 2. PEM private key inside Anthropic tool_use.input.detail MUST trigger ActionBlock.
+	anthropicBlockPayload := `{
+		"model": "claude-sonnet-4-6",
+		"messages": [{
+			"role": "assistant",
+			"content": [{
+				"type": "tool_use",
+				"id": "toolu_01",
+				"name": "write_file",
+				"input": {"detail": "` + pemKey + `"}
+			}]
+		}]
+	}`
+	blockRes, err := eval.InspectJSONPayload(context.Background(), []byte(anthropicBlockPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blockRes.Action != ActionBlock {
+		t.Fatalf("expected ActionBlock for PEM inside tool_use.input.detail, got %q", blockRes.Action)
+	}
+
+	// 3. Gemini functionCall.args and functionResponse.response MUST scan "detail", "id", "name", "type"
+	//    while leaving functionCall.name / functionResponse.name intact.
+	geminiToolPayload := `{
+		"contents": [
+			{"role": "model", "parts": [{"functionCall": {"name": "deploy", "args": {"id": "` + oaiKey + `", "detail": "` + awsKey + `", "name": "` + awsKey + `"}}}]},
+			{"role": "user", "parts": [{"functionResponse": {"name": "deploy", "response": {"id": "` + awsKey + `", "detail": "` + oaiKey + `", "type": "` + awsKey + `"}}}]}
+		]
+	}`
+	gemRes, err := eval.InspectJSONPayload(context.Background(), []byte(geminiToolPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gemRes.Action != ActionRedact {
+		t.Fatalf("expected redact on Gemini functionCall/functionResponse, got %q", gemRes.Action)
+	}
+	if strings.Contains(string(gemRes.ModifiedBody), awsKey) || strings.Contains(string(gemRes.ModifiedBody), oaiKey) {
+		t.Fatalf("raw secrets survived in Gemini tool payload: %s", string(gemRes.ModifiedBody))
+	}
+	var parsedGem map[string]any
+	if err := json.Unmarshal(gemRes.ModifiedBody, &parsedGem); err != nil {
+		t.Fatal(err)
+	}
+	fc := parsedGem["contents"].([]any)[0].(map[string]any)["parts"].([]any)[0].(map[string]any)["functionCall"].(map[string]any)
+	if fc["name"] != "deploy" {
+		t.Fatalf("functionCall.name envelope should stay intact, got %v", fc["name"])
+	}
+
+	// 4. OpenAI image_url.detail stays skipped, while non-image_url "detail" and non-string envelope values are scanned.
+	openAIPayload := `{
+		"model": "gpt-4.1",
+		"messages": [{
+			"role": "user",
+			"detail": "` + awsKey + `",
+			"content": [
+				{"type": "image_url", "image_url": {"url": "https://example.com/a.png", "detail": "high"}}
+			]
+		}],
+		"extra": {"id": "` + oaiKey + `", "role": "` + awsKey + `"}
+	}`
+	oaiRes, err := eval.InspectJSONPayload(context.Background(), []byte(openAIPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oaiRes.Action != ActionRedact {
+		t.Fatalf("expected redact on non-image_url detail & extra object, got %q", oaiRes.Action)
+	}
+	if strings.Contains(string(oaiRes.ModifiedBody), awsKey) || strings.Contains(string(oaiRes.ModifiedBody), oaiKey) {
+		t.Fatalf("raw secret survived in non-envelope keys: %s", string(oaiRes.ModifiedBody))
+	}
+	if !strings.Contains(string(oaiRes.ModifiedBody), `"detail":"high"`) {
+		t.Fatalf("image_url.detail should remain intact: %s", string(oaiRes.ModifiedBody))
+	}
+}
+
+func TestSyncReviewUnknownActionFailClosedAndFailOpen(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"action":"deny","reason":"nope"}`))
+	}))
+	defer srv.Close()
+
+	st := newTestStore(t)
+	wh := store.Webhook{
+		ID:        "strict-review",
+		Name:      "Strict Review",
+		URL:       srv.URL,
+		Type:      config.WebhookTypeSyncReview,
+		TimeoutMS: 1000,
+		FailOpen:  false,
+		Enabled:   true,
+	}
+	if err := st.UpsertWebhook(context.Background(), wh); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		logMu sync.Mutex
+		logs  []string
+	)
+	disp := NewWebhookDispatcher(st, WebhookDispatcherOptions{
+		RetryBackoff: 10 * time.Millisecond,
+		Logf: func(format string, args ...any) {
+			logMu.Lock()
+			logs = append(logs, format)
+			logMu.Unlock()
+		},
+	})
+	defer func() { _ = disp.Close(context.Background()) }()
+
+	req := SyncReviewRequest{
+		RequestID: "req-unk-1",
+		Subject:   "alice@example.com",
+		Protocol:  "openai_chat",
+		Model:     "openai/gpt-4.1",
+		Body:      json.RawMessage(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}]}`),
+	}
+
+	// 1. fail_closed (FailOpen=false): unknown action "deny" MUST block with 503.
+	out, err := disp.Review(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Action != ActionBlock || out.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected fail_closed 503 on unknown action 'deny', got %+v", out)
+	}
+	if !strings.Contains(out.Reason, `unknown action "deny"`) || !slices.Contains(out.Hits, "webhook:strict-review") {
+		t.Fatalf("unexpected unknown-action outcome: %+v", out)
+	}
+
+	// 2. fail_open (FailOpen=true): unknown action "deny" logs warning and allows.
+	wh.FailOpen = true
+	if err := st.UpsertWebhook(context.Background(), wh); err != nil {
+		t.Fatal(err)
+	}
+	out, err = disp.Review(context.Background(), req)
+	if err != nil || out.Action != ActionAllow {
+		t.Fatalf("expected fail_open allow on unknown action 'deny', got out=%+v err=%v", out, err)
+	}
+	logMu.Lock()
+	logCount := len(logs)
+	logMu.Unlock()
+	if logCount == 0 {
+		t.Fatalf("expected warning log when fail_open encounters unknown action")
+	}
+}
+
+func TestWebhookSSRFDialGuard(t *testing.T) {
+	blockedDefault := []string{
+		"169.254.169.254:80",
+		"169.254.0.1:443",
+		"[::ffff:169.254.169.254]:80",
+		"[fe80::1]:80",
+		"[fd00:ec2::254]:80",
+		"0.0.0.0:80",
+		"[::]:80",
+		"224.0.0.1:80",
+		"[ff02::1]:80",
+	}
+	for _, addr := range blockedDefault {
+		err := validateWebhookDialAddr(addr, false)
+		if !errors.Is(err, ErrBlockedWebhookAddress) {
+			t.Fatalf("expected %s to be blocked by SSRF guard, got err=%v", addr, err)
+		}
+	}
+
+	allowedDefault := []string{
+		"127.0.0.1:8080",
+		"[::1]:8080",
+		"100.64.0.10:8080",
+		"10.0.0.5:8080",
+		"1.1.1.1:443",
+	}
+	for _, addr := range allowedDefault {
+		if err := validateWebhookDialAddr(addr, false); err != nil {
+			t.Fatalf("expected %s to be allowed by default, got err=%v", addr, err)
+		}
+	}
+
+	for _, addr := range []string{"127.0.0.1:8080", "[::1]:8080", "[::ffff:127.0.0.1]:8080"} {
+		if err := validateWebhookDialAddr(addr, true); !errors.Is(err, ErrBlockedWebhookAddress) {
+			t.Fatalf("expected %s to be blocked when BlockLoopback=true, got err=%v", addr, err)
+		}
+	}
+
+	// End-to-end live dial check against AWS IPv4 & IPv6 IMDS fails immediately before TCP connect.
+	st := newTestStore(t)
+	disp := NewWebhookDispatcher(st, WebhookDispatcherOptions{RetryBackoff: 10 * time.Millisecond})
+	defer func() { _ = disp.Close(context.Background()) }()
+
+	for _, target := range []string{
+		"http://169.254.169.254/latest/meta-data/",
+		"http://[fd00:ec2::254]/latest/meta-data/",
+	} {
+		pingRes, err := disp.PingWebhook(context.Background(), store.Webhook{
+			ID: "imds", Name: "IMDS", URL: target, TimeoutMS: 1000,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pingRes.OK || !strings.Contains(pingRes.Message, ErrBlockedWebhookAddress.Error()) {
+			t.Fatalf("expected SSRF block for %s, got %+v", target, pingRes)
+		}
+	}
+
+	// Verify BlockLoopback option blocks even local httptest server.
+	localSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer localSrv.Close()
+
+	strictDisp := NewWebhookDispatcher(st, WebhookDispatcherOptions{
+		BlockLoopback: true,
+		RetryBackoff:  10 * time.Millisecond,
+	})
+	defer func() { _ = strictDisp.Close(context.Background()) }()
+
+	pingLoop, err := strictDisp.PingWebhook(context.Background(), store.Webhook{
+		ID: "loop", Name: "Loop", URL: localSrv.URL, TimeoutMS: 1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pingLoop.OK || !strings.Contains(pingLoop.Message, ErrBlockedWebhookAddress.Error()) {
+		t.Fatalf("expected BlockLoopback=true to block %s, got %+v", localSrv.URL, pingLoop)
 	}
 }

@@ -128,6 +128,8 @@ routes:
 
 # Rate limiting (RPM/TPM/concurrency) and daily/monthly USD spend budgets.
 # Scopes: "*" (global), "tag:<name>", or a specific user subject (e.g. "alice@example.com").
+# Tip: Always pair `tpm` and `daily_usd`/`monthly_usd` with `max_concurrent` — streaming
+# token and USD totals finalize as in-flight streams complete, so concurrency caps bound burst overspend.
 budgets:
   - scope: "*"
     rpm: 120

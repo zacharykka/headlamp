@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"path"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/zacharykka/headlamp/internal/auth"
@@ -22,12 +25,15 @@ import (
 
 const maxJSONBodyBytes = 1 << 20 // 1 MiB
 
+var awsIPv6IMDSAddr = netip.MustParseAddr("fd00:ec2::254")
+
 // AuditController manages live audit payload settings and manual retention purges.
 // Satisfied directly by *metering.Recorder.
 type AuditController interface {
 	AuditConfig() config.AuditConfig
 	UpdateAuditConfig(config.AuditConfig)
 	PurgeNow(ctx context.Context) (int64, error)
+	PurgeOlderThan(ctx context.Context, maxAge time.Duration) (int64, error)
 }
 
 // BudgetStatusItem is the per-scope budget view returned to callers on GET /api/v1/me.
@@ -143,14 +149,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 	}
 	client := cfg.HTTPClient
 	if client == nil {
-		client = &http.Client{
-			Timeout: 5 * time.Second,
-			// Never follow redirects on upstream probes so vendor auth headers
-			// (x-api-key, x-goog-api-key, Authorization) cannot leak across hosts.
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}
+		client = newSafeProbeHTTPClient()
 	}
 
 	return &Handler{
@@ -506,26 +505,109 @@ func isMutatingMethod(method string) bool {
 	}
 }
 
+func newSafeProbeHTTPClient() *http.Client {
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	dialer := &net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   ssrfSafeDialControl,
+	}
+	base.DialContext = dialer.DialContext
+	return &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: base,
+		// Never follow redirects on upstream probes so vendor auth headers
+		// (x-api-key, x-goog-api-key, Authorization) cannot leak across hosts.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// ssrfSafeDialControl blocks connections to cloud metadata and link-local/unspecified/multicast
+// destinations after DNS resolution, preventing SSRF and DNS-rebinding probes against IMDS
+// while still allowing local Ollama (127.0.0.1/::1), Tailnet peers, and public APIs.
+func ssrfSafeDialControl(_, address string, _ syscall.RawConn) error {
+	ap, err := netip.ParseAddrPort(address)
+	if err != nil {
+		return fmt.Errorf("probe dial blocked: invalid resolved address %q", address)
+	}
+	addr := ap.Addr().Unmap()
+	if addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsMulticast() || addr.IsUnspecified() || addr == awsIPv6IMDSAddr {
+		return fmt.Errorf("probe dial blocked: destination IP %s is a restricted link-local, metadata, multicast, or unspecified address", addr)
+	}
+	return nil
+}
+
 // checkSameOriginCSRF enforces same-origin validation whenever browser fetch headers
 // (Origin or Sec-Fetch-Site) are present, while permitting non-browser tailnet CLI calls.
+// For local frontend development proxies (e.g. Vite on localhost:5173 -> 127.0.0.1:8080),
+// cross-port/loopback-alias requests are allowed ONLY when RemoteAddr, Origin, and Host are
+// all strictly loopback.
 func checkSameOriginCSRF(r *http.Request) error {
-	if sfs := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); sfs != "" {
-		switch sfs {
-		case "same-origin", "none":
-		default:
-			return fmt.Errorf("cross-site request blocked (Sec-Fetch-Site=%q)", sfs)
-		}
-	}
+	remoteLoopback := isLoopbackRemoteAddr(r.RemoteAddr)
+	hostLoopback := isLoopbackHost(r.Host)
+	loopbackDevEligible := remoteLoopback && hostLoopback
+
 	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
 		u, err := url.Parse(origin)
 		if err != nil || u.Host == "" {
 			return fmt.Errorf("invalid Origin header %q", origin)
 		}
 		if !strings.EqualFold(u.Host, r.Host) {
-			return fmt.Errorf("cross-origin request blocked (origin=%q, host=%q)", u.Host, r.Host)
+			if !(loopbackDevEligible && isLoopbackHost(u.Hostname())) {
+				return fmt.Errorf("cross-origin request blocked (origin=%q, host=%q)", u.Host, r.Host)
+			}
+		}
+	}
+
+	if sfs := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); sfs != "" {
+		switch sfs {
+		case "same-origin", "none":
+		case "same-site":
+			if !loopbackDevEligible {
+				return fmt.Errorf("cross-site request blocked (Sec-Fetch-Site=%q)", sfs)
+			}
+		default:
+			return fmt.Errorf("cross-site request blocked (Sec-Fetch-Site=%q)", sfs)
 		}
 	}
 	return nil
+}
+
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	host := strings.TrimSpace(remoteAddr)
+	if host == "" {
+		return false
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return addr.Unmap().IsLoopback()
+}
+
+func isLoopbackHost(hostport string) bool {
+	host := strings.TrimSpace(hostport)
+	if host == "" {
+		return false
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if host == "localhost" {
+		return true
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return addr.Unmap().IsLoopback()
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {

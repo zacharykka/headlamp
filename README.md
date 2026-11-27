@@ -7,7 +7,7 @@ Headlamp is a self-hosted, single-binary private AI gateway built in Go that joi
 - **Zero-Key Tailnet Identity & Grants Authorization**: Joins Headscale v0.29+ (or Tailscale) directly via `tsnet`, identifies callers via `WhoIs`, and enforces pure **grants-only** authorization (`headlamp.dev/cap/gateway`, plus `tailscale.com/cap/aperture` on official Tailscale SaaS) with **Explicit Deny Wins**.
 - **Embedded Admin Dashboard & Personal Usage UI**: Ships a single-binary React + TypeScript + Vite SPA (Geist typography & Reicon icons) embedded directly via `go:embed` (`web/dist`), authenticated automatically via Tailnet WhoIs SSO. Admins manage providers, virtual routes, budgets, guardrails, webhooks, usage analytics, audit logs, and grants snippets at `/`; standard users see their personal usage, budgets, and SDK setup snippets.
 - **Multi-Protocol Routing & Accounting**: Supports OpenAI (`/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`), Anthropic (`/anthropic/v1/messages`), Google Gemini (`/gemini/v1beta/...`), and Ollama providers, virtual model alias routing with automatic fallbacks, bidirectional OpenAI <-> Anthropic translation, streaming SSE token/cost usage logs, and opt-in audit payloads with TTL retention purge.
-- **Budgets, Rate Limits & Quotas**: Enforces per-scope (`*`, `tag:<name>`, user subject) RPM, TPM, max concurrency, and UTC daily/monthly USD spend caps (`429` with `Retry-After`) plus configurable soft-alert threshold notifications.
+- **Budgets, Rate Limits & Quotas**: Enforces per-scope (`*`, `tag:<name>`, user subject) RPM, TPM, max concurrency, and UTC daily/monthly USD spend caps (`429` with `Retry-After`) plus configurable soft-alert threshold notifications. Pair `tpm` and `daily_usd`/`monthly_usd` with `max_concurrent` to bound burst overspend while in-flight streaming responses finalize their token and USD totals.
 - **Guardrails & Signed Webhooks**: Built-in zero-latency regex detectors (OpenAI, Anthropic, AWS, GitHub, and GCP secrets, PEM private keys, JWTs, credit cards, emails, and phone numbers) with `log_only`, `redact`, or `block` actions, custom regex rules, synchronous pre-request review webhooks (`sync_review`), and HMAC-SHA256 signed asynchronous event alerts (`guardrail.triggered`, `budget.threshold`, `budget.exceeded`, `upstream.fallback`, `upstream.error`).
 - **Automated ACME DNS-01 HTTPS**: Supports automated TLS certificate issuance and renewal on private Headscale domains via Cloudflare API or custom DNS-01 webhook solvers (`server.tls.mode: acme_dns01`), alongside `static` cert/key and plaintext Tailnet HTTP (`none`).
 - **Encrypted Credential Store & Zero-CGO Storage**: Upstream provider API keys and webhook secrets are encrypted at rest with AES-256-GCM (`HEADLAMP_MASTER_KEY`, or an auto-generated `0600` key file in `state_dir`), stored in pure-Go SQLite (`modernc.org/sqlite`) in WAL mode with embedded SQL migrations.
@@ -45,6 +45,7 @@ Common environment overrides:
 | `HEADLAMP_TLS_DNS_PROVIDER` | DNS-01 solver: `cloudflare` or `webhook` |
 | `HEADLAMP_TLS_DNS_API_TOKEN` | Cloudflare API token or webhook bearer token for DNS-01 |
 | `HEADLAMP_TLS_DNS_WEBHOOK_URL` | Custom DNS-01 webhook endpoint URL |
+| `HEADLAMP_STARTUP_TIMEOUT` | Listener/tsnet/ACME startup timeout override (e.g. `3m`; defaults to `5m` for `acme_dns01`, `60s` otherwise) |
 
 ## Client Quickstart
 

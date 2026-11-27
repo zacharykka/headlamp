@@ -13,12 +13,13 @@ import (
 
 // EngineConfig configures the unified Guardrail + Webhook Engine.
 type EngineConfig struct {
-	Store        store.Store
-	HTTPClient   *http.Client
-	QueueSize    int
-	Workers      int
-	RetryBackoff time.Duration
-	Logf         func(format string, args ...any)
+	Store         store.Store
+	HTTPClient    *http.Client
+	BlockLoopback bool
+	QueueSize     int
+	Workers       int
+	RetryBackoff  time.Duration
+	Logf          func(format string, args ...any)
 }
 
 // InspectInput provides request context and raw JSON payload for Engine.InspectRequest.
@@ -59,11 +60,12 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 	return &Engine{
 		evaluator: NewEvaluator(cfg.Store, logf),
 		dispatcher: NewWebhookDispatcher(cfg.Store, WebhookDispatcherOptions{
-			HTTPClient:   cfg.HTTPClient,
-			QueueSize:    cfg.QueueSize,
-			Workers:      cfg.Workers,
-			RetryBackoff: cfg.RetryBackoff,
-			Logf:         logf,
+			HTTPClient:    cfg.HTTPClient,
+			BlockLoopback: cfg.BlockLoopback,
+			QueueSize:     cfg.QueueSize,
+			Workers:       cfg.Workers,
+			RetryBackoff:  cfg.RetryBackoff,
+			Logf:          logf,
 		}),
 	}, nil
 }

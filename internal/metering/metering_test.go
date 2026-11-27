@@ -642,6 +642,38 @@ func TestRecorderAsyncFlushWithoutAndWithAuditPayloads(t *testing.T) {
 			t.Fatalf("expected audit payload persisted after runtime UpdateAuditConfig, got (%+v, %v)", payload, err)
 		}
 	})
+
+	// Case F: PurgeOlderThan supports explicit maxAge including 0 (purge all up to now)
+	// while PurgeNow remains a no-op when active RetentionDays == 0.
+	t.Run("purge_older_than_and_zero_retention", func(t *testing.T) {
+		st := newTestSQLiteStore(t)
+		rec := NewRecorder(st, config.AuditConfig{StorePayloads: true, RetentionDays: 0}, pt, RecorderOptions{
+			DisableAutoPurge: true,
+		})
+		defer func() { _ = rec.Close(ctx) }()
+
+		now := time.Now().UTC()
+		_ = st.InsertUsageLog(ctx, store.UsageLog{ID: "u-old", CreatedAt: now.Add(-48 * time.Hour), Subject: "alice@example.com", ProviderName: "openai", RequestedModel: "gpt-5", StatusCode: 200})
+		_ = st.InsertAuditPayload(ctx, store.AuditPayload{UsageLogID: "u-old", CreatedAt: now.Add(-48 * time.Hour), RequestBody: "old"})
+		_ = st.InsertUsageLog(ctx, store.UsageLog{ID: "u-new", CreatedAt: now, Subject: "alice@example.com", ProviderName: "openai", RequestedModel: "gpt-5", StatusCode: 200})
+		_ = st.InsertAuditPayload(ctx, store.AuditPayload{UsageLogID: "u-new", CreatedAt: now, RequestBody: "new"})
+
+		if _, err := rec.PurgeOlderThan(ctx, -time.Second); err == nil {
+			t.Fatal("expected error for negative maxAge")
+		}
+		if n, err := rec.PurgeNow(ctx); err != nil || n != 0 {
+			t.Fatalf("PurgeNow with RetentionDays=0 got (%d, %v), want (0, nil)", n, err)
+		}
+		if n, err := rec.PurgeOlderThan(ctx, 24*time.Hour); err != nil || n != 1 {
+			t.Fatalf("PurgeOlderThan(24h) got (%d, %v), want (1, nil)", n, err)
+		}
+		if n, err := rec.PurgeOlderThan(ctx, 0); err != nil || n != 1 {
+			t.Fatalf("PurgeOlderThan(0) got (%d, %v), want (1, nil)", n, err)
+		}
+		if _, err := st.GetAuditPayloadByUsageLogID(ctx, "u-new"); err == nil {
+			t.Fatal("expected u-new audit payload to be purged by PurgeOlderThan(0)")
+		}
+	})
 }
 
 func TestDefaultPricingSyncedWithSpec(t *testing.T) {

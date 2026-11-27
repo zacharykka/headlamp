@@ -1808,3 +1808,172 @@ func TestEventDispatcherUpstreamFallbackAndError(t *testing.T) {
 		t.Fatalf("expected [upstream.fallback, upstream.error], got %+v", ev.events)
 	}
 }
+
+func TestSyncReviewModifyRepinsModelAndStream(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		seenPath string
+		seenBody map[string]any
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var parsed map[string]any
+		_ = json.Unmarshal(raw, &parsed)
+		mu.Lock()
+		seenPath = r.URL.Path
+		seenBody = parsed
+		mu.Unlock()
+
+		if parsed["stream"] == true {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-pin\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-pin\",\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "count_tokens") {
+			_, _ = w.Write([]byte(`{"input_tokens":12}`))
+			return
+		}
+		if strings.Contains(r.URL.Path, "/v1/messages") {
+			_, _ = w.Write([]byte(`{"id":"msg_pin","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-pin","object":"chat.completion","model":"gpt-4.1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`))
+	}))
+	defer upstream.Close()
+
+	// Malicious/buggy sync_review webhook attempts to rewrite "model" to an unauthorized
+	// model ("openai/o3" or "claude-opus-4-6") and flip "stream" to the opposite boolean.
+	var (
+		whMu         sync.Mutex
+		tamperedBody string
+	)
+	reviewSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		whMu.Lock()
+		mod := tamperedBody
+		whMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"action":"modify","modified_body":` + mod + `}`))
+	}))
+	defer reviewSrv.Close()
+
+	st := newTestStore(t)
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "openai", Type: config.ProviderTypeOpenAI, BaseURL: upstream.URL, APIKey: "sk-1", Models: []string{"gpt-4.1", "o3"}, Enabled: true,
+	})
+	_ = st.UpsertProvider(context.Background(), store.Provider{
+		Name: "anthropic", Type: config.ProviderTypeAnthropic, BaseURL: upstream.URL, APIKey: "sk-ant", Models: []string{"claude-sonnet-4-6", "claude-opus-4-6"}, Enabled: true,
+	})
+	for _, r := range store.DefaultBuiltinGuardrailRules() {
+		_ = st.UpsertGuardrailRule(context.Background(), r)
+	}
+	_ = st.UpsertWebhook(context.Background(), store.Webhook{
+		ID: "tamper-wh", Name: "Tamper Review", URL: reviewSrv.URL, Type: config.WebhookTypeSyncReview, TimeoutMS: 1000, FailOpen: false, Enabled: true,
+	})
+
+	eng, err := guardrail.NewEngine(guardrail.EngineConfig{Store: st, RetryBackoff: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close(context.Background()) }()
+
+	gw, _ := NewGateway(GatewayConfig{
+		Store:      st,
+		Guardrails: guardrailEngineAdapter{engine: eng},
+		Events:     eng,
+	})
+
+	// Case A: OpenAI Chat bare model (cand.upstreamModel == inv.requestedModel == "gpt-4.1"), stream=false.
+	// Webhook attempts to hijack model -> "o3" and stream -> true + stream_options.
+	whMu.Lock()
+	tamperedBody = `{"model":"o3","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"scrubbed"}]}`
+	whMu.Unlock()
+
+	recA := httptest.NewRecorder()
+	gw.ServeHTTP(recA, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-4.1","messages":[{"role":"user","content":"hello"}]}`))
+	if recA.Code != http.StatusOK {
+		t.Fatalf("case A failed: %d %s", recA.Code, recA.Body.String())
+	}
+	mu.Lock()
+	if seenBody["model"] != "gpt-4.1" {
+		mu.Unlock()
+		t.Fatalf("case A: webhook hijacked model to %v, want gpt-4.1", seenBody["model"])
+	}
+	if seenBody["stream"] != false {
+		mu.Unlock()
+		t.Fatalf("case A: webhook hijacked stream to %v, want false", seenBody["stream"])
+	}
+	if _, hasOpts := seenBody["stream_options"]; hasOpts {
+		mu.Unlock()
+		t.Fatalf("case A: smuggled stream_options survived when stream=false: %+v", seenBody)
+	}
+	mu.Unlock()
+
+	// Case B: OpenAI Chat stream=true, webhook attempts to hijack model -> "o3" and flip stream -> false.
+	whMu.Lock()
+	tamperedBody = `{"model":"o3","stream":false,"messages":[{"role":"user","content":"scrubbed-stream"}]}`
+	whMu.Unlock()
+
+	recB := httptest.NewRecorder()
+	gw.ServeHTTP(recB, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"hello"}]}`))
+	if recB.Code != http.StatusOK {
+		t.Fatalf("case B failed: %d %s", recB.Code, recB.Body.String())
+	}
+	mu.Lock()
+	if seenBody["model"] != "gpt-4.1" || seenBody["stream"] != true {
+		mu.Unlock()
+		t.Fatalf("case B: expected model=gpt-4.1 stream=true, got model=%v stream=%v", seenBody["model"], seenBody["stream"])
+	}
+	mu.Unlock()
+
+	// Case C: Anthropic /v1/messages & /v1/messages/count_tokens bare model "claude-sonnet-4-6",
+	// webhook attempts to hijack model -> "claude-opus-4-6" and stream -> true.
+	whMu.Lock()
+	tamperedBody = `{"model":"claude-opus-4-6","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"scrubbed-anth"}]}`
+	whMu.Unlock()
+
+	recC1 := httptest.NewRecorder()
+	gw.ServeHTTP(recC1, authedReq(http.MethodPost, "/anthropic/v1/messages", `{"model":"claude-sonnet-4-6","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`))
+	if recC1.Code != http.StatusOK {
+		t.Fatalf("case C1 failed: %d %s", recC1.Code, recC1.Body.String())
+	}
+	mu.Lock()
+	if seenBody["model"] != "claude-sonnet-4-6" || seenBody["stream"] != false {
+		mu.Unlock()
+		t.Fatalf("case C1: Anthropic model/stream hijacked: model=%v stream=%v", seenBody["model"], seenBody["stream"])
+	}
+	mu.Unlock()
+
+	recC2 := httptest.NewRecorder()
+	gw.ServeHTTP(recC2, authedReq(http.MethodPost, "/anthropic/v1/messages/count_tokens", `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}`))
+	if recC2.Code != http.StatusOK {
+		t.Fatalf("case C2 failed: %d %s", recC2.Code, recC2.Body.String())
+	}
+	mu.Lock()
+	if seenPath != "/v1/messages/count_tokens" || seenBody["model"] != "claude-sonnet-4-6" {
+		mu.Unlock()
+		t.Fatalf("case C2: count_tokens model hijacked: path=%s model=%v", seenPath, seenBody["model"])
+	}
+	mu.Unlock()
+
+	// Case D: Combined local regex redact (AWS key -> finalAction="redact") + sync_review modify
+	// attempting to hijack model -> "o3" and stream -> true must STILL re-pin both!
+	whMu.Lock()
+	tamperedBody = `{"model":"o3","stream":true,"messages":[{"role":"user","content":"scrubbed-both"}]}`
+	whMu.Unlock()
+
+	awsKey := "AKIA" + "1122334455667788"
+	recD := httptest.NewRecorder()
+	gw.ServeHTTP(recD, authedReq(http.MethodPost, "/v1/chat/completions", `{"model":"gpt-4.1","messages":[{"role":"user","content":"key=`+awsKey+`"}]}`))
+	if recD.Code != http.StatusOK {
+		t.Fatalf("case D failed: %d %s", recD.Code, recD.Body.String())
+	}
+	mu.Lock()
+	if seenBody["model"] != "gpt-4.1" || seenBody["stream"] != false {
+		mu.Unlock()
+		t.Fatalf("case D: combined redact+modify hijacked model=%v stream=%v", seenBody["model"], seenBody["stream"])
+	}
+	mu.Unlock()
+}

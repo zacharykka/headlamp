@@ -206,12 +206,17 @@ func runServe(args []string, _, stderr io.Writer) error {
 		return fmt.Errorf("init api handler: %w", err)
 	}
 
+	startupTimeout, err := resolveStartupTimeout(cfg)
+	if err != nil {
+		return err
+	}
+
 	srv, err := netts.NewServer(cfg.Server, netts.WithUserLogf(logger.Printf))
 	if err != nil {
 		return fmt.Errorf("init server: %w", err)
 	}
 
-	startupCtx, cancelStartup := context.WithTimeout(ctx, 60*time.Second)
+	startupCtx, cancelStartup := context.WithTimeout(ctx, startupTimeout)
 	err = srv.Start(startupCtx)
 	cancelStartup()
 	if err != nil {
@@ -394,6 +399,23 @@ func openStore(ctx context.Context, cfg *config.Config) (store.Store, bool, stri
 		return nil, generated, keyPath, fmt.Errorf("open sqlite store: %w", err)
 	}
 	return st, generated, keyPath, nil
+}
+
+// resolveStartupTimeout returns the timeout budget for starting listeners, tsnet, and ACME DNS-01.
+// ACME DNS-01 defaults to 5m to allow authoritative DNS TXT propagation and Let's Encrypt validation;
+// all other modes default to 60s. Set HEADLAMP_STARTUP_TIMEOUT (e.g. "3m") to override.
+func resolveStartupTimeout(cfg *config.Config) (time.Duration, error) {
+	if raw := strings.TrimSpace(os.Getenv("HEADLAMP_STARTUP_TIMEOUT")); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			return 0, fmt.Errorf("invalid HEADLAMP_STARTUP_TIMEOUT %q: must be a positive duration (e.g. 90s, 3m)", raw)
+		}
+		return d, nil
+	}
+	if cfg != nil && cfg.Server.TLS.Mode == config.TLSModeACMEDNS01 {
+		return 5 * time.Minute, nil
+	}
+	return 60 * time.Second, nil
 }
 
 // loadActiveAuditConfig restores persisted UI audit settings when present,

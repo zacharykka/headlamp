@@ -88,25 +88,83 @@ func (e *Evaluator) TestText(ctx context.Context, text string) (*TestResult, err
 	}, nil
 }
 
-// skippedJSONKeys are structural/protocol metadata keys whose string values are
-// never scanned or rewritten by guardrails so valid LLM payloads remain intact.
-var skippedJSONKeys = map[string]struct{}{
-	"model":             {},
-	"role":              {},
-	"type":              {},
-	"id":                {},
-	"tool_use_id":       {},
-	"tool_call_id":      {},
-	"object":            {},
-	"name":              {},
-	"media_type":        {},
-	"mime_type":         {},
-	"mimeType":          {},
-	"finish_reason":     {},
-	"stop_reason":       {},
-	"encoding_format":   {},
-	"detail":            {},
-	"anthropic_version": {},
+// rootEnvelopeKeys are top-level protocol metadata keys skipped ONLY at JSON depth 0.
+var rootEnvelopeKeys = map[string]struct{}{
+	"model":                {},
+	"encoding_format":      {},
+	"anthropic_version":    {},
+	"service_tier":         {},
+	"reasoning_effort":     {},
+	"object":               {},
+	"id":                   {},
+	"previous_response_id": {},
+}
+
+// structuralEnvelopeKeys are protocol metadata keys skipped ONLY on known LLM
+// message/block/tool envelope objects (never inside user/tool payload subtrees).
+var structuralEnvelopeKeys = map[string]struct{}{
+	"role":          {},
+	"type":          {},
+	"tool_use_id":   {},
+	"tool_call_id":  {},
+	"call_id":       {},
+	"object":        {},
+	"media_type":    {},
+	"mime_type":     {},
+	"mimeType":      {},
+	"finish_reason": {},
+	"stop_reason":   {},
+}
+
+// envelopeParents are JSON parent keys whose child objects represent protocol
+// envelopes rather than arbitrary user/tool data.
+var envelopeParents = map[string]struct{}{
+	"messages":              {},
+	"content":               {},
+	"contents":              {},
+	"parts":                 {},
+	"input":                 {}, // OpenAI Responses top-level input[] items (depth 1 only)
+	"system":                {},
+	"tool_calls":            {},
+	"tools":                 {},
+	"tool_choice":           {},
+	"function":              {},
+	"function_call":         {},
+	"functionCall":          {},
+	"functionResponse":      {},
+	"functionDeclarations":  {},
+	"function_declarations": {},
+	"source":                {},
+	"image_url":             {},
+	"inlineData":            {},
+	"inline_data":           {},
+	"thinking":              {},
+	"response_format":       {},
+	"json_schema":           {},
+}
+
+// nameEnvelopeParents are parent keys whose child object's "name" field is a
+// tool/function/schema declaration identifier rather than prompt/payload data.
+var nameEnvelopeParents = map[string]struct{}{
+	"function":              {},
+	"function_call":         {},
+	"functionCall":          {},
+	"functionResponse":      {},
+	"tools":                 {},
+	"tool_choice":           {},
+	"functionDeclarations":  {},
+	"function_declarations": {},
+	"json_schema":           {},
+}
+
+// inlineMediaParents are parent keys that can hold inline base64 media objects.
+var inlineMediaParents = map[string]struct{}{
+	"source":      {},
+	"inlineData":  {},
+	"inline_data": {},
+	"parts":       {},
+	"content":     {},
+	"contents":    {},
 }
 
 // InspectJSONPayload scans prompt and content string values inside a JSON LLM
@@ -152,7 +210,7 @@ func (e *Evaluator) InspectJSONPayload(ctx context.Context, body []byte) (*Inspe
 		seenIDs: make(map[string]struct{}),
 		matches: []RuleMatch{},
 	}
-	mutatedRoot, mutated := scanJSONValue(rules, root, "", acc)
+	mutatedRoot, mutated := scanJSONValue(rules, root, 0, "", false, acc)
 
 	res := &InspectResult{
 		Action:       acc.action,
@@ -194,12 +252,9 @@ func (a *scanAccumulator) record(action string, matches []RuleMatch) {
 	}
 }
 
-func scanJSONValue(rules []compiledRule, v any, parentKey string, acc *scanAccumulator) (any, bool) {
+func scanJSONValue(rules []compiledRule, v any, depth int, parentKey string, scanAll bool, acc *scanAccumulator) (any, bool) {
 	switch val := v.(type) {
 	case string:
-		if _, skip := skippedJSONKeys[parentKey]; skip {
-			return val, false
-		}
 		action, redacted, matches := evaluateString(rules, val)
 		if len(matches) > 0 {
 			acc.record(action, matches)
@@ -210,19 +265,13 @@ func scanJSONValue(rules []compiledRule, v any, parentKey string, acc *scanAccum
 		return val, false
 
 	case map[string]any:
-		// Skip inline base64 media payloads (Anthropic {"type":"base64","media_type":...,"data":"..."}
-		// and Gemini inlineData/inline_data {"mimeType"|"mime_type":...,"data":"..."})
-		// so random base64 runs don't false-positive as API keys.
-		isBase64Source := val["type"] == "base64" || hasNonEmptyString(val, "mimeType") || hasNonEmptyString(val, "mime_type")
 		mutated := false
 		for k, elem := range val {
-			if _, skip := skippedJSONKeys[k]; skip {
+			if _, isStr := elem.(string); isStr && !scanAll && shouldSkipMapStringKey(depth, parentKey, val, k) {
 				continue
 			}
-			if isBase64Source && k == "data" {
-				continue
-			}
-			newElem, changed := scanJSONValue(rules, elem, k, acc)
+			childScanAll := scanAll || entersPayloadSubtree(depth, k)
+			newElem, changed := scanJSONValue(rules, elem, depth+1, k, childScanAll, acc)
 			if changed {
 				val[k] = newElem
 				mutated = true
@@ -233,7 +282,7 @@ func scanJSONValue(rules []compiledRule, v any, parentKey string, acc *scanAccum
 	case []any:
 		mutated := false
 		for i, elem := range val {
-			newElem, changed := scanJSONValue(rules, elem, parentKey, acc)
+			newElem, changed := scanJSONValue(rules, elem, depth, parentKey, scanAll, acc)
 			if changed {
 				val[i] = newElem
 				mutated = true
@@ -244,6 +293,77 @@ func scanJSONValue(rules []compiledRule, v any, parentKey string, acc *scanAccum
 	default:
 		return v, false
 	}
+}
+
+// entersPayloadSubtree reports whether descending into key crosses into an
+// arbitrary user/tool payload subtree where 100% of string values must be
+// scanned regardless of key names.
+func entersPayloadSubtree(depth int, key string) bool {
+	switch key {
+	case "args", "response", "arguments", "metadata":
+		return true
+	case "input", "output":
+		// Root "input" (depth 0) is OpenAI Responses' message/item envelope;
+		// any nested "input"/"output" (e.g. Anthropic tool_use.input) is tool payload.
+		return depth > 0
+	default:
+		return false
+	}
+}
+
+// shouldSkipMapStringKey reports whether a string-valued key on obj is pure
+// protocol metadata at its structural JSON path and should not be scanned/rewritten.
+func shouldSkipMapStringKey(depth int, parentKey string, obj map[string]any, key string) bool {
+	if depth == 0 {
+		_, skip := rootEnvelopeKeys[key]
+		return skip
+	}
+
+	// Inline base64 media payloads (Anthropic {"type":"base64","media_type":...,"data":"..."}
+	// and Gemini inlineData/inline_data {"mimeType"|"mime_type":...,"data":"..."}).
+	if key == "data" {
+		if _, ok := inlineMediaParents[parentKey]; ok {
+			return obj["type"] == "base64" || hasNonEmptyString(obj, "mimeType") || hasNonEmptyString(obj, "mime_type")
+		}
+		return false
+	}
+
+	// OpenAI image_url detail ("auto" | "low" | "high") only inside image_url.
+	if key == "detail" {
+		return parentKey == "image_url"
+	}
+
+	// Tool/function/schema identifier "name" only on declaration/call envelopes.
+	if key == "name" {
+		if _, ok := nameEnvelopeParents[parentKey]; ok {
+			return true
+		}
+		if (parentKey == "content" || parentKey == "input") &&
+			(obj["type"] == "tool_use" || obj["type"] == "server_tool_use" || obj["type"] == "mcp_tool_use" || obj["type"] == "function_call") {
+			return true
+		}
+		return false
+	}
+
+	// Envelope "id" only on message/item/tool_call objects or typed content blocks.
+	if key == "id" {
+		switch parentKey {
+		case "messages", "tool_calls":
+			return true
+		case "input":
+			return depth == 1
+		case "content":
+			return hasNonEmptyString(obj, "type")
+		default:
+			return false
+		}
+	}
+
+	if _, isEnvelope := envelopeParents[parentKey]; !isEnvelope {
+		return false
+	}
+	_, skip := structuralEnvelopeKeys[key]
+	return skip
 }
 
 // evaluateString applies compiled rules against a single string value.

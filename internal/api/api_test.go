@@ -505,3 +505,251 @@ func TestAuditRegressionFixes(t *testing.T) {
 		t.Fatalf("webhook with '/' = %d, want 400", r.Code)
 	}
 }
+
+func TestBackendReviewFixRegressions(t *testing.T) {
+	t.Run("P1_3_gitops_source_config_lock_and_builtin_guardrail_exception", func(t *testing.T) {
+		h, st, _, _ := setupTestAPI(t)
+		ctx := context.Background()
+
+		// Seed source="config" records across all 5 resource types + a built-in guardrail preset.
+		if err := st.UpsertProvider(ctx, store.Provider{
+			Name: "cfg-openai", Type: config.ProviderTypeOpenAI, BaseURL: "https://api.openai.com",
+			Models: []string{"gpt-5"}, Enabled: true, Source: store.SourceConfig,
+		}); err != nil {
+			t.Fatalf("seed provider: %v", err)
+		}
+		if err := st.UpsertModelRoute(ctx, store.ModelRoute{
+			Alias: "team/cfg", ProviderName: "cfg-openai", UpstreamModel: "gpt-5",
+			Enabled: true, Source: store.SourceConfig,
+		}); err != nil {
+			t.Fatalf("seed route: %v", err)
+		}
+		daily := 25.0
+		if err := st.UpsertBudget(ctx, store.Budget{
+			Scope: "tag:cfg", RPM: 60, DailyUSD: &daily, SoftAlertPct: 80,
+			Enabled: true, Source: store.SourceConfig,
+		}); err != nil {
+			t.Fatalf("seed budget: %v", err)
+		}
+		if err := st.UpsertGuardrailRule(ctx, store.GuardrailRule{
+			ID: "cfg-custom-rule", Name: "YAML Rule", Category: config.GuardrailCategoryCustom,
+			Pattern: "SECRET_[0-9]+", Action: config.GuardrailActionRedact,
+			Builtin: false, Enabled: true, Source: store.SourceConfig,
+		}); err != nil {
+			t.Fatalf("seed config guardrail: %v", err)
+		}
+		if err := st.UpsertGuardrailRule(ctx, store.GuardrailRule{
+			ID: "builtin-email", Name: "Email Address", Category: config.GuardrailCategoryPII,
+			Pattern: `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`, Action: config.GuardrailActionRedact,
+			Builtin: true, Enabled: false, Source: store.SourceConfig,
+		}); err != nil {
+			t.Fatalf("seed builtin guardrail: %v", err)
+		}
+		if err := st.UpsertWebhook(ctx, store.Webhook{
+			ID: "cfg-wh", Name: "YAML Alerts", URL: "https://hooks.example.com/a",
+			Type: config.WebhookTypeAsyncEvent, Events: []string{config.WebhookEventBudgetExceeded},
+			TimeoutMS: 2000, FailOpen: true, Enabled: true, Source: store.SourceConfig,
+		}); err != nil {
+			t.Fatalf("seed webhook: %v", err)
+		}
+
+		// POST (create-over-existing), PUT, and DELETE must all return 409 Conflict for source=config items.
+		cases := []struct {
+			name   string
+			method string
+			path   string
+			body   string
+		}{
+			{"post config provider", http.MethodPost, "/api/v1/admin/providers", `{"name":"cfg-openai","type":"openai","base_url":"https://api.openai.com"}`},
+			{"put config provider", http.MethodPut, "/api/v1/admin/providers/cfg-openai", `{"models":["gpt-4.1"]}`},
+			{"delete config provider", http.MethodDelete, "/api/v1/admin/providers/cfg-openai", ""},
+			{"post config route", http.MethodPost, "/api/v1/admin/routes", `{"alias":"team/cfg","provider_name":"cfg-openai","upstream_model":"gpt-5"}`},
+			{"put config route", http.MethodPut, "/api/v1/admin/routes?alias=team/cfg", `{"upstream_model":"gpt-4.1"}`},
+			{"delete config route", http.MethodDelete, "/api/v1/admin/routes/team/cfg", ""},
+			{"post config budget", http.MethodPost, "/api/v1/admin/budgets", `{"scope":"tag:cfg","rpm":100}`},
+			{"put config budget", http.MethodPut, "/api/v1/admin/budgets/tag:cfg", `{"rpm":100}`},
+			{"delete config budget", http.MethodDelete, "/api/v1/admin/budgets/tag:cfg", ""},
+			{"post config guardrail", http.MethodPost, "/api/v1/admin/guardrails", `{"id":"cfg-custom-rule","name":"X","pattern":"foo","action":"redact"}`},
+			{"put config guardrail", http.MethodPut, "/api/v1/admin/guardrails/cfg-custom-rule", `{"enabled":false}`},
+			{"delete config guardrail", http.MethodDelete, "/api/v1/admin/guardrails/cfg-custom-rule", ""},
+			{"post config webhook", http.MethodPost, "/api/v1/admin/webhooks", `{"id":"cfg-wh","name":"X","url":"https://hooks.example.com/b","type":"async_event"}`},
+			{"put config webhook", http.MethodPut, "/api/v1/admin/webhooks/cfg-wh", `{"name":"Edited"}`},
+			{"delete config webhook", http.MethodDelete, "/api/v1/admin/webhooks/cfg-wh", ""},
+		}
+		for _, tc := range cases {
+			rec := doAPIRequest(h, adminPrincipal(), tc.method, tc.path, tc.body, nil)
+			if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "source=config") {
+				t.Fatalf("%s: got %d %s, want 409 mentioning source=config", tc.name, rec.Code, rec.Body.String())
+			}
+		}
+
+		// Built-in guardrail presets remain toggleable/editable via PUT, but DELETE returns 409 Conflict.
+		if rec := doAPIRequest(h, adminPrincipal(), http.MethodPut, "/api/v1/admin/guardrails/builtin-email", `{"enabled":true,"action":"log_only"}`, nil); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"enabled":true`) || !strings.Contains(rec.Body.String(), `"builtin":true`) {
+			t.Fatalf("PUT builtin guardrail = %d: %s", rec.Code, rec.Body.String())
+		}
+		if rec := doAPIRequest(h, adminPrincipal(), http.MethodPost, "/api/v1/admin/guardrails", `{"id":"builtin-email","name":"Dup","pattern":"foo","action":"redact"}`, nil); rec.Code != http.StatusConflict {
+			t.Fatalf("POST over builtin guardrail = %d, want 409", rec.Code)
+		}
+		if rec := doAPIRequest(h, adminPrincipal(), http.MethodDelete, "/api/v1/admin/guardrails/builtin-email", "", nil); rec.Code != http.StatusConflict {
+			t.Fatalf("DELETE builtin guardrail = %d, want 409: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("P1_4_provider_probe_ssrf_dial_guard", func(t *testing.T) {
+		blockedAddrs := []string{
+			"169.254.169.254:80",
+			"[::ffff:169.254.169.254]:80",
+			"[fe80::1]:443",
+			"[fd00:ec2::254]:80",
+			"0.0.0.0:80",
+			"[::]:80",
+			"224.0.0.1:80",
+			"[ff02::1]:80",
+		}
+		for _, addr := range blockedAddrs {
+			if err := ssrfSafeDialControl("tcp4", addr, nil); err == nil {
+				t.Fatalf("expected ssrfSafeDialControl to block %s", addr)
+			}
+		}
+		allowedAddrs := []string{
+			"127.0.0.1:11434",
+			"[::1]:11434",
+			"100.64.0.10:8080",
+			"1.1.1.1:443",
+		}
+		for _, addr := range allowedAddrs {
+			if err := ssrfSafeDialControl("tcp", addr, nil); err != nil {
+				t.Fatalf("expected ssrfSafeDialControl to allow %s, got %v", addr, err)
+			}
+		}
+
+		// End-to-end provider probe against AWS IMDS fails fast via dial control.
+		h, st, _, _ := setupTestAPI(t)
+		_ = st.UpsertProvider(context.Background(), store.Provider{
+			Name: "imds-probe", Type: config.ProviderTypeOpenAI, BaseURL: "http://169.254.169.254",
+			Enabled: true, Source: store.SourceLocal,
+		})
+		rec := doAPIRequest(h, adminPrincipal(), http.MethodPost, "/api/v1/admin/providers/imds-probe/test", "", nil)
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"ok":false`) || !strings.Contains(rec.Body.String(), "probe dial blocked") {
+			t.Fatalf("expected SSRF-blocked probe response, got %d %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("P2_4_item1_audit_purge_with_zero_retention_and_override", func(t *testing.T) {
+		h, st, rec, _ := setupTestAPI(t)
+		ctx := context.Background()
+		now := time.Now().UTC()
+
+		_ = st.InsertUsageLog(ctx, store.UsageLog{ID: "p-1", CreatedAt: now, Subject: "alice@example.com", ProviderName: "openai", RequestedModel: "gpt-5", StatusCode: 200})
+		_ = st.InsertAuditPayload(ctx, store.AuditPayload{UsageLogID: "p-1", CreatedAt: now, RequestBody: "recent"})
+
+		// Set retention_days=0 (auto-purge disabled).
+		rec.UpdateAuditConfig(config.AuditConfig{StorePayloads: true, RetentionDays: 0})
+		_ = st.SetAuditSettings(ctx, store.AuditSettings{StorePayloads: true, RetentionDays: 0})
+
+		// Empty body when retention_days=0 must return 400 with actionable hint.
+		if r := doAPIRequest(h, adminPrincipal(), http.MethodPost, "/api/v1/admin/settings/audit/purge", "", nil); r.Code != http.StatusBadRequest || !strings.Contains(r.Body.String(), "retention_days=0") {
+			t.Fatalf("empty purge when retention_days=0 = %d: %s", r.Code, r.Body.String())
+		}
+		// Negative retention_days must return 400.
+		if r := doAPIRequest(h, adminPrincipal(), http.MethodPost, "/api/v1/admin/settings/audit/purge", `{"retention_days":-1}`, nil); r.Code != http.StatusBadRequest {
+			t.Fatalf("negative retention_days purge = %d, want 400", r.Code)
+		}
+		// Invalid JSON must return 400.
+		if r := doAPIRequest(h, adminPrincipal(), http.MethodPost, "/api/v1/admin/settings/audit/purge", `{bad`, nil); r.Code != http.StatusBadRequest {
+			t.Fatalf("malformed json purge = %d, want 400", r.Code)
+		}
+		// Explicit {"retention_days": 0} purges all payloads up to now!
+		if r := doAPIRequest(h, adminPrincipal(), http.MethodPost, "/api/v1/admin/settings/audit/purge", `{"retention_days":0}`, nil); r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"purged":1`) {
+			t.Fatalf("explicit retention_days=0 purge = %d: %s", r.Code, r.Body.String())
+		}
+	})
+
+	t.Run("P2_4_item2_csrf_loopback_dev_proxy_vs_strict_tailnet", func(t *testing.T) {
+		h, _, _, _ := setupTestAPI(t)
+
+		send := func(remoteAddr, host string, headers map[string]string) *httptest.ResponseRecorder {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/settings/audit/purge", strings.NewReader(`{"retention_days":30}`))
+			req.RemoteAddr = remoteAddr
+			req.Host = host
+			req.Header.Set("Content-Type", "application/json")
+			for k, v := range headers {
+				req.Header.Set(k, v)
+			}
+			req = req.WithContext(auth.WithPrincipal(req.Context(), adminPrincipal()))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			return rec
+		}
+
+		// Allowed: Vite local dev proxy (loopback RemoteAddr + loopback Host + loopback Origin + same-site/same-origin).
+		if r := send("127.0.0.1:54321", "127.0.0.1:8080", map[string]string{
+			"Origin":         "http://localhost:5173",
+			"Sec-Fetch-Site": "same-site",
+		}); r.Code != http.StatusOK {
+			t.Fatalf("loopback dev proxy IPv4 = %d: %s", r.Code, r.Body.String())
+		}
+		if r := send("[::1]:54321", "[::1]:8080", map[string]string{
+			"Origin":         "http://localhost:5173",
+			"Sec-Fetch-Site": "same-origin",
+		}); r.Code != http.StatusOK {
+			t.Fatalf("loopback dev proxy IPv6 = %d: %s", r.Code, r.Body.String())
+		}
+
+		// Blocked: cross-site even on loopback, non-loopback Origin on loopback, or spoofed Host from non-loopback peer.
+		blockedCases := []struct {
+			name       string
+			remoteAddr string
+			host       string
+			headers    map[string]string
+		}{
+			{"loopback cross-site", "127.0.0.1:54321", "127.0.0.1:8080", map[string]string{"Origin": "http://localhost:5173", "Sec-Fetch-Site": "cross-site"}},
+			{"loopback evil origin", "127.0.0.1:54321", "127.0.0.1:8080", map[string]string{"Origin": "https://evil.example.com", "Sec-Fetch-Site": "same-site"}},
+			{"tailnet spoofed loopback host", "100.64.0.10:50000", "127.0.0.1:8080", map[string]string{"Origin": "http://localhost:5173", "Sec-Fetch-Site": "same-site"}},
+			{"tailnet same-site", "100.64.0.10:50000", "headlamp.tailnet.internal", map[string]string{"Sec-Fetch-Site": "same-site"}},
+			{"tailnet cross-port origin", "100.64.0.10:50000", "headlamp.tailnet.internal:8080", map[string]string{"Origin": "http://headlamp.tailnet.internal:5173"}},
+		}
+		for _, tc := range blockedCases {
+			if r := send(tc.remoteAddr, tc.host, tc.headers); r.Code != http.StatusForbidden {
+				t.Fatalf("%s: got %d, want 403 (%s)", tc.name, r.Code, r.Body.String())
+			}
+		}
+	})
+
+	t.Run("P2_4_item4_budget_post_put_return_budget_admin_item_with_spend", func(t *testing.T) {
+		h, st, _, _ := setupTestAPI(t)
+		ctx := context.Background()
+		now := time.Now().UTC()
+
+		_ = st.InsertUsageLog(ctx, store.UsageLog{
+			ID: "spend-1", CreatedAt: now, Subject: "alice@example.com",
+			ProviderName: "openai", RequestedModel: "gpt-5", CostUSD: 1.25, StatusCode: 200,
+		})
+
+		recPost := doAPIRequest(h, adminPrincipal(), http.MethodPost, "/api/v1/admin/budgets",
+			`{"scope":"alice@example.com","rpm":60,"daily_usd":10.0,"monthly_usd":100.0}`, nil)
+		if recPost.Code != http.StatusCreated {
+			t.Fatalf("POST budget = %d: %s", recPost.Code, recPost.Body.String())
+		}
+		var postItem BudgetAdminItem
+		if err := json.Unmarshal(recPost.Body.Bytes(), &postItem); err != nil {
+			t.Fatalf("decode POST budget item: %v", err)
+		}
+		if postItem.Scope != "alice@example.com" || postItem.DailySpentUSD != 1.25 || postItem.MonthlySpentUSD != 1.25 {
+			t.Fatalf("POST budget missing live spend fields: %+v", postItem)
+		}
+
+		recPut := doAPIRequest(h, adminPrincipal(), http.MethodPut, "/api/v1/admin/budgets?scope=alice@example.com",
+			`{"rpm":120,"daily_usd":20.0,"monthly_usd":200.0}`, nil)
+		if recPut.Code != http.StatusOK {
+			t.Fatalf("PUT budget = %d: %s", recPut.Code, recPut.Body.String())
+		}
+		var putItem BudgetAdminItem
+		if err := json.Unmarshal(recPut.Body.Bytes(), &putItem); err != nil {
+			t.Fatalf("decode PUT budget item: %v", err)
+		}
+		if putItem.RPM != 120 || putItem.DailySpentUSD != 1.25 || putItem.MonthlySpentUSD != 1.25 {
+			t.Fatalf("PUT budget missing live spend fields: %+v", putItem)
+		}
+	})
+}

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,10 @@ import (
 	"github.com/zacharykka/headlamp/internal/policy"
 	"github.com/zacharykka/headlamp/internal/store"
 )
+
+func configManagedConflictMessage(resource, id string) string {
+	return fmt.Sprintf("%s %q is managed by headlamp.yaml (source=config) and is read-only via the API; edit headlamp.yaml and restart", resource, id)
+}
 
 // --- User Endpoints (/api/v1/me*) ---
 
@@ -254,7 +259,11 @@ func (h *Handler) handleAdminCreateProvider(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	if _, err := h.store.GetProvider(r.Context(), p.Name); err == nil {
+	if existing, err := h.store.GetProvider(r.Context(), p.Name); err == nil {
+		if existing.Source == store.SourceConfig {
+			writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("provider", p.Name))
+			return
+		}
 		writeError(w, http.StatusConflict, "conflict", fmt.Sprintf("provider %q already exists", p.Name))
 		return
 	} else if !errors.Is(err, store.ErrNotFound) {
@@ -283,6 +292,10 @@ func (h *Handler) handleAdminUpdateProvider(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
+	if existing.Source == store.SourceConfig {
+		writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("provider", name))
+		return
+	}
 	var req providerRequest
 	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -306,6 +319,19 @@ func (h *Handler) handleAdminUpdateProvider(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *Handler) handleAdminDeleteProvider(w http.ResponseWriter, r *http.Request, name string) {
+	existing, err := h.store.GetProvider(r.Context(), name)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", fmt.Sprintf("provider %q not found", name))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
+		return
+	}
+	if existing.Source == store.SourceConfig {
+		writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("provider", name))
+		return
+	}
 	if err := h.store.DeleteProvider(r.Context(), name); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", fmt.Sprintf("provider %q not found", name))
@@ -535,7 +561,11 @@ func (h *Handler) handleAdminCreateRoute(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	if _, err := h.store.GetModelRoute(r.Context(), route.Alias); err == nil {
+	if existing, err := h.store.GetModelRoute(r.Context(), route.Alias); err == nil {
+		if existing.Source == store.SourceConfig {
+			writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("route", route.Alias))
+			return
+		}
 		writeError(w, http.StatusConflict, "conflict", fmt.Sprintf("route %q already exists", route.Alias))
 		return
 	} else if !errors.Is(err, store.ErrNotFound) {
@@ -569,6 +599,10 @@ func (h *Handler) handleAdminUpdateRoute(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
+	if existing.Source == store.SourceConfig {
+		writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("route", alias))
+		return
+	}
 	var req routeRequest
 	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -595,6 +629,19 @@ func (h *Handler) handleAdminDeleteRoute(w http.ResponseWriter, r *http.Request,
 	alias = strings.TrimSpace(alias)
 	if alias == "" {
 		writeError(w, http.StatusBadRequest, "invalid_request", "route alias is required")
+		return
+	}
+	existing, err := h.store.GetModelRoute(r.Context(), alias)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", fmt.Sprintf("route %q not found", alias))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
+		return
+	}
+	if existing.Source == store.SourceConfig {
+		writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("route", alias))
 		return
 	}
 	if err := h.store.DeleteModelRoute(r.Context(), alias); err != nil {
@@ -726,7 +773,11 @@ func (h *Handler) handleAdminCreateBudget(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	if _, err := h.store.GetBudget(r.Context(), b.Scope); err == nil {
+	if existing, err := h.store.GetBudget(r.Context(), b.Scope); err == nil {
+		if existing.Source == store.SourceConfig {
+			writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("budget", b.Scope))
+			return
+		}
 		writeError(w, http.StatusConflict, "conflict", fmt.Sprintf("budget for scope %q already exists", b.Scope))
 		return
 	} else if !errors.Is(err, store.ErrNotFound) {
@@ -742,7 +793,12 @@ func (h *Handler) handleAdminCreateBudget(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusCreated, saved)
+	item, err := h.budgetAdminItemForBudget(r.Context(), *saved)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, item)
 }
 
 func (h *Handler) handleAdminUpdateBudget(w http.ResponseWriter, r *http.Request, scope string) {
@@ -758,6 +814,10 @@ func (h *Handler) handleAdminUpdateBudget(w http.ResponseWriter, r *http.Request
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
+		return
+	}
+	if existing.Source == store.SourceConfig {
+		writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("budget", scope))
 		return
 	}
 	var req budgetRequest
@@ -779,13 +839,31 @@ func (h *Handler) handleAdminUpdateBudget(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, saved)
+	item, err := h.budgetAdminItemForBudget(r.Context(), *saved)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
 }
 
 func (h *Handler) handleAdminDeleteBudget(w http.ResponseWriter, r *http.Request, scope string) {
 	scope = strings.TrimSpace(scope)
 	if scope == "" {
 		writeError(w, http.StatusBadRequest, "invalid_request", "budget scope is required")
+		return
+	}
+	existing, err := h.store.GetBudget(r.Context(), scope)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", fmt.Sprintf("budget for scope %q not found", scope))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
+		return
+	}
+	if existing.Source == store.SourceConfig {
+		writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("budget", scope))
 		return
 	}
 	if err := h.store.DeleteBudget(r.Context(), scope); err != nil {
@@ -797,6 +875,41 @@ func (h *Handler) handleAdminDeleteBudget(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"deleted": scope})
+}
+
+func (h *Handler) budgetAdminItemForBudget(ctx context.Context, b store.Budget) (BudgetAdminItem, error) {
+	if h.budgetReporter != nil {
+		items, err := h.budgetReporter.ListAllStatuses(ctx)
+		if err != nil {
+			return BudgetAdminItem{}, err
+		}
+		for _, item := range items {
+			if item.Scope == b.Scope {
+				return item, nil
+			}
+		}
+	}
+	now := time.Now().UTC()
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	daySpent, monthSpent, err := h.scopeSpendFromStore(ctx, b.Scope, dayStart, monthStart)
+	if err != nil {
+		return BudgetAdminItem{}, err
+	}
+	return BudgetAdminItem{
+		Scope:           b.Scope,
+		RPM:             b.RPM,
+		TPM:             b.TPM,
+		MaxConcurrent:   b.MaxConcurrent,
+		DailyUSD:        b.DailyUSD,
+		MonthlyUSD:      b.MonthlyUSD,
+		DailySpentUSD:   daySpent,
+		MonthlySpentUSD: monthSpent,
+		SoftAlertPct:    b.SoftAlertPct,
+		Enabled:         b.Enabled,
+		Source:          b.Source,
+		UpdatedAt:       b.UpdatedAt,
+	}, nil
 }
 
 func validateBudgetPayload(scope string, req budgetRequest, existing *store.Budget) (store.Budget, error) {
@@ -1175,16 +1288,55 @@ func (h *Handler) handleAdminPutAuditSettings(w http.ResponseWriter, r *http.Req
 }
 
 func (h *Handler) handleAdminPurgeAudit(w http.ResponseWriter, r *http.Request) {
-	var purged int64
-	var err error
-	if h.auditController != nil {
-		purged, err = h.auditController.PurgeNow(r.Context())
+	var req struct {
+		RetentionDays *int `json:"retention_days"`
+	}
+	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+		dec := json.NewDecoder(r.Body)
+		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, "invalid_request", fmt.Sprintf("invalid json: %v", err))
+			return
+		}
+	}
+
+	var (
+		purged int64
+		err    error
+	)
+	if req.RetentionDays != nil {
+		if *req.RetentionDays < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_request", "retention_days must be >= 0")
+			return
+		}
+		maxAge := time.Duration(*req.RetentionDays) * 24 * time.Hour
+		if h.auditController != nil {
+			purged, err = h.auditController.PurgeOlderThan(r.Context(), maxAge)
+		} else {
+			now := time.Now().UTC()
+			cutoff := now.Add(-maxAge)
+			if maxAge == 0 {
+				cutoff = now.Add(time.Nanosecond)
+			}
+			purged, err = h.store.PurgeAuditPayloads(r.Context(), cutoff)
+		}
 	} else {
 		days := 7
-		if s, getErr := h.store.GetAuditSettings(r.Context()); getErr == nil {
+		if h.auditController != nil {
+			days = h.auditController.AuditConfig().RetentionDays
+		} else if s, getErr := h.store.GetAuditSettings(r.Context()); getErr == nil {
 			days = s.RetentionDays
+		} else if !errors.Is(getErr, store.ErrNotFound) {
+			writeError(w, http.StatusInternalServerError, "server_error", getErr.Error())
+			return
 		}
-		if days > 0 {
+		if days <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid_request", `auto-purge is disabled (retention_days=0); pass {"retention_days": N} in request body or set retention_days > 0`)
+			return
+		}
+		if h.auditController != nil {
+			purged, err = h.auditController.PurgeNow(r.Context())
+		} else {
 			cutoff := time.Now().UTC().Add(-time.Duration(days) * 24 * time.Hour)
 			purged, err = h.store.PurgeAuditPayloads(r.Context(), cutoff)
 		}
@@ -1231,7 +1383,15 @@ func (h *Handler) handleAdminCreateGuardrail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if rule.ID != "" {
-		if _, err := h.store.GetGuardrailRule(r.Context(), rule.ID); err == nil {
+		if existing, err := h.store.GetGuardrailRule(r.Context(), rule.ID); err == nil {
+			if existing.Builtin {
+				writeError(w, http.StatusConflict, "conflict", fmt.Sprintf("built-in guardrail rule %q already exists; update it via PUT instead", rule.ID))
+				return
+			}
+			if existing.Source == store.SourceConfig {
+				writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("guardrail rule", rule.ID))
+				return
+			}
 			writeError(w, http.StatusConflict, "conflict", fmt.Sprintf("guardrail rule %q already exists", rule.ID))
 			return
 		} else if !errors.Is(err, store.ErrNotFound) {
@@ -1263,6 +1423,12 @@ func (h *Handler) handleAdminUpdateGuardrail(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
+	// Built-in guardrail presets remain editable via PUT so admins can toggle/tune them
+	// (SyncConfig uses ON CONFLICT DO NOTHING for built-ins); non-builtin YAML rules are read-only.
+	if !existing.Builtin && existing.Source == store.SourceConfig {
+		writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("guardrail rule", id))
+		return
+	}
 	var req guardrailRequest
 	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -1286,6 +1452,23 @@ func (h *Handler) handleAdminUpdateGuardrail(w http.ResponseWriter, r *http.Requ
 }
 
 func (h *Handler) handleAdminDeleteGuardrail(w http.ResponseWriter, r *http.Request, id string) {
+	existing, err := h.store.GetGuardrailRule(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", fmt.Sprintf("guardrail rule %q not found", id))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
+		return
+	}
+	if existing.Builtin {
+		writeError(w, http.StatusConflict, "conflict", fmt.Sprintf("built-in guardrail rule %q cannot be deleted; disable it with enabled=false instead", id))
+		return
+	}
+	if existing.Source == store.SourceConfig {
+		writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("guardrail rule", id))
+		return
+	}
 	if err := h.store.DeleteGuardrailRule(r.Context(), id); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", fmt.Sprintf("guardrail rule %q not found", id))
@@ -1476,7 +1659,11 @@ func (h *Handler) handleAdminCreateWebhook(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if wh.ID != "" {
-		if _, err := h.store.GetWebhook(r.Context(), wh.ID); err == nil {
+		if existing, err := h.store.GetWebhook(r.Context(), wh.ID); err == nil {
+			if existing.Source == store.SourceConfig {
+				writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("webhook", wh.ID))
+				return
+			}
 			writeError(w, http.StatusConflict, "conflict", fmt.Sprintf("webhook %q already exists", wh.ID))
 			return
 		} else if !errors.Is(err, store.ErrNotFound) {
@@ -1508,6 +1695,10 @@ func (h *Handler) handleAdminUpdateWebhook(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
+	if existing.Source == store.SourceConfig {
+		writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("webhook", id))
+		return
+	}
 	var req webhookRequest
 	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -1531,6 +1722,19 @@ func (h *Handler) handleAdminUpdateWebhook(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *Handler) handleAdminDeleteWebhook(w http.ResponseWriter, r *http.Request, id string) {
+	existing, err := h.store.GetWebhook(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", fmt.Sprintf("webhook %q not found", id))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "server_error", err.Error())
+		return
+	}
+	if existing.Source == store.SourceConfig {
+		writeError(w, http.StatusConflict, "conflict", configManagedConflictMessage("webhook", id))
+		return
+	}
 	if err := h.store.DeleteWebhook(r.Context(), id); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", fmt.Sprintf("webhook %q not found", id))

@@ -867,7 +867,18 @@ audit:
 		t.Fatalf("persisted audit settings reload failed: %+v err=%v", reloadedAudit, err)
 	}
 
-	// (d) Configure async webhook, custom guardrail rule, and Alice's daily USD budget via Admin API.
+	// (d) Verify GitOps source=config lock on YAML-synced provider + builtin guardrail editability,
+	// then configure async webhook, custom guardrail rule, and Alice's daily USD budget via Admin API.
+	if rec := doReq("100.64.0.1:50002", http.MethodPut, "/api/v1/admin/providers/openai", `{"models":["gpt-4.1"]}`, sameOrigin); rec.Code != http.StatusConflict {
+		t.Fatalf("PUT source=config provider = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+	if rec := doReq("100.64.0.1:50002", http.MethodPut, "/api/v1/admin/guardrails/builtin-email", `{"enabled":false}`, sameOrigin); rec.Code != http.StatusOK {
+		t.Fatalf("PUT builtin guardrail = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if rec := doReq("100.64.0.1:50002", http.MethodDelete, "/api/v1/admin/guardrails/builtin-email", "", sameOrigin); rec.Code != http.StatusConflict {
+		t.Fatalf("DELETE builtin guardrail = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+
 	whBody := fmt.Sprintf(`{"id":"m2-alerts","name":"M2 Alerts","url":%q,"type":"async_event","secret":%q,"events":["guardrail.triggered","budget.threshold","budget.exceeded"],"timeout_ms":2000,"fail_open":true,"enabled":true}`, webhookServer.URL, webhookSecret)
 	if rec := doReq("100.64.0.1:50002", http.MethodPost, "/api/v1/admin/webhooks", whBody, sameOrigin); rec.Code != http.StatusCreated {
 		t.Fatalf("POST /api/v1/admin/webhooks = %d: %s", rec.Code, rec.Body.String())
@@ -1037,5 +1048,41 @@ audit:
 		if !slices.Contains(gotEvents, want) {
 			t.Fatalf("expected async webhook event %q, got events: %v", want, gotEvents)
 		}
+	}
+}
+
+func TestResolveStartupTimeout(t *testing.T) {
+	t.Setenv("HEADLAMP_STARTUP_TIMEOUT", "")
+
+	d, err := resolveStartupTimeout(&config.Config{
+		Server: config.ServerConfig{TLS: config.TLSConfig{Mode: config.TLSModeNone}},
+	})
+	if err != nil || d != 60*time.Second {
+		t.Fatalf("default timeout = (%v, %v), want (60s, nil)", d, err)
+	}
+
+	d, err = resolveStartupTimeout(&config.Config{
+		Server: config.ServerConfig{TLS: config.TLSConfig{Mode: config.TLSModeACMEDNS01}},
+	})
+	if err != nil || d != 5*time.Minute {
+		t.Fatalf("acme_dns01 timeout = (%v, %v), want (5m, nil)", d, err)
+	}
+
+	t.Setenv("HEADLAMP_STARTUP_TIMEOUT", "3m")
+	d, err = resolveStartupTimeout(&config.Config{
+		Server: config.ServerConfig{TLS: config.TLSConfig{Mode: config.TLSModeNone}},
+	})
+	if err != nil || d != 3*time.Minute {
+		t.Fatalf("env override timeout = (%v, %v), want (3m, nil)", d, err)
+	}
+
+	t.Setenv("HEADLAMP_STARTUP_TIMEOUT", "0s")
+	if _, err := resolveStartupTimeout(&config.Config{}); err == nil {
+		t.Fatal("expected error for non-positive HEADLAMP_STARTUP_TIMEOUT")
+	}
+
+	t.Setenv("HEADLAMP_STARTUP_TIMEOUT", "not-a-duration")
+	if _, err := resolveStartupTimeout(&config.Config{}); err == nil {
+		t.Fatal("expected error for malformed HEADLAMP_STARTUP_TIMEOUT")
 	}
 }

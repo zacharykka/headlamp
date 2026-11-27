@@ -10,11 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -113,24 +116,28 @@ type WebhookDispatcher struct {
 	closeOnce sync.Once
 }
 
+// ErrBlockedWebhookAddress is returned when a webhook target resolves to a
+// blocked SSRF destination (cloud IMDS, link-local, unspecified, multicast, or
+// loopback when BlockLoopback is enabled).
+var ErrBlockedWebhookAddress = errors.New("guardrail: blocked webhook target IP address")
+
+var awsIPv6IMDS = netip.MustParseAddr("fd00:ec2::254")
+
 // WebhookDispatcherOptions tunes queue size, worker parallelism, retry backoff, and HTTP client.
 type WebhookDispatcherOptions struct {
-	HTTPClient   *http.Client
-	QueueSize    int
-	Workers      int
-	RetryBackoff time.Duration
-	Logf         func(format string, args ...any)
+	HTTPClient    *http.Client
+	BlockLoopback bool
+	QueueSize     int
+	Workers       int
+	RetryBackoff  time.Duration
+	Logf          func(format string, args ...any)
 }
 
 // NewWebhookDispatcher creates a WebhookDispatcher and starts its async delivery workers.
 func NewWebhookDispatcher(st store.Store, opts WebhookDispatcherOptions) *WebhookDispatcher {
 	client := opts.HTTPClient
 	if client == nil {
-		client = &http.Client{
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}
+		client = defaultWebhookHTTPClient(opts.BlockLoopback)
 	}
 	qSize := opts.QueueSize
 	if qSize <= 0 {
@@ -285,6 +292,20 @@ func (d *WebhookDispatcher) Review(ctx context.Context, req SyncReviewRequest) (
 
 		case ActionAllow, "":
 			// Allowed; proceed to next webhook.
+
+		default:
+			if !wh.FailOpen {
+				return &SyncReviewOutcome{
+					Action:       ActionBlock,
+					ModifiedBody: currentBody,
+					Hits:         append(outcome.Hits, "webhook:"+wh.ID),
+					Reason:       fmt.Sprintf("sync review webhook %q returned unknown action %q (fail_closed)", wh.Name, reviewResp.Action),
+					StatusCode:   http.StatusServiceUnavailable,
+				}, nil
+			}
+			if d.logf != nil {
+				d.logf("headlamp guardrail: sync review webhook %q returned unknown action %q (fail_open, allowing request)", wh.Name, reviewResp.Action)
+			}
 		}
 	}
 
@@ -525,4 +546,54 @@ func sanitizeURLError(err error) string {
 		return fmt.Sprintf("%s %q: %v", urlErr.Op, cleanURL, urlErr.Err)
 	}
 	return err.Error()
+}
+
+func defaultWebhookHTTPClient(blockLoopback bool) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+				Control:   webhookDialControl(blockLoopback),
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          50,
+			MaxIdleConnsPerHost:   10,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func webhookDialControl(blockLoopback bool) func(network, address string, c syscall.RawConn) error {
+	return func(_ string, address string, _ syscall.RawConn) error {
+		return validateWebhookDialAddr(address, blockLoopback)
+	}
+}
+
+func validateWebhookDialAddr(address string, blockLoopback bool) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("%w: invalid dial address %q", ErrBlockedWebhookAddress, address)
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return fmt.Errorf("%w: invalid IP %q", ErrBlockedWebhookAddress, host)
+	}
+	addr = addr.Unmap()
+	switch {
+	case addr.IsLinkLocalUnicast(),
+		addr.IsLinkLocalMulticast(),
+		addr.WithZone("") == awsIPv6IMDS,
+		addr.IsUnspecified(),
+		addr.IsMulticast(),
+		blockLoopback && addr.IsLoopback():
+		return fmt.Errorf("%w: %s", ErrBlockedWebhookAddress, addr)
+	}
+	return nil
 }

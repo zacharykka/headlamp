@@ -3,6 +3,7 @@ package metering
 import (
 	"bytes"
 	"context"
+	"errors"
 	"maps"
 	"slices"
 	"strings"
@@ -218,7 +219,24 @@ func (r *Recorder) PurgeNow(ctx context.Context) (int64, error) {
 	if r.store == nil || auditCfg.RetentionDays <= 0 {
 		return 0, nil
 	}
-	cutoff := time.Now().UTC().Add(-time.Duration(auditCfg.RetentionDays) * 24 * time.Hour)
+	return r.PurgeOlderThan(ctx, time.Duration(auditCfg.RetentionDays)*24*time.Hour)
+}
+
+// PurgeOlderThan immediately deletes audit_payloads older than maxAge.
+// A maxAge of 0 purges all audit_payloads recorded up to now.
+func (r *Recorder) PurgeOlderThan(ctx context.Context, maxAge time.Duration) (int64, error) {
+	if r.store == nil {
+		return 0, nil
+	}
+	if maxAge < 0 {
+		return 0, errors.New("metering: maxAge must be non-negative")
+	}
+	now := time.Now().UTC()
+	cutoff := now.Add(-maxAge)
+	if maxAge == 0 {
+		// Store purge uses strict "<"; bump by 1ns so payloads recorded at the exact same timestamp are included.
+		cutoff = now.Add(time.Nanosecond)
+	}
 	return r.store.PurgeAuditPayloads(ctx, cutoff)
 }
 

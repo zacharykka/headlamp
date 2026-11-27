@@ -439,6 +439,7 @@ func (g *Gateway) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Run guardrails before forwarding prompt messages to Anthropic's count_tokens endpoint.
+	guardrailModified := false
 	if g.guardrails != nil {
 		requestID := uuid.NewString()
 		decision, gErr := g.guardrails.Inspect(r.Context(), GuardrailRequest{
@@ -468,6 +469,7 @@ func (g *Gateway) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Requ
 			}
 			if (decision.Action == "redact" || decision.Action == "modify") && len(decision.ModifiedBody) > 0 {
 				reqBody = decision.ModifiedBody
+				guardrailModified = true
 			}
 		}
 	}
@@ -475,7 +477,7 @@ func (g *Gateway) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Requ
 	var lastResp *http.Response
 	for i, cand := range anthropicCands {
 		bodyToSend := reqBody
-		if cand.upstreamModel != meta.Model {
+		if cand.upstreamModel != meta.Model || guardrailModified {
 			bodyToSend, _, err = patchJSONRequest(reqBody, cand.upstreamModel, false)
 			if err != nil {
 				if i+1 < len(anthropicCands) {
@@ -598,6 +600,7 @@ type llmInvocation struct {
 	reqBody            []byte
 	guardrailAction    string
 	guardrailHits      []string
+	guardrailModified  bool
 }
 
 func (g *Gateway) authorizeModel(w http.ResponseWriter, r *http.Request, principal *auth.Principal, protocol, canonicalModel string) bool {
@@ -737,6 +740,7 @@ func (g *Gateway) executeLLMRequest(w http.ResponseWriter, r *http.Request, inv 
 			}
 			if (decision.Action == "redact" || decision.Action == "modify") && len(decision.ModifiedBody) > 0 {
 				inv.reqBody = decision.ModifiedBody
+				inv.guardrailModified = true
 			}
 		}
 	}
@@ -1167,7 +1171,7 @@ func (g *Gateway) prepareUpstreamRequestPayload(inv llmInvocation, cand routeCan
 			return inv.reqBody, buildUpstreamURL(cand.provider, path, rawQuery), false, nil
 
 		case ProtocolOpenAIChat:
-			needModelRewrite := cand.upstreamModel != inv.requestedModel
+			needModelRewrite := cand.upstreamModel != inv.requestedModel || inv.guardrailModified
 			needStreamOpts := inv.stream
 			body = inv.reqBody
 			if needModelRewrite || needStreamOpts {
@@ -1175,7 +1179,12 @@ func (g *Gateway) prepareUpstreamRequestPayload(inv llmInvocation, cand routeCan
 				if needModelRewrite {
 					newModel = cand.upstreamModel
 				}
-				body, injectedIncludeUsage, err = patchJSONRequest(inv.reqBody, newModel, needStreamOpts)
+				var pinStream *bool
+				if inv.guardrailModified {
+					streamVal := inv.stream
+					pinStream = &streamVal
+				}
+				body, injectedIncludeUsage, err = patchJSONRequestWithStream(inv.reqBody, newModel, needStreamOpts, pinStream)
 				if err != nil {
 					return nil, "", false, err
 				}
@@ -1184,10 +1193,15 @@ func (g *Gateway) prepareUpstreamRequestPayload(inv llmInvocation, cand routeCan
 
 		default:
 			// OpenAI Responses, OpenAI Embeddings, Anthropic Messages:
-			// zero JSON restructuring when model name matches!
+			// zero JSON restructuring when model name matches and body was not rewritten by guardrails.
 			body = inv.reqBody
-			if cand.upstreamModel != inv.requestedModel {
-				body, _, err = patchJSONRequest(inv.reqBody, cand.upstreamModel, false)
+			if cand.upstreamModel != inv.requestedModel || inv.guardrailModified {
+				var pinStream *bool
+				if inv.guardrailModified && inv.ingressProtocol != ProtocolOpenAIEmbeddings {
+					streamVal := inv.stream
+					pinStream = &streamVal
+				}
+				body, _, err = patchJSONRequestWithStream(inv.reqBody, cand.upstreamModel, false, pinStream)
 				if err != nil {
 					return nil, "", false, err
 				}
@@ -1196,11 +1210,21 @@ func (g *Gateway) prepareUpstreamRequestPayload(inv llmInvocation, cand routeCan
 		}
 	}
 
-	// Cross-protocol translation.
+	// Cross-protocol translation: if guardrails modified the body, re-pin "stream"
+	// before translating so a sync_review webhook cannot flip streaming mode.
+	reqBody := inv.reqBody
+	if inv.guardrailModified {
+		streamVal := inv.stream
+		reqBody, _, err = patchJSONRequestWithStream(reqBody, "", false, &streamVal)
+		if err != nil {
+			return nil, "", false, err
+		}
+	}
+
 	switch inv.ingressProtocol {
 	case ProtocolOpenAIChat:
 		// OpenAI Chat -> Anthropic Messages.
-		translatedBody, err := translate.OpenAIRequestToAnthropic(inv.reqBody, cand.upstreamModel)
+		translatedBody, err := translate.OpenAIRequestToAnthropic(reqBody, cand.upstreamModel)
 		if err != nil {
 			return nil, "", false, err
 		}
@@ -1208,7 +1232,7 @@ func (g *Gateway) prepareUpstreamRequestPayload(inv llmInvocation, cand routeCan
 
 	case ProtocolAnthropicMessages:
 		// Anthropic Messages -> OpenAI Chat (OpenAI or Ollama).
-		translatedBody, err := translate.AnthropicRequestToOpenAI(inv.reqBody, cand.upstreamModel, cand.provider.Type)
+		translatedBody, err := translate.AnthropicRequestToOpenAI(reqBody, cand.upstreamModel, cand.provider.Type)
 		if err != nil {
 			return nil, "", false, err
 		}
@@ -1615,6 +1639,10 @@ func feedJSONArrayOrObject(raw []byte, observer StreamObserver) {
 // injectedIncludeUsage is true whenever injectStreamOptions was requested and
 // the client did not already supply "stream_options": {"include_usage": true}.
 func patchJSONRequest(body []byte, newModel string, injectStreamOptions bool) ([]byte, bool, error) {
+	return patchJSONRequestWithStream(body, newModel, injectStreamOptions, nil)
+}
+
+func patchJSONRequestWithStream(body []byte, newModel string, injectStreamOptions bool, pinStream *bool) ([]byte, bool, error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(body, &fields); err != nil {
 		return nil, false, fmt.Errorf("invalid JSON object: %w", err)
@@ -1632,6 +1660,22 @@ func patchJSONRequest(body []byte, newModel string, injectStreamOptions bool) ([
 		}
 		fields["model"] = encodedModel
 		modified = true
+	}
+
+	if pinStream != nil {
+		if *pinStream {
+			fields["stream"] = json.RawMessage("true")
+			modified = true
+		} else {
+			if _, hasStream := fields["stream"]; hasStream {
+				fields["stream"] = json.RawMessage("false")
+				modified = true
+			}
+			if _, hasOpts := fields["stream_options"]; hasOpts {
+				delete(fields, "stream_options")
+				modified = true
+			}
+		}
 	}
 
 	if injectStreamOptions {
